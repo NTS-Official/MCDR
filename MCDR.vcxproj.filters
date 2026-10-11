@@ -28,6 +28,24 @@
     <ClInclude Include="src\core\pch.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="src\dx12\dx12_async_bundle.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\dx12\dx12_async_descriptor.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\dx12\dx12_async_executor.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\dx12\dx12_async_fence.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\dx12\dx12_descriptor_allocator.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\dx12\dx12_device.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\core\dllmain.cpp">
@@ -37,6 +55,27 @@
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="src\core\pch.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\dx12\dx12_async_bundle.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\dx12\dx12_async_descriptor.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\dx12\dx12_async_executor.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\dx12\dx12_async_fence.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\dx12\dx12_descriptor_allocator.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\dx12\dx12_device.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\dx12\dx12_surface.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>

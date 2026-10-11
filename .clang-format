@@ -1,0 +1,74 @@
+# MCDR native code style.
+#
+# Calibrated against the style the port already uses, so that running
+# clang-format produces fixes rather than a wholesale style flip:
+#   * 4-space indent, 100-column limit, left-aligned pointers
+#   * `if (cond) return;` and one-line function bodies stay on one line
+#   * wrapped binary operators lead the continuation line (`+ "x"`)
+#   * `template <typename T>` keeps the space and stays on its own line
+#
+# Two deliberate choices:
+#   * AlignConsecutiveDeclarations is OFF: it column-aligns declarations of
+#     *different* types, which turns `int gOpenListCount = 0;` into a
+#     fifty-column-wide line for no readability gain.
+#   * ReflowComments is OFF: dx12_device.* and dx12_surface.cpp carry
+#     hand-wrapped Chinese comments, and clang-format counts a CJK glyph as a
+#     single column, so reflowing would merge lines that are already full width.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: Latest
+
+# ---- line & indent ---------------------------------------------------------
+ColumnLimit: 110
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -4
+ContinuationIndentWidth: 4
+ConstructorInitializerIndentWidth: 4
+NamespaceIndentation: None
+MaxEmptyLinesToKeep: 1
+IndentPPDirectives: None
+IndentCaseLabels: true
+IndentWrappedFunctionNames: false
+
+# ---- braces & one-liners ---------------------------------------------------
+BreakBeforeBraces: Attach
+BreakConstructorInitializers: BeforeColon
+BreakTemplateDeclarations: Yes
+AllowShortFunctionsOnASingleLine: All
+AllowShortBlocksOnASingleLine: Never
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: true
+
+# ---- alignment -------------------------------------------------------------
+AlignAfterOpenBracket: Align
+AlignOperands: Align
+AlignEscapedNewlines: Left
+PointerAlignment: Left
+ReferenceAlignment: Left
+AlignConsecutiveDeclarations: false
+AlignConsecutiveMacros: true
+AlignTrailingComments: {Kind: Leave}
+SpacesBeforeTrailingComments: 2
+
+# ---- spaces ----------------------------------------------------------------
+SpaceAfterCStyleCast: false
+SpaceAfterTemplateKeyword: true
+SpaceBeforeParens: ControlStatements
+SpacesInAngles: Never
+SpacesInContainerLiterals: false
+SpacesInSquareBrackets: false
+BinPackArguments: true
+BinPackParameters: true
+BreakBeforeBinaryOperators: NonAssignment
+
+# ---- includes --------------------------------------------------------------
+SortIncludes: Never
+IncludeBlocks: Preserve
+
+# ---- comments --------------------------------------------------------------
+ReflowComments: false
+FixNamespaceComments: true

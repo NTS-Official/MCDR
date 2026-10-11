@@ -1,0 +1,741 @@
+#pragma once
+
+// 禁用 Windows min/max 宏，避免与 std::max/std::min 冲突（须在任何
+// windows.h/d3d12.h 之前定义）。
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+// dx12-mc 原生 D3D12 层（C++）
+// P2 目标：D3D12 设备上下文 + 资源创建（texture/buffer/sampler/view）+ 自检。
+// P3 目标：命令层（CommandEncoder 双缓冲提交 + fence 同步 + copy/clear +
+//          render pass 生命周期 + timestamp query）。
+// 设计参考：官方 com.mojang.blaze3d.vulkan.VulkanDevice / VulkanGpuTexture /
+// VulkanGpuBuffer.Direct / VulkanGpuSampler / VulkanGpuTextureView /
+// VulkanCommandEncoder / VulkanRenderPass。
+
+#include <d3d12.h>
+#include <d3d12sdklayers.h>
+#include <d3dcompiler.h>
+#include <dxgi1_4.h>
+#include <dcomp.h>
+#include <wrl/client.h>
+
+#include <cstdint>
+#include <memory>
+#include <thread>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+// P33 async：异步渲染基础设施（MainCommandExecutor + BundleRecorderPool）
+#include "dx12_async_executor.h"
+#include "dx12_async_bundle.h"
+#include "dx12_async_descriptor.h"
+
+namespace d3d12_mc {
+
+using Microsoft::WRL::ComPtr;
+
+// P15: 日志分级 - ERROR/WARNING 始终输出；INFO/DEBUG 默认关闭，需 DX12_LOG_VERBOSE=1
+
+enum class DbgLogLevel : int {
+    ERR = 0,
+    WARN = 1,
+    INFO = 2,
+    DEBUG = 3,
+};
+
+// 毫秒时间戳（QPC），供诊断插桩打印精确阻塞点（渲染线程卡死排查用）。
+double nowMs();
+
+// 错误/警告（始终输出）
+void dbgLog(const char* fmt, ...);
+// 信息级别（默认关闭）
+void dbgLogInfo(const char* fmt, ...);
+// 调试级别（默认关闭）
+void dbgLogDebug(const char* fmt, ...);
+// 设置日志级别（0=ERR 1=WARN 2=INFO 3=DEBUG）
+void setLogLevel(int level);
+
+// 高频调试宏：默认静默，DX12_LOG_VERBOSE=1 或编译时 DX12_DEBUG_VERBOSE 宏开启
+#ifdef DX12_DEBUG_VERBOSE
+#define DBG_LOG_DEBUG(...) dbgLogDebug(__VA_ARGS__)
+#else
+#define DBG_LOG_DEBUG(...) ((void)0)
+#endif
+
+// ---------------------------------------------------------------------------
+// P22: 前向声明（DeviceContext 使用 std::unique_ptr<BlitPipeline>，需完整类型）
+// ---------------------------------------------------------------------------
+struct BlitPipeline;
+
+// ---------------------------------------------------------------------------
+// 设备上下文（进程内单例，Java 侧首次调用 dx12CreateDevice 时创建）
+// ---------------------------------------------------------------------------
+struct DeviceContext {
+    ComPtr<ID3D12Device> device;
+
+    ComPtr<ID3D12DescriptorHeap> srvHeap;      // SRV（SHADER_VISIBLE）
+    // P6：SRV 的 CPU-only 镜像堆（非 SHADER_VISIBLE）。CopyDescriptorsSimple
+    // 的源必须是 CPU-only 堆——texture view 的 cpuHandle 指向这里（供
+    // pushDescriptors 复制到 drawHeap），srvHeap 的 GPU 句柄仍供直接绑定用。
+    ComPtr<ID3D12DescriptorHeap> srvCpuHeap;
+    ComPtr<ID3D12DescriptorHeap> rtvHeap;      // RTV（持久：surface backbuffer RTV）
+    // P24 fix：帧级瞬态 RTV 专用堆。beginRenderPass/clearColorTexture 每帧从
+    // 0 号槽复用，避免覆盖 rtvHeap 上持久化的 backbuffer RTV——曾致 blit 把
+    // 颜色纹理当 RT 绑定（资源状态 0xC0 不是 RENDER_TARGET）→ 全程黑屏。
+    ComPtr<ID3D12DescriptorHeap> frameRtvHeap; // 帧级瞬态 RTV（每帧从 0 复用）
+    ComPtr<ID3D12DescriptorHeap> dsvHeap;      // DSV
+    ComPtr<ID3D12DescriptorHeap> samplerHeap;  // Sampler（SHADER_VISIBLE）
+    ComPtr<ID3D12DescriptorHeap> drawHeap;     // P6：每帧瞬时 CBV/SRV 描述符（SHADER_VISIBLE，ring x2）
+
+    // P33 async：开启异步分区后，drawHeap 的每个帧段被划出一部分给 worker 分区，
+    // 同步 ring 只允许使用每段起始的 syncRingReserve 个槽位。0 = 未开启异步分区
+    // （同步 ring 可用整段 kDrawHeapPerFrame）。由 dx12AsyncDescriptorCreate 设置。
+    UINT syncRingReserve = 0;
+
+    // P6：ExecuteIndirect 用 command signature（DrawIndexedInstanced / DrawInstanced）
+    ComPtr<ID3D12CommandSignature> cmdSigIndexed;
+    ComPtr<ID3D12CommandSignature> cmdSigNonIndexed;
+
+    UINT srvInc = 0, rtvInc = 0, dsvInc = 0, samplerInc = 0;
+    UINT drawInc = 0;  // == srvInc（同属 CBV_SRV_UAV 堆类型）
+
+    std::string adapterName;
+    ComPtr<IDXGIAdapter> adapter;  // 与 device 绑定的 DXGI adapter（用于 CreateDXGIFactoryForAdapter）
+    D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
+    UINT64 timestampFrequency = 0;  // 从 GetTimestampFrequency 获取（DeviceInfo.timestampPeriod 用）
+    ComPtr<ID3D12CommandQueue> queue;   // 图形队列（提交命令用）
+
+    // 全局队列 fence（P6 fence token）：官方 createCommandEncoder() 返回共享
+    // encoder，createFence() 的语义是"下一次提交完成后完成"。vanilla 在一次性
+    // encoder 上创建 fence token（queueFencedTask / StagedVertexBuffer endFrame /
+    // MappableRingBuffer rotate），该 encoder 从不 submit——若用 per-ctx fence 则
+    // 永不完成 → 渲染线程永久等待（waitFence: value=1 completed=0 黑屏冻结）。
+    // 故用设备级队列 fence 复现官方语义：每次 ExecuteCommandLists 后 Signal
+    // (queueFence, ++queueFenceValue)，createFence 目标 = 当前值 + 1。
+    ComPtr<ID3D12Fence> queueFence;
+    HANDLE queueFenceEvent = nullptr;   // waitForQueueFenceValue 用（每调用新建 event，不共享）
+    UINT64 queueFenceValue = 0;         // 每次 ExecuteCommandLists 后递增
+
+    // 诊断（调试层）：设备移除时 GetDeviceRemovedReason + InfoQueue 消息定位根因
+    ComPtr<ID3D12InfoQueue> infoQueue;
+
+    // P22: blit 全屏四边形管线（懒初始化，device 级单例）
+    std::unique_ptr<BlitPipeline> blitPipeline;
+};
+
+// ---------------------------------------------------------------------------
+// 资源对象（Java long 句柄 = Dx12Object*）
+// ---------------------------------------------------------------------------
+struct Dx12Object {
+    enum class Kind { Texture, Buffer, Sampler, TextureView };
+
+    Kind kind = Kind::Buffer;
+    ComPtr<ID3D12Resource> resource;  // Texture / Buffer
+    D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle{};  // View / Sampler 的 CPU 句柄
+    D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle{};  // View / Sampler 的 GPU 句柄
+    D3D12_HEAP_TYPE heapType = D3D12_HEAP_TYPE_DEFAULT;
+    DXGI_FORMAT dxgiFormat = DXGI_FORMAT_UNKNOWN;  // Texture 的格式（copy 计算行距用）
+    void* mappedPtr = nullptr;  // map 后的指针
+    int usage = 0;
+    long long size = 0;
+    // P6：描述符堆槽位索引（TextureView → SRV 槽位；Sampler → sampler 槽位；
+    // -1 = 未占用）。销毁时归还 free-list 复用，防止长会话 SRV 堆耗尽。
+    int descSlot = -1;
+    // TextureView 指向的底层 Texture（采样前需 transition 到
+    // PIXEL_SHADER_RESOURCE；Texture/Buffer 恒为 nullptr）。
+    Dx12Object* sourceTexture = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// 设备生命周期
+// ---------------------------------------------------------------------------
+// 创建/复用全局设备上下文；失败时填充 errorOut 并返回 false。
+bool ensureDevice(std::string& errorOut);
+void destroyDevice();
+
+// JNI 层访问设备上下文（读 adapterName/featureLevel）。
+DeviceContext& deviceContext();
+// P33 fix：flush 延迟删除对象，在 destroySurface 等 present fence 后调用，
+// 确保 GPU 工作完成后再释放资源。
+// P46：默认只释放 queue fence 已确认完成的条目（不阻塞）；force=true 时
+// 忽略 fence 门槛全部释放（仅用于进程退出等 GPU 已空闲的场景）。
+void flushPendingDeletes(bool force = false);
+
+// ---------------------------------------------------------------------------
+// P33 async：把瞬时描述符直接写到 drawHeap 的「绝对槽位」（供 worker 线程在
+// 自己的分区区域内写 CBV / 纹理 SRV / texel buffer SRV）。
+//
+// 与 pushDescriptors 的区别：不做 transition（bundle 内禁止 ResourceBarrier），
+// 调用方须先用 transitionBufferTo / transitionTextureTo 在主列表上完成过渡；
+// 槽位由 PartitionedDescriptorAllocator 分配，保证与其他 worker 互不重叠。
+// ---------------------------------------------------------------------------
+// buffer[offset, offset+size) 写为 CBV（size 向上取整 256 对齐）。
+bool writeCBVToDrawHeap(const UINT& slot, const Dx12Object*& buf, const long long& offset,
+                        const long long& size, std::string& err);
+// 复制纹理视图已有的 SRV 描述符到 slot。
+bool writeTextureSRVToDrawHeap(const UINT& slot, const Dx12Object*& view, std::string& err);
+// buffer[offset, offset+length) 写为 texel buffer SRV（texelFormat = GpuFormat ordinal）。
+bool writeBufferSRVToDrawHeap(UINT slot, Dx12Object* buf, long long offset, long long length, int texelFormat,
+                              std::string& err);
+
+// 返回设备/队列的原始 COM 指针（用于 Java 侧持有句柄）。
+uintptr_t getDeviceHandle();
+uintptr_t getQueueHandle();
+
+// 创建一个隐藏的 Win32 窗口（用于测试渲染循环）；返回 HWND (uintptr_t)。
+uintptr_t createHiddenWindow(int width, int height);
+// 销毁隐藏的 Win32 窗口。
+void destroyHiddenWindow(uintptr_t hwnd);
+
+// ---------------------------------------------------------------------------
+// 资源创建（返回 new 的 Dx12Object*，句柄 = 指针；失败返回 nullptr + err）
+// ---------------------------------------------------------------------------
+Dx12Object* createTexture(int usage, int format, int width, int height, int depthOrLayers, int mipLevels,
+                          std::string& err);
+Dx12Object* createBuffer(int usage, long long size, std::string& err);
+Dx12Object* createSampler(int addressU, int addressV, int minFilter, int magFilter, int maxAnisotropy,
+                          float maxLod, std::string& err);
+Dx12Object* createTextureView(Dx12Object* texture, int baseMipLevel, int mipLevels, std::string& err);
+void destroyObject(Dx12Object* obj);
+
+// ---------------------------------------------------------------------------
+// Buffer 映射
+// ---------------------------------------------------------------------------
+// 对应官方 GpuBuffer.map(offset, length, read, write)：校验 usage 位后
+// ID3D12Resource::Map，返回连续指针（供 NewDirectByteBuffer 使用）。
+void* mapBuffer(Dx12Object* buffer, long long offset, long long length, bool read, bool write,
+                std::string& err);
+void unmapBuffer(Dx12Object* buffer);
+
+// ---------------------------------------------------------------------------
+// 命令层（P3）：CommandContext 对应官方 VulkanCommandEncoder。
+// 官方用 timeline semaphore + 双 command pool（MAX_SUBMITS_IN_FLIGHT=2）；
+// D3D12 用 ID3D12Fence（timeline 语义）+ 三 command allocator 一一对应：
+//   signalSemaphore(idx)      -> queue->Signal(fence, idx)
+//   awaitSubmitCompletion(idx)-> fence->GetCompletedValue()/SetEventOnCompletion
+//   currentCommandPool().reset-> allocators[fenceValue % 3]->Reset()
+// 三 ring：帧 N 用 index (N-1)%3，帧 N+3 复用同一 index 时 submit 已等 N 完成。
+// （双 ring + 等 value-2 会差一帧：帧 N+2 复用帧 N 的 allocator 但只等了 N-1。）
+// ---------------------------------------------------------------------------
+struct Dx12Pipeline;  // forward，CommandContext 持有其裸指针
+
+// P64：帧级瞬态 RTV/DSV 缓存键。(资源指针, mip) 唯一决定视图内容（见 makeRtvDesc）。
+struct RtvDsvKey {
+    ID3D12Resource* resource;
+    UINT mip;
+    bool operator==(const RtvDsvKey& o) const { return resource == o.resource && mip == o.mip; }
+};
+struct RtvDsvKeyHash {
+    size_t operator()(const RtvDsvKey& k) const {
+        return std::hash<void*>()(reinterpret_cast<void*>(k.resource))
+               ^ (std::hash<UINT>()(k.mip) * 0x9E3779B97F4A7C15ULL);
+    }
+};
+
+struct CommandContext {
+    ComPtr<ID3D12CommandAllocator> allocators[3];   // 三帧飞行，等待 value-2 后复用
+    // P55：command list 也改为 3 路 ring（此前只有单条 list，导致主线程必须等上一帧
+    // GPU 执行完才能 Reset 同一条 list → CPU 录制与 GPU 执行被完全串行化，
+    // 实测 GPU 仅 33%、CPU 仅 29% 却只跑到 ~680 FPS）。现在 list 与 allocator 一一
+    // 对应同一槽位，主线程录制帧 N 时用的是与帧 N-3 相同的槽位，只需等该槽位的 fence。
+    ComPtr<ID3D12GraphicsCommandList> commandLists[3];
+    ComPtr<ID3D12Fence> fence;
+    UINT64 fenceValue = 0;              // 最近一次 Signal 的值（从 1 开始递增）
+    HANDLE fenceEvent = nullptr;        // SetEventOnCompletion 用
+    int listOpen = 0;                   // command list 是否已 begin
+    int inRenderPass = 0;               // 渲染 pass 是否打开
+
+    // P55：本帧使用的 ring 槽位（begin 时按 fenceValue%3 固定，submit 时据此记录 fence）。
+    UINT currentListSlot = 0;
+    // P55：各槽位最后一次提交的 per-list fence 值。begin 时等本槽位的值，
+    // 保证该槽位的 list/allocator 不再被 GPU 引用后再 Reset。
+    UINT64 slotFence[3] = {0, 0, 0};
+    // P55：指向 commandLists[currentListSlot] 的裸指针，供全部录制调用点直接使用
+    // （保持原有 `ctx->commandList->Foo()` 写法不变）。由 beginCommandListWithWait 指向当前槽位。
+    ID3D12GraphicsCommandList* commandList = nullptr;
+
+    // P11：当前渲染 pass 的活跃附件。endRenderPass 必须把它们从
+    // RENDER_TARGET/DEPTH_WRITE 显式回切 COMMON——这两种状态属"非可提升状态"，
+    // 命令列表执行完成时【不会】隐式 decay 回 COMMON（只有 COPY_SOURCE/
+    // COPY_DEST/UAV 等可提升状态才 decay）。若省略回切，下一 command list 的
+    // barrier 按 COMMON 写 Before 状态会与资源实际状态错配（每帧验证 ERROR →
+    // GPU 状态错乱 → TDR 冻结：游戏挂死，启动器同 GPU 渲染也卡死）。
+    std::vector<Dx12Object*> activeColorTargets;
+    // P17：标记每个 color target 在本 command list 中是否被 draw 写入过
+    std::vector<bool> activeColorTargetsTouched;
+    // P17：整个 command list 是否有过任何 draw 写入（endRenderPass 后仍有效，供 blitSurface 判断）
+    bool colorTargetsWritten = false;
+    Dx12Object* activeDepthTarget = nullptr;
+
+    // P6：本帧 drawHeap 瞬时描述符分配（ring：fenceValue%2 交替两个半区；
+    // 帧 N+2 重写帧 N 半区时 submit 已等 N 完成，故 x2 足够）
+    UINT drawHeapSlotBase = 0;
+    UINT nextDrawSlot = 0;
+
+    // P33 async：记录上一次 submitCommandList 写入的 queue fence 值。
+    // beginCommandListWithWait 据此等待 GPU 完成上一帧后再 Reset allocator，
+    // 避免异步线程并发提交时的 use-after-free（ACCESS_VIOLATION 根因）。
+    // 初始值 0 表示"无需等待"（首帧或 createBuffer 一次性路径）。
+    UINT64 lastSubmitQueueFence = 0;
+
+    // P40：记录上一帧 submit 时写入的 per-command-list fence 值。
+    // beginCommandListWithWait 等待此 fence 完成，确保 GPU 已实际执行完
+    // 引用该 allocator 的所有命令，再 Reset allocator——这是避免 hang 的关键。
+    // 与 lastSubmitQueueFence 的区别：queue fence 仅表示命令已入队，
+    // per-command-list fence 表示 GPU 已完成执行。
+    UINT64 prevFenceValue = 0;
+
+    // 本 command list 内已过渡的资源状态（资源指针 -> 当前 D3D12 状态）。
+    // 初始态 = 资源创建时的状态（texture=COMMON，buffer=initialStateFor）。
+    // beginCommandList 清空：因为 submit 同步等待完成，上一 command list
+    // 执行结束后所有提升状态已隐式 decay 回 COMMON，故每个新 list 一切资源
+    // 都从初始态开始。绝不在 list 内显式回退 COMMON（D3D12 禁止）。
+    std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> resourceState;
+    // 本 command list 内被 transition 到 COPY_SOURCE 的 UPLOAD heap staging buffer。
+    // endCommandList 必须将它们回切 GENERIC_READ（而非 COMMON），因为下一帧
+    // beginCommandList 以 GENERIC_READ 为初始态假设，GPU 实际状态必须匹配。
+    std::unordered_set<ID3D12Resource*> stagingCopySourceResources;
+
+    // P6：当前绑定的管线，用于 setVertexBuffer 查找修正 stride
+    Dx12Pipeline* currentPipeline = nullptr;
+
+    // P64：setPipeline 快速路径。同一命令列表内以相同 PSO 重复调用时，root signature /
+    // PSO / topology 均未变，可跳过 3 次驱动调用。ExecuteBundle 后置空（bundle 内设置的
+    // PSO 不回滚到父列表，父列表状态可能已变）。
+    ID3D12PipelineState* cachedPso = nullptr;
+
+    // P64：帧级瞬态 RTV/DSV 描述符缓存。beginRenderPass/clear* 在本命令列表内对同一
+    // (资源, mip) 只创建一次视图；此前每次调用都 CreateRenderTargetView/
+    // CreateDepthStencilView（数百次/帧的驱动调用）。beginCommandList 清空
+    // （gNextFrameRtv/gNextDsv 同点清零，句柄随之失效）。
+    std::unordered_map<RtvDsvKey, D3D12_CPU_DESCRIPTOR_HANDLE, RtvDsvKeyHash> rtvCache;
+    std::unordered_map<RtvDsvKey, D3D12_CPU_DESCRIPTOR_HANDLE, RtvDsvKeyHash> dsvCache;
+
+    ComPtr<ID3D12CommandAllocator>& currentAllocator() { return allocators[currentListSlot]; }
+};
+
+// 创建命令上下文：3 个 allocator + command list + fence + event。
+CommandContext* createCommandEncoder(std::string& err);
+void destroyCommandEncoder(CommandContext* ctx);
+
+// 开始录制：先等待 GPU 完成 waitForValue 对应的提交（若 waitForValue > 0），
+// 再 Reset 当前 allocator + list。用于异步多线程场景，确保 allocator 不被
+// 还在使用的 GPU 命令列表引用时覆写。waitForValue == 0 时跳过等待（兼容原有
+// 单线程路径及 createBuffer 一次性路径）。
+bool beginCommandList(CommandContext* ctx, std::string& err);
+bool beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue, std::string& err);
+// 结束录制：Close list（之后可提交）。
+bool endCommandList(CommandContext* ctx, std::string& err);
+// 提交：ExecuteCommandLists + Signal(fence, ++fenceValue)。
+// 非阻塞（GPU 异步执行）；fence 信号值同时写入当前 active surface 的 per-backbuffer 记录。
+// 返回本次提交的 fence value。
+UINT64 submitCommandList(CommandContext* ctx, std::string& err);
+// 等待 fence 值达到 value；timeoutNs 为纳秒。返回是否完成。
+bool waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs, std::string& err);
+// 当前 fence value（Java 侧 createFence 记录用）。
+UINT64 currentFenceValue(CommandContext* ctx);
+
+// ---------------------------------------------------------------------------
+// P33 async：独立 C++ 渲染线程（渲染工作从主线程剥离）
+// ---------------------------------------------------------------------------
+//
+// 架构：独立的 C++ 渲染线程负责 GPU 同步（acquire/present/fence wait），
+// 主线程只负责 push 绘制命令，不阻塞等 GPU。
+//
+// 四阶段状态机（通过 Windows events 协调）：
+//   1. BEGIN_FRAME      — 主线程发信号，请求开始新帧
+//   2. RECORDING_READY  — 渲染线程发信号，告知 GPU 已就绪，可以 push 命令
+//   3. COMMANDS_READY   — 主线程发信号，所有绘制命令已入队
+//   4. SUBMIT_DONE      — 渲染线程发信号，命令已提交，回到步骤 1
+// ---------------------------------------------------------------------------
+bool initAsyncRenderer(UINT workerCount);
+void destroyAsyncRenderer();
+// 等待渲染线程完成当前帧（不销毁线程，仅同步到 gEvtSubmitDone 触发后）
+void waitForRenderThreadSubmit();
+// P48（多帧飞行）：等待所有已提交帧完成 Present。acquireSurface 在真正调用
+// GetCurrentBackBufferIndex 之前必须调用它——Present 未完成时 index 不会轮转，
+// 提前 acquire 会拿到同一个 back buffer（两帧写同一处 → 闪帧/撕裂）。
+// 正常情况（主线程录制耗时 ≫ 渲染线程 Present 耗时）返回 0ms。
+void waitForPendingPresents();
+// 非阻塞：请求渲染线程开始下一帧。返回 true 表示成功排队，false 表示正在处理上一帧。
+bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err);
+// 阻塞：等到本帧提交完成（或超时 ms）。
+bool asyncRenderWaitComplete(CommandContext* ctx, UINT64 timeoutMs, std::string& err);
+// 非阻塞：查询渲染线程是否已到达 "recording ready" 阶段。
+bool asyncRenderIsRecordingReady(CommandContext* ctx);
+// 阻塞：等待渲染线程到达 "recording ready" 阶段（超时 ms）。
+// 取代 Java 侧 Thread.sleep(1) 轮询：消除每帧 ~1ms 的调度器休眠开销。
+bool asyncRenderWaitRecordingReady(CommandContext* ctx, UINT64 timeoutMs);
+// 主线程通知渲染线程：所有命令已入队（设置 gEvtCommandsReady）。
+void asyncSendCommandsReady(CommandContext* ctx);
+// 主动清除 gAsyncRenderCtx（供 Java 侧超时降级时同步调用）。
+void clearAsyncRenderCtx();
+// 查询命令列表是否已打开。
+bool isListOpen(CommandContext* ctx);
+
+// P33 async：当前帧使用的 drawHeap 段号（= fenceValue % kDrawHeapSections）。
+// 与 beginCommandListWithWait 中 drawHeapSlotBase 的段号一致；Java 侧据此把
+// worker 的 (frameSlot, worker) 描述符区域对齐到同一段，避免与同步 ring 重叠。
+UINT currentDrawFrameSlot(CommandContext* ctx);
+
+// ---------------------------------------------------------------------------
+// 全局队列 fence（P6 fence token；对应官方共享 encoder 的 submit index）
+// ---------------------------------------------------------------------------
+// 当前全局队列 fence 值（Java 侧 createFence 记录用：目标 = 当前值 + 1，
+// 下一次任意 ctx 的提交完成后达成——官方语义"共享 encoder 的下一次 submit"）。
+UINT64 currentQueueFenceValue();
+// 等待全局队列 fence 达到 value（createFence token 的 awaitCompletion 用；
+// 等待对象是设备级 queueFence，而非 per-ctx fence）。
+bool waitForQueueFenceValue(UINT64 value, UINT64 timeoutNs, std::string& err);
+
+// 立即读 GPU 时间戳（等价官方 getTimestampNow：临时 query + 提交 + 读回）。
+long long getTimestampNow(CommandContext* ctx, std::string& err);
+
+// ---------------------------------------------------------------------------
+// 命令录制（P3）：copy / clear / render pass / timestamp
+// ---------------------------------------------------------------------------
+// buffer -> buffer 拷贝（CopyBufferRegion）。
+bool copyBufferToBuffer(CommandContext* ctx, Dx12Object* src, long long srcOffset, Dx12Object* dst,
+                        long long dstOffset, long long size, std::string& err);
+
+// 状态追踪的纹理过渡：把 tex 过渡到 to（以本 command list 已跟踪状态为准，
+// 绝不回退 COMMON——decay 由命令列表完成时隐式处理）。blitSurface 也要用它
+// 把渲染后的源纹理过渡到 COPY_SOURCE。
+void transitionTextureTo(CommandContext* ctx, Dx12Object* tex, D3D12_RESOURCE_STATES to);
+
+// 状态追踪的 buffer 过渡（同上，初始锚点 = initialStateFor(heapType)）。
+// 异步路径在主列表上为 bundle 批量预过渡 CBV/SRV 资源时复用。
+void transitionBufferTo(CommandContext* ctx, Dx12Object* buf, D3D12_RESOURCE_STATES to);
+
+// 底层过渡：直接接受 ID3D12Resource*，用于 swapchain back buffer 等
+// 不在 Dx12Object 包装中的资源。blitSurface 用它跟踪 back buffer 状态。
+void transitionTo(CommandContext* ctx, ID3D12Resource* res, D3D12_RESOURCE_STATES fromInitial,
+                  D3D12_RESOURCE_STATES to);
+
+// clear 颜色纹理（整纹理，RENDER_ATTACHMENT）。
+bool clearColorTexture(CommandContext* ctx, Dx12Object* tex, float r, float g, float b, float a,
+                       std::string& err);
+// clear 深度纹理（整纹理）。
+bool clearDepthTexture(CommandContext* ctx, Dx12Object* tex, double depth, std::string& err);
+
+// clear 颜色纹理矩形区域（P3b fix：GuiItemAtlas 槽位 STALE 重绘前只清该槽位。
+// 原简化实现忽略 region 整图清空，滚动时会把其它槽位已烘好的物品图标一并抹掉，
+// 翻页回来后这些区域不再触发重绘 → 物品消失）。
+bool clearColorTextureRegion(CommandContext* ctx, Dx12Object* tex, float r, float g, float b, float a, int x,
+                             int y, int w, int h, std::string& err);
+// clear 深度纹理矩形区域（同上）。
+bool clearDepthTextureRegion(CommandContext* ctx, Dx12Object* tex, double depth, int x, int y, int w, int h,
+                             std::string& err);
+// clear stencil 位（MC 26.2 新增的 CommandEncoderBackend::clearStencilTexture）。
+// clearDepthTexture 一直隐式把 stencil 清成 0；这里只清 STENCIL 位并写入调用方
+// 指定的 value，深度位保持不动（ClearDepthStencilView 只带 STENCIL flag 时
+// depth 参数被忽略）。
+bool clearStencilTexture(CommandContext* ctx, Dx12Object* tex, int value, std::string& err);
+
+// ---------------------------------------------------------------------------
+// 纹理拷贝（P3）：CopyTextureRegion 系列
+// ---------------------------------------------------------------------------
+// staging/通用 buffer -> texture 子区域（writeToTexture / copyBufferToTexture）。
+// srcWidth/srcHeight 为源 buffer 的行宽/行高（texel），用于 footprint 计算；
+// w/h 为实际拷贝尺寸。
+bool copyBufferToTexture(CommandContext* ctx, Dx12Object* srcBuf, long long srcOffset, int srcWidth,
+                         int srcHeight, Dx12Object* dstTex, int mip, int layer, int dstX, int dstY, int w,
+                         int h, std::string& err);
+
+// texture 子区域 -> readback buffer（copyTextureToBuffer）。
+bool copyTextureToBuffer(CommandContext* ctx, Dx12Object* srcTex, int mip, int layer, int srcX, int srcY,
+                         int w, int h, Dx12Object* dstBuf, long long dstOffset, std::string& err);
+
+// texture -> texture 子区域（copyTextureToTexture）。
+bool copyTextureToTexture(CommandContext* ctx, Dx12Object* srcTex, Dx12Object* dstTex, int mip, int layer,
+                          int srcX, int srcY, int dstX, int dstY, int w, int h, std::string& err);
+
+// 设备 timestamp 频率（GetTimestampFrequency；0 = 未知/未初始化）。
+unsigned long long getTimestampFrequency();
+
+// 渲染 pass 生命周期（P3：OMSetRenderTargets + viewport/scissor + clear；
+// draw 命令录制依赖 P4 pipeline）。
+//   colorViews      ：颜色纹理数组（允许空指针占位，对应 withUnusedColorAttachment）
+//   colorMips       ：每附件要绑定的 mip slice（长度 colorCount；可为 null=0。
+//                     官方 TextureAtlas 对 mipViews[level] 逐级发起 render pass 写
+//                     各 mip —— 原 RTV 恒绑 mip0 使 1+ 级图集内容从未写入：远处/大
+//                     LOD 采样到未初始化 mip → 黑色方块、4px 模糊块等）
+//   colorClearFlags ：0=保留(Load)，1=clear（对应 clearValue 存在）
+//   clearColors     ：每附件 4 个 float（r,g,b,a），长度 colorCount*4
+//   depthView       ：深度纹理（可为空）
+//   depthMip        ：深度附件绑定的 mip slice（默认 0）
+//   depthClearFlag  ：0=Load，1=clear
+//   depthClearValue ：深度清除值
+//   x/y/w/h         ：renderArea
+bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews, int colorCount, const int* colorMips,
+                     const int* colorClearFlags, const float* clearColors, Dx12Object* depthView,
+                     int depthMip, int depthClearFlag, double depthClearValue, int x, int y, int w, int h,
+                     std::string& err);
+bool endRenderPass(CommandContext* ctx, std::string& err);
+
+// ---------------------------------------------------------------------------
+// Timestamp query pool（P3）
+// ---------------------------------------------------------------------------
+struct QueryPool {
+    ComPtr<ID3D12QueryHeap> heap;
+    int size = 0;
+};
+
+QueryPool* createQueryPool(int size, std::string& err);
+void destroyQueryPool(QueryPool* pool);
+// 录制 EndQuery(TIMESTAMP) 到 pool[index]。
+bool writeTimestampToPool(CommandContext* ctx, QueryPool* pool, int index, std::string& err);
+// 阻塞读回单个/多个 timestamp（等待 GPU 完成）。
+bool readQueryValue(QueryPool* pool, int index, long long& out, std::string& err);
+bool readQueryValues(QueryPool* pool, int start, int count, long long* out, std::string& err);
+
+// ---------------------------------------------------------------------------
+// 格式映射（官方 GpuFormat 枚举值 -> DXGI_FORMAT）
+// ---------------------------------------------------------------------------
+DXGI_FORMAT toDxgiFormat(int gpuFormat);
+// 顶点输入布局专用：RGB32_* 用精确的三分量格式（R32G32B32_*，DXGI 合法
+// 输入格式；纹理用的 toDxgiFormat 会把 RGB32 加宽成 RGBA32，输入布局不能加宽）。
+DXGI_FORMAT toDxgiVertexFormat(int gpuFormat);
+
+// ---------------------------------------------------------------------------
+// 图形管线（P4）：D3DCompile(vs_5_1/ps_5_1) + root signature + 双 PSO
+// ---------------------------------------------------------------------------
+struct Dx12Pipeline {
+    ComPtr<ID3D12RootSignature> rootSignature;
+    ComPtr<ID3D12PipelineState> withDepth;  // 总是创建；DSV=D32_FLOAT（镜像官方 depthAttachmentFormat=126）
+    ComPtr<ID3D12PipelineState> withoutDepth;  // 仅 depthState==null 时创建；DSV=UNKNOWN
+    int topology = 4;  // MC PrimitiveTopology ordinal（setPipeline 时 IASetPrimitiveTopology 用）
+    // P6：per-slot 修正 stride（由 inputElements 实际格式推算，覆盖 Java 侧 getVertexSize() 的错误值）
+    std::unordered_map<int, UINT> vertexStrides;
+};
+
+// Java 侧 dx12CreateGraphicsPipeline 的 desc 解析产物（字段语义见 Dx12Native Javadoc）。
+struct PipelineDesc {
+    struct ColorTarget {
+        int format = 0;  // GpuFormat ordinal；-1 = 未使用槽位
+        uint8_t writeMask = 0;
+        bool blendEnabled = false;
+        uint8_t srcColor = 0, dstColor = 0, colorOp = 0;
+        uint8_t srcAlpha = 0, dstAlpha = 0, alphaOp = 0;
+    };
+    struct InputElement {
+        int location = 0, binding = 0, format = 0;
+        int offset = 0, stride = 0, stepRate = 0;
+        std::string semanticName;  // HLSL 声明的语义名（如 "POSITION"、"TEXCOORD0"）；空串则回退到 "TEXCOORD"
+    };
+    struct Binding {
+        uint8_t type = 0;  // 0=CBV，1=SRV+static sampler，2=SRV
+        uint8_t reg = 0;
+    };
+
+    std::vector<uint8_t> vsBytes;  // HLSL 源码（vs_5_1 编译）
+    std::vector<uint8_t> psBytes;  // HLSL 源码（ps_5_1 编译）
+    int colorCount = 0;
+    std::vector<ColorTarget> colorTargets;
+    bool hasDepth = false;
+    int depthFormat = 0;
+    bool depthWrite = false;
+    int depthCompareOp = 0;
+    int topology = 0;  // PrimitiveTopology ordinal
+    bool cullEnabled = false;
+    int polygonMode = 0;  // PolygonMode ordinal（0=FILL, 1=WIREFRAME）
+    std::vector<InputElement> inputElements;
+    std::vector<Binding> bindings;  // 按 shader 声明顺序（register = 序号）
+};
+
+// 创建管线（D3DCompile + root signature + 双 PSO）；失败返回 nullptr + err。
+Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err);
+void destroyPipeline(Dx12Pipeline* pipeline);
+
+// ---------------------------------------------------------------------------
+// P22: Blit 管线（全屏四边形绘制，绕过 CopyTextureRegion 格式不兼容问题）
+// 源纹理（R32G32B32A32_FLOAT 等）→ backbuffer（R8G8B8A8_UNORM），由 GPU
+// 光栅器自动做格式转换，无需手动 resolve。
+// ---------------------------------------------------------------------------
+struct BlitPipeline {
+    ComPtr<ID3D12RootSignature> rootSig;  // SRV(t0) + sampler(s0)
+    ComPtr<ID3D12PipelineState> pso;  // noDepth, noBlend, noCull
+    ComPtr<ID3D12Resource> vertBuf;  // 4 vertices, R32G32 + R32G32
+    ComPtr<ID3D12Resource> idxBuf;  // 6 indices, R16_UINT
+    D3D12_VERTEX_BUFFER_VIEW vbView{};
+    D3D12_INDEX_BUFFER_VIEW ibView{};
+};
+
+// 懒初始化 blit 管线（线程安全：第一次调用创建，后续直接返回）。
+void initBlitPipeline(std::string& err);
+const BlitPipeline* getBlitPipeline();
+// P22: 在 srvHeap 为 srcTex 分配 SRV 槽位并设置根描述符表（srvGpu 已绑定）。
+// 调用方无需关心 srvHeap 内部细节。
+bool blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex, ID3D12GraphicsCommandList* cmd,
+                           std::string& err);
+
+// ---------------------------------------------------------------------------
+// Draw 命令录制（P6）：渲染 pass 内的 draw 全链路。
+// 对应官方 VulkanRenderPass：setPipeline / bindTexture / setUniform /
+// enableScissor / setVertexBuffer / setIndexBuffer / drawIndexed / draw /
+// multiDraw* / drawIndexedIndirect / drawIndirect。
+// ---------------------------------------------------------------------------
+// 绑定图形管线（hasDepth 决定用 withDepth / withoutDepth PSO）。
+bool setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool hasDepth, std::string& err);
+// RSSetScissorRects(1)（x,y,w,h）。
+bool setScissor(CommandContext* ctx, int x, int y, int w, int h, std::string& err);
+// RSSetViewports(1)（x,y,w,h；depth 恒 0..1）。MC 26.2 把 viewport 提升为
+// RenderPassBackend 上的独立抽象方法 setViewport(int,int,int,int)，原先只有
+// beginRenderPass 会设置视口，因此这里补一个等价入口。
+bool setViewport(CommandContext* ctx, int x, int y, int w, int h, std::string& err);
+// IASetVertexBuffers：slot 0..15；stride 来自管线的 vertex format。
+bool setVertexBuffer(CommandContext* ctx, int slot, Dx12Object* buffer, long long offset, int stride,
+                     std::string& err);
+// IASetIndexBuffer（indexType：0=SHORT(R16_UINT)，1=INT(R32_UINT)）。
+bool setIndexBuffer(CommandContext* ctx, Dx12Object* buffer, int indexType, std::string& err);
+// 瞬时描述符绑定（对应官方 pushDescriptors）：
+//   type 0 = CBV（buffer + offset + length，offset 须 256 对齐）
+//   type 1 = SRV（复制 texture view 的现有描述符）
+//   type 2 = SRV（texel buffer，按 texelFormat 建 Buffer SRV）
+struct DrawBinding {
+    uint8_t type = 0;
+    Dx12Object* buffer = nullptr;  // CBV / TEXEL 的 buffer
+    long long offset = 0;  // CBV offset
+    long long length = 0;  // CBV length（内部向上取整 256）
+    int texelFormat = 0;  // TEXEL SRV 的 GpuFormat ordinal
+    Dx12Object* view = nullptr;  // SAMPLED_IMAGE 的 texture view
+};
+// B（拆根签名）：CBV 走 root descriptor（SetGraphicsRootConstantBufferView，不占堆
+// 槽位），SRV 写入本帧 drawHeap 瞬时槽位并 SetGraphicsRootDescriptorTable(cbvCount)。
+bool pushDescriptors(CommandContext* ctx, const std::vector<DrawBinding>& bindings, std::string& err);
+
+bool drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCount, INT startIndexLocation,
+                          INT baseVertexLocation, UINT startInstanceLocation, std::string& err);
+bool drawInstanced(CommandContext* ctx, UINT vertexCount, UINT instanceCount, UINT firstVertex,
+                   UINT startInstanceLocation, std::string& err);
+// ExecuteIndirect（DrawIndexedInstanced / DrawInstanced command signature）。
+bool drawIndexedIndirect(CommandContext* ctx, Dx12Object* commands, long long offset, UINT drawCount,
+                         std::string& err);
+bool drawIndirect(CommandContext* ctx, Dx12Object* commands, long long offset, UINT drawCount,
+                  std::string& err);
+
+// ---------------------------------------------------------------------------
+// Surface（P5）：DXGI swapchain（镜像官方 VulkanGpuSurface）。
+// PresentMode 序数 = 官方枚举 ordinal：IMMEDIATE=0, MAILBOX=1, FIFO=2,
+// FIFO_RELAXED=3。DXGI FLIP 模型支持 {0, 2, 3}（MAILBOX 无直接对应）。
+// ---------------------------------------------------------------------------
+constexpr UINT kSurfaceBufferCount = 3;  // 镜像官方 minImageCount max(3, min)
+
+struct Dx12Surface {
+    ComPtr<IDXGISwapChain3> swapChain;
+    uintptr_t hwnd = 0;  // 重建 swapchain 时需要；ResizeBuffers 失败时销毁重建用
+    UINT width = 1;
+    UINT height = 1;
+    DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    int presentMode = 2;  // 默认 FIFO
+    int currentImageIndex = -1;  // 最近 acquire 的 back buffer
+    // P6 诊断：最近一次 blit 写入的 back buffer 下标。present 后 currentImageIndex
+    // 被重置为 -1（防 ResizeBuffers 误判），而 readback 需要读"本帧已 blit 的
+    // buffer"才能看到真实画面——用 GetCurrentBackBufferIndex() 兜底会读到下一帧
+    // 尚未写入的 buffer（全 0 假黑屏）。blit 成功时记录此处。
+    int lastBlitIndex = -1;
+    bool suboptimal = false;
+    // P65：实际创建的 swapchain 是否带 DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING（tier1 成功）。
+    // 仅当为 true 时才能在 Present 时传 DXGI_PRESENT_ALLOW_TEARING，否则 Present
+    // 返回 DXGI_ERROR_INVALID_CALL。窗口/全屏切换可能重建 swapchain，故每次创建后更新。
+    bool allowTearing = false;
+    // P33 fallback：CreateSwapChainForHwnd 被拒（E_ACCESSDENIED 0x80070005，见
+    // Issue #11）时改用 CreateSwapChainForComposition + DirectComposition 呈现。
+    // compositionMode=true 时 swapChain 由 CreateSwapChainForComposition 创建，
+    // 画面经 dcompVisual 合成到窗口；此时不支持 ALLOW_TEARING。
+    // 声明顺序保证析构时先释放 visual/target/device 再释放 swapChain。
+    bool compositionMode = false;
+    ComPtr<IDCompositionDevice> dcompDevice;
+    ComPtr<IDCompositionTarget> dcompTarget;
+    ComPtr<IDCompositionVisual> dcompVisual;
+    std::vector<ComPtr<ID3D12Resource>> backBuffers;
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvHandles;  // 由 rtvHeap 分配
+    // P18：per-backbuffer fence 值。submitCommandList 记录本帧写入的 fence 值，
+    // acquireSurface 据此判断重用的 back buffer 是否仍被 GPU 使用。
+    std::vector<UINT64> surfaceFences;
+    // P33 fix：per-surface present fence。渲染线程每次 presentSurface() 后递增并
+    // signal 此 fence，确保 Display Controller 完成 flip 后再销毁 surface。
+    // IMMEDIATE 模式 + FLIP_DISCARD 下 deviceWaitIdle 不等待 display controller，
+    // 此 fence 填补该空档，避免 backbuffer 被 DWM/显示器读取时释放导致 CORRUPTION。
+    std::vector<UINT64> surfacePresentFences;
+};
+
+// P18：当前 active surface（单例，渲染线程访问）。submit 时写入 per-backbuffer fence。
+extern Dx12Surface* gActiveSurface;
+inline void setActiveSurface(Dx12Surface* s) { gActiveSurface = s; }
+inline Dx12Surface* getActiveSurface() { return gActiveSurface; }
+// P33：async 渲染线程 handle（供 destroySurface 在关闭渲染线程后等待 GPU 空闲使用）
+extern std::thread gRenderThread;
+// P33：渲染线程运行标志（供 destroySurface 判断是否需要等待线程退出）
+extern bool gRenderRunning;
+// P33：当前正在处理的 ctx（nullptr = 无活动帧），供诊断读回函数检测 ASYNC 管道活跃。
+extern CommandContext* gAsyncRenderCtx;
+// P33：本帧的 Present 是否已由渲染线程执行（true = Java 侧 present() 必须跳过，
+// 否则会重复 Present：一个渲染完成的帧 + 一个未渲染的 back buffer 交替显示，
+// 表现为窗口闪烁各种颜色）。由渲染线程 present 后置位，Java present() 消费后清位。
+extern bool gAsyncOwnsPresent;
+
+// 从 rtvHeap 分配一个 RTV CPU 句柄（surface 的 back buffer 用）。
+D3D12_CPU_DESCRIPTOR_HANDLE allocRtvHandle(std::string& err);
+
+// 创建 swapchain（FLIP_DISCARD + ALLOW_TEARING，1x1 占位，configure 时 ResizeBuffers）。
+Dx12Surface* createSurface(uintptr_t hwnd, std::string& err);
+// 取该 surface 支持的 present modes（官方枚举序数数组，MAILBOX 不支持）。
+std::vector<int> surfacePresentModes();
+// ResizeBuffers + 重新取 back buffers + 重建 RTV。
+bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, std::string& err);
+// 获取当前 back buffer index（DXGI FLIP 模型下 Present 内部同步）。
+bool acquireSurface(Dx12Surface* s, std::string& err);
+// 录制 blit（源纹理 -> back buffer）：在 command list 录制状态下调用；
+// 源与目标格式须一致（RGBA8/BGRA8 族可直接拷贝）。返回 false 表示未录制。
+bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex, std::string& err);
+// Present(interval, flags)：FIFO=Present(1,0)；IMMEDIATE=Present(0,0)；
+// FIFO_RELAXED=Present(1,ALLOW_TEARING)。
+void presentSurface(Dx12Surface* s);
+void destroySurface(Dx12Surface* s);
+// 仅清理表面，不调用 deviceWaitIdle（供 C++ 内部调用，在 render thread 已停止后使用）
+void destroySurfaceNoWaitIdle(Dx12Surface* s);
+// P6 诊断：把当前 back buffer 读回 CPU 并打印 3x3 采样点 RGBA（每 ~60 帧调用
+// 一次，内部先等 GPU 空闲；用于确认画面实际颜色/内容——纯色=渲染未生效）。
+bool readbackSurfacePixels(Dx12Surface* s, std::string& err);
+// 返回当前 acquire 的 back buffer 原始 ID3D12Resource 指针（uintptr_t），
+// 供 Java 侧直接用于 blit 源或 readback（避免使用缓存的旧 lastColorTextureHandle）。
+uintptr_t getBackBufferHandle(Dx12Surface* s);
+// 返回当前 command context 的渲染 pass 中第一个活跃颜色附件的纹理句柄；
+// 若不在渲染 pass 中则返回 0。用于替代缓存的 lastColorTextureHandle，
+// 避免 resize 后句柄指向旧纹理的问题。
+uintptr_t getActiveColorTextureHandle(CommandContext* ctx);
+// P6 诊断：读回任意纹理 3x3 采样点 RGBA（tag 标注来源，如 blit 源=渲染目标，
+// 用于区分 draw 未写入 vs blit 丢失）。
+void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag);
+// P6 诊断：把 RGBA8 像素数据保存为 BMP 文件（32bpp，覆盖写当前工作目录
+// dx12_dump_<tag>.bmp）并在日志打印 ASCII 缩略图（亮度字符 + 色相字母）。
+// 用于把画面完整可视化，定位 GUI 元素绘制目标是否与 blit 源一致。
+void dbgDumpPixelsToFile(const uint8_t* rgba, UINT w, UINT h, UINT64 pitch, const char* tag);
+// P6 诊断：读回 buffer 内容（前若干 float + hex），UPLOAD 直接 Map、DEFAULT 经
+// readback staging；用于确认顶点/UBO 数据是否真正写入 GPU 资源。
+void dbgReadbackBufferBytes(Dx12Object* buf, long long offset, int len, const char* tag);
+
+// 阻塞等待 GPU 队列上所有已提交命令执行完成（销毁 swapchain/设备前调用，
+// 避免 backbuffer 等资源在被 GPU 使用时释放导致 DXGI_ERROR_DEVICE_REMOVED）。
+bool deviceWaitIdle(std::string& err);
+
+// 自检：创建 texture/buffer/sampler/view 各一，验证资源层可用后销毁。
+// 返回描述字符串（成功/失败明细）。
+std::string runResourceSelfTest();
+
+// 枚举所有 D3D12 适配器，返回 JSON 数组字符串：
+// [{"name":"...","luid":0x...,"vid":0x...,"did":0x...,"vram_gb":N,...},...]
+std::string enumerateAdaptersJson();
+
+// 活跃设备所绑定那块适配器的完整描述，返回单行扁平 JSON 对象（键与含义见
+// mcdr_abi.h 里 mcdr_dx12GetAdapterInfo 的说明）。没有活跃设备时返回空串。
+// 驱动版本 / 驱动描述 / 硬件·集显·可拆卸分类来自运行期动态加载的 DXCore，
+// DXCore 不可用时这些字段回落为 ""/false，其余字段全部来自 DXGI。
+std::string adapterInfoJson();
+
+}  // namespace d3d12_mc
