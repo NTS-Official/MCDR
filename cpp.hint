@@ -1,0 +1,2 @@
+#define MCDR_API __declspec(dllexport)
+#define MCDR_API __declspec(dllimport)

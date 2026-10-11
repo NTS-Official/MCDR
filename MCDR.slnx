@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="MCDR.vcxproj" Id="84130ce9-f253-4377-aedc-c25d5bc102ef" />
+</Solution>
