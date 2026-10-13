@@ -1,4 +1,37 @@
-// abi_bridge_p33.cpp — async rendering infrastructure: partitioned descriptor
+
+
+// abi_async.cpp — async rendering infrastructure: partitioned descriptor allocator, bundle recorder pool, fence manager, main-list executor, barrier pre-passes
+//
+// Group: async infrastructure (originally abi_bridge_p33.cpp).
+// 合并自：abi_bridge_p33.cpp
+//
+#include "_d3d12_module_prelude.h"
+
+#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
+
+import mcdr.d3d12.device;
+import mcdr.d3d12.mesh;
+import mcdr.d3d12.async_bundle;
+import mcdr.d3d12.async_descriptor;
+import mcdr.d3d12.async_executor;
+import mcdr.d3d12.async_fence;
+import mcdr.abi.common;
+
+using namespace d3d12_mc;
+
+// ===========================================================================
+// 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
+// 共享前言（prelude / mcdr_abi.h / 各模块 import）统一放在文件顶部，下面每一段
+// 保留原单元的文件头注释与代码本体，内容逐字节未改。
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 来源单元：abi_bridge_p33.cpp
+// ---------------------------------------------------------------------------
+
+
+
+// abi_async.cpp — async rendering infrastructure: partitioned descriptor（合并自 abi_bridge_p33.cpp）
 // allocator, bundle recorder pool, fence manager, main-list executor, and the
 // barrier pre-passes and bundle execution that glue them onto the sync path.
 //
@@ -29,16 +62,7 @@
 //     variants, because the Java side only reaches the bundle path once it has
 //     proved every draw in the batch shares the same SRV set (`srvUniform`).
 
-#include "abi_common.h"
-#include "../dx12/dx12_async_bundle.h"
-#include "../dx12/dx12_async_descriptor.h"
-#include "../dx12/dx12_async_executor.h"
-#include "../dx12/dx12_async_fence.h"
-#include "../dx12/dx12_device.h"
 
-import std;
-
-using namespace d3d12_mc;
 
 namespace {
 
@@ -244,6 +268,14 @@ int32_t prepareObjects(mcdr_command_ctx* ctx, mcdr_object* const* objects, int32
 
 }  // namespace
 
+// BundleRecorder::correctedStride 读取本 bundle 记下的 per-slot 修正 stride 映射。
+// 映射由 setCorrectedStride 在 mcdr_dx12AsyncBundleSetPipelineState 里从 Dx12Pipeline
+// 抄入；本模块（异步 bundle）不 import 设备模块，故不持有 Dx12Pipeline*。
+UINT BundleRecorder::correctedStride(int slot) const {
+    auto it = m_correctedStrides.find(slot);
+    return it == m_correctedStrides.end() ? 0u : it->second;
+}
+
 extern "C" {
 
 // ===========================================================================
@@ -355,7 +387,8 @@ mcdr_bundle_pool* MCDR_CALL mcdr_dx12AsyncBundlePoolCreate(int32_t workerCount) 
     // A bundle records SetGraphicsRootDescriptorTable, so it has to bind a
     // shader-visible descriptor heap itself: pass the same (non-owned) drawHeap
     // the parent command list uses.
-    if (!pool->init(dc.device.Get(), dc.drawHeap.Get(), static_cast<UINT>(workerCount))) {
+    if (!pool->init(dc.device.Get(), dc.drawHeap.Get(), static_cast<UINT>(workerCount), dc.cmdSigIndexed.Get(),
+                     dc.cmdSigNonIndexed.Get())) {
         mcdr::abi::setLastError("mcdr_dx12AsyncBundlePoolCreate", "BundleRecorderPool::init failed");
         logFail("dx12AsyncBundlePoolCreate: init");
         delete pool;
@@ -400,9 +433,11 @@ int32_t MCDR_CALL mcdr_dx12AsyncBundleSetPipelineState(mcdr_bundle_pool* pool, i
     r->setRootSignature(pl->rootSignature.Get());
     r->setPipelineState(pso);
     r->setPrimitiveTopology(bundlePrimitiveTopology(pl->topology));
-    // P33: remember the pipeline so setVertexBuffer can apply the same corrected
-    // stride override the sync path uses.
-    r->setPipeline(pl);
+    // P33: remember the pipeline's corrected per-slot strides so setVertexBuffer can
+    // apply the same override the sync path uses.
+    for (const auto& kv : pl->vertexStrides) {
+        r->setCorrectedStride(kv.first, kv.second);
+    }
     return 1;
 }
 
@@ -668,7 +703,7 @@ mcdr_executor* MCDR_CALL mcdr_dx12AsyncExecutorCreate(void) {
         return nullptr;
     }
     auto* exec = new MainCommandExecutor();
-    if (!exec->init(dc.device.Get(), dc.queue.Get())) {
+    if (!exec->init(dc.device.Get(), dc.queue.Get(), dc.drawHeap.Get())) {
         mcdr::abi::setLastError("mcdr_dx12AsyncExecutorCreate", "MainCommandExecutor::init failed");
         logFail("dx12AsyncExecutorCreate: init");
         delete exec;

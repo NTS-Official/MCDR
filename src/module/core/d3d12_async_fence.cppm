@@ -1,5 +1,3 @@
-#pragma once
-
 // dx12-mc 异步渲染基础设施（P33）：Fence 管理器
 //
 // 用 SetEventOnCompletion + 专用等待线程替代 1ms 轮询：
@@ -10,21 +8,13 @@
 //   - signal：queue->Signal 便捷封装。
 // 回调在锁外调用，允许回调内部再次注册/注销，避免自锁死。
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
+module;
 
-#include <d3d12.h>
-#include <wrl/client.h>
+#include "_d3d12_module_prelude.h"
 
-#include <atomic>
-#include <cstdint>
-#include <functional>
-#include <mutex>
-#include <thread>
-#include <unordered_map>
+export module mcdr.d3d12.async_fence;
 
-namespace d3d12_mc {
+export namespace d3d12_mc {
 
 using Microsoft::WRL::ComPtr;
 

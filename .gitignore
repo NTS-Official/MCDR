@@ -11,6 +11,13 @@
 *.gch
 *.pch
 
+# C++ 模块（MSVC /ifcOutput 与模块扫描元数据；随工具链版本失效，不入库）
+*.ifc
+*.module.json
+*.ifc.dt
+*.ifc.bgca.dt
+*.ifc.dtast
+
 # Compiled Dynamic libraries
 *.so
 *.dylib

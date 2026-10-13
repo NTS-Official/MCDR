@@ -200,6 +200,39 @@ typedef struct mcdr_pipeline_desc {
 } mcdr_pipeline_desc;
 
 // ---------------------------------------------------------------------------
+// P72: mesh-shader (amplification / mesh) pipeline description.
+//
+// `asData`/`msData`/`psData` point at DXIL bytecode produced by DXC
+// (as_6_x / ms_6_x / ps_6_x) -- NOT HLSL source and NOT DXBC: mesh shaders
+// cannot be compiled by D3DCompile/fxc (SM 5.1 ceiling). `msData` is required;
+// `asData` may be NULL/0 (no amplification stage) and `psData` may be NULL/0
+// (no pixel shader, in which case nothing is written to the colour targets).
+//
+// Bindings reuse mcdr_pipeline_binding_desc with the SAME layout contract as
+// mcdr_pipeline_desc (CBV -> root descriptor, SRV -> the single descriptor
+// table at root index cbvCount), so mcdr_dx12PushDescriptors is unchanged.
+typedef struct mcdr_mesh_pipeline_desc {
+    const void* asData;         // DXIL amplification shader bytecode, or NULL
+    int32_t asLen;
+    int32_t _pad0;
+    const void* msData;         // DXIL mesh shader bytecode (required)
+    int32_t msLen;
+    int32_t _pad1;
+    const void* psData;         // DXIL pixel shader bytecode, or NULL
+    int32_t psLen;
+    int32_t colorCount;
+    const mcdr_color_target_desc* colorTargets;
+    int32_t hasDepth;               // same meaning as mcdr_pipeline_desc::hasDepth
+    int32_t _pad2;
+    mcdr_depth_state_desc depth;    // same layout as mcdr_pipeline_desc::depth
+    int32_t cullEnabled;
+    int32_t polygonMode;            // PolygonMode ordinal
+    int32_t bindingCount;
+    int32_t _pad3;
+    const mcdr_pipeline_binding_desc* bindings;
+} mcdr_mesh_pipeline_desc;
+
+// ---------------------------------------------------------------------------
 // ABI self-check
 //
 // The native side publishes one entry per mirrored struct field. The Java side
@@ -294,9 +327,9 @@ MCDR_API void MCDR_CALL mcdr_dx12DestroyHiddenWindow(uint64_t hwnd);
 // Command layer  (was jni_bridge_p3.cpp — 36 exports, +1 for MC 26.2 clearStencilTexture)
 // ---------------------------------------------------------------------------
 
-MCDR_API int64_t MCDR_CALL mcdr_dx12GetTimestampFrequency(void);
+MCDR_API int64_t MCDR_CALL MCDR_D3D12_get_timestamp_frequency(void);
 
-MCDR_API mcdr_command_ctx* MCDR_CALL mcdr_dx12CreateCommandEncoder(void);
+MCDR_API mcdr_command_ctx* MCDR_CALL MCDR_D3D12_create_command_encoder(void);
 MCDR_API void MCDR_CALL mcdr_dx12DestroyCommandEncoder(mcdr_command_ctx* ctx);
 MCDR_API void MCDR_CALL mcdr_dx12BeginCommandList(mcdr_command_ctx* ctx);
 MCDR_API void MCDR_CALL mcdr_dx12BeginCommandListWithWait(mcdr_command_ctx* ctx, uint64_t waitForValue);
@@ -382,6 +415,32 @@ MCDR_API void MCDR_CALL mcdr_dx12ClearAsyncRenderCtx(void);
 
 MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateGraphicsPipeline(const mcdr_pipeline_desc* desc);
 MCDR_API void MCDR_CALL mcdr_dx12DestroyPipeline(mcdr_pipeline* pipeline);
+
+// ---------------------------------------------------------------------------
+// Mesh shaders (P72: amplification/mesh pipeline + HLSL->DXIL compilation)
+//
+// Mesh shaders are unreachable through D3DCompile (SM 5.1 ceiling), so the
+// native side compiles them with DXC, loaded dynamically from dxcompiler.dll
+// next to the library or from the installed Windows SDK.
+// ---------------------------------------------------------------------------
+
+// Compiles one HLSL entry point to DXIL. Returns the bytecode size in bytes, or
+// 0 on failure (reason via mcdrLastError()). `profile` is e.g. "as_6_6" /
+// "ms_6_6" / "ps_6_0"; an empty `entry` means "main". Pass (NULL, 0) -- or a
+// buffer smaller than the result -- to learn the required size first and then
+// call again with a buffer of that size.
+MCDR_API int32_t MCDR_CALL mcdr_dx12CompileShaderDxc(const char* source, int32_t sourceLen,
+                                                     const char* entry, const char* profile, void* outDxil,
+                                                     int32_t outCapacity);
+
+// Creates an amplification/mesh pipeline from DXIL bytecode. Returns NULL and
+// sets the last error when the device does not support mesh shaders (tier 0).
+MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateMeshPipeline(const mcdr_mesh_pipeline_desc* desc);
+
+// DispatchMesh with thread-group counts. Requires a mesh pipeline bound through
+// mcdr_dx12SetPipeline, an open render pass, and bindings pushed with
+// mcdr_dx12PushDescriptors. Returns 1 on success.
+MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchMesh(mcdr_command_ctx* ctx, int32_t x, int32_t y, int32_t z);
 
 // ---------------------------------------------------------------------------
 // Surface  (was jni_bridge_p5.cpp — 13 exports)

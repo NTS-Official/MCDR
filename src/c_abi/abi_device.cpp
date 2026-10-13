@@ -1,4 +1,37 @@
-// abi_bridge.cpp — device, resource and hidden-window entry points.
+
+
+// abi_device.cpp — device, resource and hidden-window entry points
+//
+// Group: device surface (originally abi_bridge.cpp).
+// 合并自：abi_bridge.cpp
+//
+#include "_d3d12_module_prelude.h"
+
+#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
+
+import mcdr.d3d12.device;
+import mcdr.d3d12.mesh;
+import mcdr.d3d12.async_bundle;
+import mcdr.d3d12.async_descriptor;
+import mcdr.d3d12.async_executor;
+import mcdr.d3d12.async_fence;
+import mcdr.abi.common;
+
+using namespace d3d12_mc;
+
+// ===========================================================================
+// 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
+// 共享前言（prelude / mcdr_abi.h / 各模块 import）统一放在文件顶部，下面每一段
+// 保留原单元的文件头注释与代码本体，内容逐字节未改。
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 来源单元：abi_bridge.cpp
+// ---------------------------------------------------------------------------
+
+
+
+// abi_device.cpp — device, resource and hidden-window entry points.（合并自 abi_bridge.cpp）
 //
 // Replaces jni_bridge.cpp (141 lines). This is the one place the old bridge had
 // to invent an error channel: dx12CreateDevice returned a String, so a failure
@@ -15,12 +48,6 @@
 // whose access layouts are native-order (little-endian on Windows x64). There is
 // no byte-order trap left to fall into.
 
-#include "abi_common.h"
-#include "../dx12/dx12_device.h"
-
-import std;
-import std.compat;
-
 extern "C" {
 
 int32_t MCDR_CALL mcdr_dx12CreateDevice(char* buf, int32_t cap) {
@@ -36,13 +63,14 @@ int32_t MCDR_CALL mcdr_dx12CreateDevice(char* buf, int32_t cap) {
     // environment at all — the Java side owns that decision and calls
     // mcdrSetLogVerbose() before this function.
     d3d12_mc::DeviceContext& ctx = d3d12_mc::deviceContext();
-    const int level = static_cast<int>(ctx.featureLevel) & 0xffff;
-    char levelName[64];
-    std::snprintf(levelName, sizeof(levelName), "D3D_FEATURE_LEVEL_%d_%d", level / 10, level % 10);
-
+    // P66: 旧的 level/10, level%10 是错的（0xC100 会打印成 "4940_8"），现在统一走
+    // featureLevelName()；能力摘要附在后面，Java 侧那行 "Device probe ..." 日志就能
+    // 直接看到 mesh shader tier 之类的 12_2 基线。
     std::string result = ctx.adapterName.empty() ? "<unknown adapter>" : ctx.adapterName;
     result += " (";
-    result += levelName;
+    result += d3d12_mc::featureLevelName(ctx.featureLevel);
+    result += "; ";
+    result += d3d12_mc::capabilitiesText(ctx.caps);
     result += "); ";
     // P1 probe + P2 resource-layer self-test; the detail string is what the Java
     // side logs when the four-round createDevice() self-test reports.

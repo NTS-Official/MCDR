@@ -1,4 +1,4 @@
-// abi_common.h — shared helpers for the MCDR C-ABI adapter layer.
+// mcdr_abi_common.cppm — shared helpers for the MCDR C-ABI adapter layer.
 //
 // Internal to the DLL: never installed, never included by the Java side.
 //
@@ -8,22 +8,28 @@
 // behavioural change is the error channel: JNI could raise a Java exception,
 // while a C ABI cannot, so every failure lands in a thread-local last-error
 // string that the Java side polls with mcdrLastError().
-#pragma once
+//
+// 迁移说明：本文件由 abi_common.h 逐行改写而来。mcdr_abi.h 本身刻意【不】迁移：
+// 它是 extern "C" 的 C ABI（内部 125 个导出函数的声明面），语言链接实体不能从
+// 模块导出，而且 Java/FFM 侧与 Kotlin 的布局镜像（MCDR_ABI.kt / MCDR_Layout.kt）
+// 必须能按普通 C 头文件包含它。因此 mcdr_abi.h 继续以头文件形式存在，只在本模块
+// 的全局模块片段里被 #include。
 
+module;
+
+// MCDR_EXPORTS 控制 mcdr_abi.h 里 MCDR_API 展开为 __declspec(dllexport)：本模块的
+// 使用者都是本 DLL 内的实现单元，必须在包含 mcdr_abi.h 之前定义它。
 #ifndef MCDR_EXPORTS
 #define MCDR_EXPORTS 1
 #endif
 
 #include "mcdr_abi.h"
 
-#include <cstdarg>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <string>
+#include "_d3d12_module_prelude.h"
 
-namespace mcdr::abi {
+export module mcdr.abi.common;
 
+export namespace mcdr::abi {
 // ---------------------------------------------------------------------------
 // Error reporting
 // ---------------------------------------------------------------------------
@@ -78,5 +84,5 @@ inline uint64_t toHandle(const T* p) {
 // a caller can probe with (nullptr, 0) and then size exactly. Returns 0 only
 // when there is genuinely nothing to write.
 int32_t writeString(const std::string& s, char* buf, int32_t cap);
-
 }  // namespace mcdr::abi
+

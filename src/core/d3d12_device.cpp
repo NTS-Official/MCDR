@@ -1,122 +1,69 @@
-#include "dx12_device.h"
-#include <dxgi.h>
-// DXCore 只用来读驱动版本 / 驱动描述 / 硬件·集显·可拆卸分类。这里刻意只包含
-// dxcore_interface.h（它不被 _WIN32_WINNT 守卫），不包含 dxcore.h —— 后者把
-// DXCoreCreateAdapterFactory 藏在 `#if (_WIN32_WINNT >= _WIN32_WINNT_WIN10)`
-// 后面，而且一旦按名字调用就会给 MCDR.dll 引入 dxcore.lib 硬依赖。工厂函数在
-// queryDxCoreInfo() 里用 LoadLibraryW + GetProcAddress 动态解析。
-#include <dxcore_interface.h>
+module;
 
-import std;
+#include "_d3d12_module_prelude.h"
+
+// P67：DXC（IDxcUtils / IDxcCompiler3 / CLSID_DxcUtils / CLSID_DxcCompiler）。SM 6.x 与
+// mesh shader 只能由 DXC 编译（D3DCompile/fxc 停在 SM 5.1）。只用头文件拿接口定义与
+// GUID，运行时经 GetProcAddress 调 DxcCreateInstance，不链接 dxcompiler.lib；
+// 必须放在全局模块片段里，否则 MSVC 报 C5244（模块 purview 内文本包含头文件）。
+#if __has_include(<dxcapi.h>)
+#include <dxcapi.h>
+#define MCDR_HAVE_DXCAPI 1
+#else
+#define MCDR_HAVE_DXCAPI 0
+#endif
+
+module mcdr.d3d12.device;
+
+import mcdr.d3d12.async_executor;   // 文件级 MainCommandExecutor
+import mcdr.d3d12.async_bundle;     // BundleRecorder / BundleRecorderPool
+import mcdr.d3d12.async_descriptor; // PartitionedDescriptorAllocator
+import mcdr.d3d12.async_fence;      // AsyncFenceManager
+
+// P66：IDXGIFactory6 / DXGI_GPU_PREFERENCE（按 GPU 偏好顺序选适配器）。
+// P67：DXC（IDxcCompiler3 / IDxcUtils）。SM 6.x 与 mesh shader 只能由 DXC 编译
+// （D3DCompile/fxc 停在 SM 5.1）。这里只用头文件拿接口定义，运行时通过
+// GetProcAddress 调用 DxcCreateInstance，不链接 dxcompiler.lib —— DXC 是可选依赖，
+// 缺失时退化为「没有 mesh shader 编译能力」，不影响既有渲染路径。
+
 namespace d3d12_mc {
 
-Dx12Surface* gActiveSurface = nullptr;  // P18：当前 active surface（渲染线程单例）
+Dx12Surface* gActiveSurface = nullptr;
 
 namespace {
 
-// P31 fix：gCtx 原本是普通命名空间作用域对象，析构函数会在 DLL_PROCESS_DETACH
-// 阶段被 CRT 的 onexit 表调用。那时 dxgi.dll / d3d12.dll 已经 detach，析构里的
-// ComPtr::Release() 会跳进失效的 vtable —— 实测退出时产生原生异常
-// code=0x0000087A，栈为
-//   dllmain_dispatch -> dllmain_crt_process_detach -> ~DeviceContext -> dxgi.dll
-// 而 dx12CrashFilter 返回 EXCEPTION_EXECUTE_HANDLER，于是这个异常码直接成为
-// 进程退出码 2170，让一次完全正常的关闭被 Gradle 报成 BUILD FAILED。
-// 修法：放在永不析构的堆对象里。显式释放只有一条路径 —— destroyDevice() 里的
-// `gCtx = DeviceContext{}`，经 mcdr_dx12DestroyDevice 导出给 JVM 调用。
 DeviceContext* makeDeviceContext() {
     return new DeviceContext();
 }
 DeviceContext& gCtx = *makeDeviceContext();
 
-// P6：延迟销毁（官方 queueForDestroy 语义）。D3D12 资源若被一个"打开但
-// 未提交"的命令列表引用（如共享渲染 encoder 长时间打开期间 vanilla 临时
-// 创建并 close 的 staging buffer），立即释放会在 Close 时报 E_INVALIDARG
-// （"was deleted prior to closing the command list"）。因此 destroyObject
-// 只登记到 pending，等所有打开的命令列表都提交完成（submit 同步等待后）
-// 才统一 delete。
-// P46 fix：待删对象 + 其"必须已完成的 queue fence 值"。
-// 仅凭"没有打开的命令列表"就判定可释放是**不够的**：命令列表可以已经 Close
-// 并 ExecuteCommandLists 提交，但仍在 GPU 上飞行（三帧飞行）。此时 Release
-// 底层 ID3D12Resource 会被调试层判定为 CORRUPTION：
-//   ID3D12Resource3::<final-release>: CORRUPTION: An ID3D12Resource object
-//   (...) is referenced by GPU operations in-flight on Command Queue (...)
-// → RaiseException(0x0000087D) → 无调试器时进程终止（本次实测崩溃根因）。
-// 现在每个对象登记释放门槛，flush 时只释放 gCtx.queueFence 已完成到该值的
-// 条目，未满足的留到后续帧，不阻塞渲染线程。
 struct PendingDelete {
     Dx12Object* obj;
     UINT64 requiredFence;
 };
 std::vector<PendingDelete> gPendingDeletes;
-int gOpenListCount = 0;  // 当前打开（已 begin 未提交）的命令列表数
-
-// P47 fix（#921 CORRUPTION 根因）：destroyObject 发生时若仍有**打开**的命令列表
-// （gOpenListCount>0），该对象可能被这条"尚未提交"的列表引用，而它的提交时刻
-// 未知——可能远在若干帧之后（queue fence 值高得多）。此时用 destroy 当下的
-// queueFenceValue 作为门槛必然偏低。
-// 实测场景：加载期存在一条长期保持打开的共享列表，装载尾声才一次性
-// Close→Execute 提交（qf=54）；而在此期间被 destroy 的 12381 个对象记录的
-// requiredFence 全部 ≤53，于是 flush 在 gpuDone=53 时把这批资源 final-release，
-// 而引用它们的 qf=54 提交仍在 GPU 在飞 → 调试层 #921 CORRUPTION → RaiseException。
-// 解决办法：这类对象先登记"阻塞哨兵值"，直到所有打开列表都已提交
-// （flush 时 gOpenListCount 归零）才回填真实门槛（见 flushPendingDeletes）。
+int gOpenListCount = 0;
 constexpr UINT64 kFenceBlockedByOpenList = UINT64_MAX;
 
-// P44 诊断：flushPendingDeletes 崩溃定位用。崩溃过滤器读取这些值即可知道
-// 崩溃发生在哪个延迟删除对象上（delete 前的最后一次记录），无需逐行日志。
-Dx12Object* volatile gPdDeletingObj = nullptr;  // 当前正在 delete 的对象
-volatile long gPdDeletingIndex = -1;            // 其在 gPendingDeletes 中的下标
-volatile long gPdDeletingTotal = 0;             // 本次 flush 的待删对象总数
-volatile long gPdInProgress = 0;                // flush 重入保护（Interlocked）
+Dx12Object* volatile gPdDeletingObj = nullptr;
+volatile long gPdDeletingIndex = -1;
+volatile long gPdDeletingTotal = 0;
+volatile long gPdInProgress = 0;
 
-// P6：SRV / sampler 描述符堆槽位复用。纹理 view 与 sampler 长会话累积分配，
-// gNextSrv 单调递增会耗尽 4096 槽位（窗口 resize 触发 RenderTarget 重建 view
-// 时崩溃："srv heap exhausted"）。对象销毁时把槽位归还 free-list。
 std::vector<UINT> gFreeSrvSlots;
 std::vector<UINT> gFreeSamplerSlots;
 
-// P45 fix（崩溃根因）：以上两个容器会被多线程并发访问——
-//   渲染线程：present 后 flushPendingDeletes() 遍历 gPendingDeletes 并
-//             向 gFree*Slots 归还槽位；
-//   主线程  ：JNI destroyObject() push_back、allocSrvSlot/allocSamplerSlot
-//             从 gFree*Slots 取用。
-// 此前完全无锁：渲染线程正在遍历 pending 时，主线程 push_back 触发 vector
-// 扩容 → 渲染线程的迭代器指向已被释放的旧缓冲区 → 读到旧/垃圾 Dx12Object*
-// → delete 已释放对象 → ComPtr<ID3D12Resource>::Release() 落到已析构内存
-// → D3D12 调试层（D3D12SDKLayers.dll）判定 CORRUPTION 并
-// RaiseException(0x0000087D) → 无调试器时进程终止。这就是"加载末期
-// flushPendingDeletes: begin count=12425 后立刻 FATAL"的成因。
-// 下面两个互斥量把所有对上述容器的访问串行化。
-std::mutex gPendingMutex;   // 保护 gPendingDeletes
-std::mutex gFreeSlotMutex;  // 保护 gFreeSrvSlots / gFreeSamplerSlots
+std::mutex gPendingMutex;
+std::mutex gFreeSlotMutex;
 
-// ---------------------------------------------------------------------------
-// P60：Buffer 复用池（deferred-free allocator）。
-//
-// 现象：稳态采样显示主线程热点是 dx12CreateBuffer（每采样窗 20–31 次），
-// 调用链 StagedVertexBuffer$GpuBufferPool.endFrame → close → dx12DestroyResource
-// → 下一帧 acquire 池空 → Dx12GpuBuffer.<init> → dx12CreateBuffer。官方池每帧
-// 都会 close 掉 available 池（其 Vulkan 实现下重新分配来自廉价的内存池，故无碍），
-// 而我们的 close 会真正走 CreateCommittedResource：D3D12 最小分配粒度 64KB，
-// DEFAULT 堆还需驱动侧零初始化 → 每帧风暴。
-//
-// 方案：复用既有「fence 门控延迟删除」路径——flushPendingDeletes 释放
-// Kind::Buffer 时不再 delete，而是把对象转入按 (heapType, 256 对齐容量) 分档的
-// 空闲池；createBuffer 优先取出复用其 ID3D12Resource。
-// 安全性：入池仅发生在 requiredFence 已被 queue fence 覆盖之后（GPU 已不再引用
-// 该资源），故复用无 hazard。容量封顶，超限即真释放，避免长会话内存膨胀。
-// ---------------------------------------------------------------------------
 struct PooledBuffer {
-    Dx12Object* obj;  // 保持存活的对象（resource 已 Unmap、无在飞引用）
+    Dx12Object* obj;
 };
 std::vector<PooledBuffer> gFreeBuffers;
 size_t gFreeBufferBytes = 0;
-std::mutex gFreeBufferMutex;  // 保护 gFreeBuffers / gFreeBufferBytes
-constexpr size_t kMaxFreeBufferBytes = 96ull * 1024 * 1024;  // 96MB 封顶
+std::mutex gFreeBufferMutex;
+constexpr size_t kMaxFreeBufferBytes = 96ull * 1024 * 1024;
 
-// buffer 的 D3D12 资源容量（真实资源宽度；回退到逻辑 size 的 256 对齐）。
-// 复用后 obj->size 会被设为更小的请求值，必须用资源真实宽度记账/匹配，
-// 否则池内条目容量被低估，后续更大请求无法命中。
 UINT64 bufferCapacity(const Dx12Object* o) {
     if (o->resource) {
         return o->resource->GetDesc().Width;
@@ -124,11 +71,6 @@ UINT64 bufferCapacity(const Dx12Object* o) {
     return (static_cast<UINT64>(o->size) + 255ULL) & ~255ULL;
 }
 
-// 从复用池取出容量 >= 请求值的 buffer（best-fit，最小可用者）；无匹配返回 nullptr。
-// 之前要求容量完全相等，而实体渲染的 StagedVertexBuffer 尺寸逐帧变化 → 几乎每帧
-// 全部 miss、走 CreateCommittedResource（D3D12 最小分配粒度 64KB + DEFAULT 堆
-// 零初始化，是主线程最大热点）。改为「不小于请求值即可复用」，底层资源更大无害
-// （消费方用的是 obj->size 逻辑长度）。
 Dx12Object* takePooledBuffer(D3D12_HEAP_TYPE heapType, UINT64 capacity) {
     std::lock_guard<std::mutex> lk(gFreeBufferMutex);
     size_t best = SIZE_MAX;
@@ -145,81 +87,44 @@ Dx12Object* takePooledBuffer(D3D12_HEAP_TYPE heapType, UINT64 capacity) {
     }
     if (best == SIZE_MAX) return nullptr;
     Dx12Object* obj = gFreeBuffers[best].obj;
-    gFreeBufferBytes -= bestCap;
+    // 记账量被 kMaxFreeBufferBytes（96 MiB）封顶，32 位 size_t 也不会溢出，故显式收窄
+    // 以免 x86 下触发 C4244（x64 下与原先完全等价）。
+    gFreeBufferBytes -= static_cast<size_t>(bestCap);
     gFreeBuffers[best] = gFreeBuffers.back();
     gFreeBuffers.pop_back();
     return obj;
 }
 
-// 把 fence 已覆盖的 buffer 归还复用池；超容量则真释放。
 void recyclePooledBuffer(Dx12Object* obj) {
     UINT64 capacity = bufferCapacity(obj);
     {
         std::lock_guard<std::mutex> lk(gFreeBufferMutex);
-        if (gFreeBufferBytes + capacity <= kMaxFreeBufferBytes) {
+        if (gFreeBufferBytes + static_cast<size_t>(capacity) <= kMaxFreeBufferBytes) {
             gFreeBuffers.push_back(PooledBuffer{obj});
-            gFreeBufferBytes += capacity;
+            gFreeBufferBytes += static_cast<size_t>(capacity);
             return;
         }
     }
     delete obj;
 }
 
-// 释放所有 pending 删除对象。调用前提：没有打开的命令列表（全部已提交并
-// 同步等待完成），此时被删资源不再被任何命令列表引用，可安全释放。
-// 定义在匿名 namespace 外，以便 destroySurface 等跨编译单元调用。
-// （见 dx12_device.cpp 第 235 行之后）
-
-// 描述符堆槽位分配（P2 简单递增；P3 渲染层再做槽位回收）
 UINT gNextSrv = 0;
-UINT gNextRtv = 0;        // 持久 RTV 槽位（surface backbuffer 用，不随帧清零）
-UINT gNextFrameRtv = 0;   // P24：帧级瞬态 RTV 槽位（beginRenderPass/clearColorTexture）
+UINT gNextRtv = 0;
+UINT gNextFrameRtv = 0;
 UINT gNextDsv = 0;
 UINT gNextSampler = 0;
 
-// P6 修复（srv heap exhausted）：Minecraft 资源包加载/窗口 resize 的瞬时
-// 峰值会同时持有数千个 texture view（旧 view 在 pending 删除队列尚未归还
-// 槽位 + 新 view 批量创建），4096 槽位实测耗尽 → 资源包被移除 → GUI draws
-// 为空 → 渲染目标只剩 clear 色 → 黑屏（按钮有声音）。D3D12 CBV_SRV_UAV
-// SHADER_VISIBLE 堆上限 1,000,000（Tier1），一次性开大彻底消除该崩溃点；
-// free-list 槽位复用仍保留，覆盖长期会话的泄漏兜底。
-// Issue #10：图集上传期间 TextureAtlas.uploadInitialContents 会为每个
-// sprite 的每个 mip 级各创建一个 GpuTextureView（mipLevelCount ×
-// staticSprites.size() 个），且整轮资源重载期间共享 encoder 的命令列表一直
-// 未提交（gOpenListCount>0）→ 延迟删除的 view 槽位无法回收 → 累计 view 数
-// 等于累计 draw 数。原 65536 在大整合包下同样接近耗尽（此前的 32768 ring
-// 崩溃即发生在此阈值之前）。提升到 262144，为累计 view 留出约 4 倍余量。
 constexpr UINT kSrvHeapSize = 262144;
 constexpr UINT kRtvHeapSize = 2048;
-// P24：帧级瞬态 RTV 堆容量。单帧 render pass 附件 + clear 数量远小于 256；
-// 每帧从 0 复用（submit 阻塞等待 GPU 完成，CPU 侧重写描述符安全）。
 constexpr UINT kFrameRtvHeapSize = 256;
 constexpr UINT kDsvHeapSize = 256;
-// 注意：D3D12 对 SAMPLER 描述符堆有硬上限 2048（所有 feature level），
-// 扩到此值即为最大；再大 CreateDescriptorHeap 直接失败（曾设为 4096 导致
-// 堆创建失败 → ensureDevice 半初始化 → createSampler 解引用 null 堆 AV）。
 constexpr UINT kSamplerHeapSize = 2048;
-
-// P6：瞬时描述符堆（drawHeap）每帧半区容量 + 总数（ring x4，配合三帧飞行）
-// 注意：D3D12 root signature 的 descriptor table 从 heapBase 绝对寻址，
-// GPU 命令列表在提交后仍会持续读取这些描述符直到 fence 完成。
-// 三帧飞行（N、N+1、N+2 同时在空中），需要 4 个半区确保帧 N+2 写时
-// 不会覆盖帧 N（GPU 仍在读）所使用的半区。
-// P33 async：每帧段槽位数 = 同步 ring 保留区 + 各 worker 分区之和。
-// 开启异步分区后，每段起始 kAsyncSyncRingReserve 个槽位归同步路径 ring，
-// 其余 kAsyncWorkerSlotsPerSection 个槽位按 worker 均分（见
-// PartitionedDescriptorAllocator::init）。两区严格互不重叠，故此处必须等于
-// 二者之和，否则 worker 分区会越界写入相邻帧段。
 constexpr UINT kDrawHeapPerFrame = kAsyncSyncRingReserve + kAsyncWorkerSlotsPerSection;
 constexpr UINT kDrawHeapSections = 4;
 constexpr UINT kDrawHeapSize = kDrawHeapPerFrame * kDrawHeapSections;
 
-// P33 async：同步 ring 在当前帧段内可用的槽位数。
-// 未开启异步分区（syncRingReserve==0）时同步路径独占整段；开启后每段起始的
-// syncRingReserve 个槽位归同步 ring，其余归 worker 分区，二者绝不重叠。
 inline UINT syncRingCapacity() { return gCtx.syncRingReserve > 0 ? gCtx.syncRingReserve : kDrawHeapPerFrame; }
 
-// P45 fix：pending 列表 / free-list 的加锁访问辅助（供本文件各处复用）。
 size_t pendingDeletesCount() {
     std::lock_guard<std::mutex> lk(gPendingMutex);
     return gPendingDeletes.size();
@@ -247,23 +152,15 @@ size_t freeSamplerSlotCount() {
     return gFreeSamplerSlots.size();
 }
 
-// 从 free-list 复用或从堆尾分配一个 SRV 槽位；失败填充 err 返回 -1。
 int allocSrvSlot(std::string& err) {
     int slot = popFreeSrvSlot();
     if (slot >= 0) return slot;
-    // P6 兜底：堆满但存在未 flush 的延迟删除对象且没有打开的命令列表时，
-    // 先 flush 一次再重试（正常路径 submit 后已 flush，此分支仅防御性的
-    // 覆盖"批量 create+destroy 夹在两次 submit 之间"的时序）。
-    // 注意：flush 内部会取 gFreeSlotMutex，故上面必须先释放锁（popFree*
-    // 为独立作用域），否则死锁。
     if (gNextSrv >= kSrvHeapSize && gOpenListCount == 0 && pendingDeletesCount() > 0) {
         flushPendingDeletes();
         slot = popFreeSrvSlot();
         if (slot >= 0) return slot;
     }
     if (gNextSrv >= kSrvHeapSize) {
-        // 诊断：若仍耗尽，打印堆使用画像定位泄漏（live 近似 = next - free，
-        // 实际持有者 = next - free - pending 中未 flush 的 view）。
         err = "srv heap exhausted (next=" + std::to_string(static_cast<long long>(gNextSrv))
               + " free=" + std::to_string(static_cast<long long>(freeSrvSlotCount()))
               + " pending=" + std::to_string(static_cast<long long>(pendingDeletesCount()))
@@ -273,7 +170,6 @@ int allocSrvSlot(std::string& err) {
     return static_cast<int>(gNextSrv++);
 }
 
-// 同上，sampler 槽位。
 int allocSamplerSlot(std::string& err) {
     int slot = popFreeSamplerSlot();
     if (slot >= 0) return slot;
@@ -307,7 +203,6 @@ std::string hrText(HRESULT hr) {
     return buf;
 }
 
-// 创建 adapter 查询用的 factory + LUID 适配器枚举
 std::string queryAdapterName(ID3D12Device* dev) {
     try {
         ComPtr<IDXGIFactory4> factory;
@@ -325,7 +220,6 @@ std::string queryAdapterName(ID3D12Device* dev) {
     }
 }
 
-// 设备移除诊断：GetDeviceRemovedReason + 调试层最近消息（定位 0x887A0005 根因）。
 std::string deviceStatusText() {
     std::string s;
     if (!gCtx.device) return s;
@@ -349,10 +243,6 @@ std::string deviceStatusText() {
     return s;
 }
 
-// P6 诊断：转储并清空调试层 InfoQueue 消息（每帧开始时调用）。验证错误
-// （ERROR/CORRUPTION）在 API 调用时写入 InfoQueue，但多数不导致崩溃，若
-// 不主动读就会静默累积；打印出来可定位非法调用（UPLOAD heap 非法 transition、
-// 未绑定/越界描述符、root 参数未设置、PSO 与 root signature 不匹配等）。
 void dumpInfoQueueMessages() {
     if (!gCtx.infoQueue) return;
     UINT64 count = gCtx.infoQueue->GetNumStoredMessages();
@@ -380,35 +270,24 @@ void dumpInfoQueueMessages() {
 
 }  // namespace
 
-// 释放所有 pending 删除对象。调用前提：没有打开的命令列表（全部已提交并
-// 同步等待完成），此时被删资源不再被任何命令列表引用，可安全释放。
-// 定义在此处（匿名 namespace 外）以便 destroySurface 等跨编译单元调用。
+// 诊断：设备移除原因 + InfoQueue 最近消息。presentSurface 失败时调用（见 dx12_surface.cpp），
+// 未开调试层时这是唯一能说明「为什么 0x887A0005」的证据。
+void logDeviceStatus(const char* tag) {
+    const std::string s = deviceStatusText();
+    if (s.empty()) return;
+    dbgLog("%s: device status: %s", tag, s.c_str());
+}
+
 void flushPendingDeletes(bool force) {
-    // P44：重入/并发保护。flush 可能来自渲染线程（present 后）、主线程
-    // （allocSrvSlot 堆满兜底）或 destroyCommandEncoder；若两处同时进入，
-    // 会并发遍历/修改同一个 std::vector → 迭代器失效 + double free。
-    // 拿到锁的线程先跑完，另一线程直接返回（对象留待下次 flush）。
     if (InterlockedExchange(&gPdInProgress, 1) != 0) {
         dbgLog("flushPendingDeletes: concurrent/re-entrant call skipped (pending=%lld)",
                static_cast<long long>(pendingDeletesCount()));
         return;
     }
-    // P46 fix：只摘出 GPU 确已完成（queueFence 已推进到 requiredFence）的条目。
-    // force=true 用于进程退出：此时必须释放全部，否则遗留 live object；
-    // 调用方须自行保证 GPU 已空闲（见 destroyDevice 的 fence drain）。
     UINT64 gpuDone = UINT64_MAX;
     if (!force && gCtx.queueFence) {
         gpuDone = gCtx.queueFence->GetCompletedValue();
     }
-    // P45 fix：在锁内把可释放条目摘出到本地，随后在锁外逐个 delete。
-    // 这样既杜绝与主线程 destroyObject() 的 push_back 竞争（扩容导致迭代器
-    // 失效 → double free），又不会在耗时的 delete 期间长时间持锁。
-    //
-    // P47 fix（#921 根因）：先把"阻塞于打开列表"（kFenceBlockedByOpenList）的
-    // 条目回填为真实门槛。前提是此刻没有打开的命令列表（各调用点均以
-    // gOpenListCount==0 为前提）——说明 destroy 时那些打开的列表现已全部提交，
-    // 其 queue fence 值必然 ≤ 当前 gCtx.queueFenceValue（含 present flip 的推进），
-    // 故以当前值作为这些对象的上界门槛，再按 gpuDone 判定是否可释放。
     const bool canResolveBlocked = (gOpenListCount == 0);
     const UINT64 resolveFence = gCtx.queueFenceValue;
     std::vector<PendingDelete> local;
@@ -426,7 +305,7 @@ void flushPendingDeletes(bool force) {
                     keep.push_back(pd);
                     continue;
                 }
-                pd.requiredFence = resolveFence;  // 回填后随下一帧 gpuDone 推进释放
+                pd.requiredFence = resolveFence;
             }
             if (pd.requiredFence <= gpuDone) {
                 local.push_back(pd);
@@ -438,7 +317,6 @@ void flushPendingDeletes(bool force) {
     }
     gPdDeletingTotal = static_cast<long>(local.size());
     if (gPdDeletingTotal > 0) {
-        // 逐帧诊断（每帧 1 次 stderr+文件 flush）→ DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
         dbgLogDebug("flushPendingDeletes: begin count=%ld deferred=%lld gpuDone=%llu", gPdDeletingTotal,
                     static_cast<long long>(pendingDeletesCount()), static_cast<unsigned long long>(gpuDone));
     }
@@ -447,7 +325,6 @@ void flushPendingDeletes(bool force) {
         Dx12Object* o = pd.obj;
         gPdDeletingObj = o;
         gPdDeletingIndex = idx++;
-        // 先归还描述符堆槽位（delete 后句柄失效，须在此前完成）
         if (o->descSlot >= 0) {
             std::lock_guard<std::mutex> lk(gFreeSlotMutex);
             if (o->kind == Dx12Object::Kind::TextureView) {
@@ -456,9 +333,6 @@ void flushPendingDeletes(bool force) {
                 gFreeSamplerSlots.push_back(static_cast<UINT>(o->descSlot));
             }
         }
-        // P60：Buffer 转入复用池（而非 delete），供 createBuffer 复用底层
-        // ID3D12Resource，消除每帧 CreateCommittedResource 风暴。force=true
-        // （设备销毁）时仍直接释放，避免残留资源。
         if (!force && o->kind == Dx12Object::Kind::Buffer) {
             recyclePooledBuffer(o);
             continue;
@@ -469,11 +343,9 @@ void flushPendingDeletes(bool force) {
     gPdDeletingIndex = -1;
     gPdDeletingTotal = 0;
     InterlockedExchange(&gPdInProgress, 0);
-    // 逐帧诊断 → DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
     dbgLogDebug("flushPendingDeletes: done");
 }
 
-// 毫秒时间戳（QPC），供诊断插桩打印精确阻塞点（渲染线程卡死排查用）。
 double nowMs() {
     LARGE_INTEGER f, c;
     QueryPerformanceFrequency(&f);
@@ -481,20 +353,12 @@ double nowMs() {
     return static_cast<double>(c.QuadPart) * 1000.0 / static_cast<double>(f.QuadPart);
 }
 
-// P15: 日志级别 - 默认只输出 WARNING 及以上；设置环境变量 DX12_LOG_VERBOSE=1 开启 INFO/DEBUG
-static int gLogLevel = 1; // WARN=1; ERR=0, WARN=1, INFO=2, DEBUG=3
+static int gLogLevel = 1;
 
-// 诊断插桩：打印到 stderr（PCL 启动器会写入游戏日志；不影响 debug.log）。
-// P12：同时镜像写入独立日志文件——PCL 启动器死锁/游戏异常退出时
-// stderr 重定向的游戏日志丢失，此独立文件随写随刷，进程挂起也能看到卡死点
-// 的最后一条原生调用（fence 等待 / destroy 路径）。
-// P30：镜像写入仅当环境变量 DX12_NATIVE_LOG_FILE 非空时启用；复用 static
-// FILE* 句柄（首次 fopen 后保持打开，进程退出时无需刻意关闭），删除逐行
-// fopen/fclose，避免渲染热路径每次日志的系统调用开销。
 static void mirrorLogToFile(const char* line) {
     static FILE* s_mirrorFile = nullptr;
     const char* path = std::getenv("DX12_NATIVE_LOG_FILE");
-    if (!path || !*path) return;  // 未显式启用则不写镜像文件
+    if (!path || !*path) return;
     if (!s_mirrorFile) {
         s_mirrorFile = std::fopen(path, "a");
         if (!s_mirrorFile) return;
@@ -547,11 +411,6 @@ void dbgLogDebug(const char* fmt, ...) {
 }
 void setLogLevel(int level) { gLogLevel = (level < 0) ? 0 : (level > 3) ? 3 : level; }
 
-// P44 诊断：D3D12 调试层同步消息回调。
-// 调试层判定 CORRUPTION（severity=0）时默认 break——无调试器时表现为
-// RaiseException(0x87D) → 未处理异常 → 进程终止。此时 InfoQueue 轮询根本
-// 来不及，只有同步回调能在抛异常前抓到这条消息。仅打印 WARNING 及以上
-// （0=CORRUPTION 1=ERROR 2=WARNING），避免 INFO 级信息洪流拖慢帧率。
 static DWORD gInfoQueueCookie = 0;
 static void CALLBACK dx12DebugMessageCallback(D3D12_MESSAGE_CATEGORY /*category*/,
                                               D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id,
@@ -565,13 +424,6 @@ static void CALLBACK dx12DebugMessageCallback(D3D12_MESSAGE_CATEGORY /*category*
     std::fflush(stderr);
 }
 
-// ---------------------------------------------------------------------------
-// 设备生命周期
-// ---------------------------------------------------------------------------
-
-// P33 诊断：全局未处理异常过滤器。上一次运行在第二次 dx12CreateSurface 内部静默崩溃
-// （无错误输出、无 JVM 崩溃日志），无法定位。这里在进程因原生异常终止前打印异常码、
-// 出错地址及其所属模块（DLL 名），便于判断崩溃发生在 nvapi/DXGI 还是本模块。
 static LONG WINAPI dx12CrashFilter(EXCEPTION_POINTERS* ep) {
     if (ep != nullptr && ep->ExceptionRecord != nullptr) {
         EXCEPTION_RECORD* rec = ep->ExceptionRecord;
@@ -585,15 +437,11 @@ static LONG WINAPI dx12CrashFilter(EXCEPTION_POINTERS* ep) {
         std::fprintf(stderr, "[dx12] FATAL native exception code=0x%08X addr=%p tid=%lu module=%s\n",
                      static_cast<unsigned>(rec->ExceptionCode), rec->ExceptionAddress,
                      static_cast<unsigned long>(GetCurrentThreadId()), modPath);
-        // P44 诊断：延迟删除状态。若崩溃发生在 flushPendingDeletes 内，
-        // 这里能直接看到正被 delete 的对象指针 / 下标 / 本批总数。
         std::fprintf(stderr,
                      "[dx12] FATAL context: pendingDeletes=%lld openList=%d flushInProgress=%ld "
                      "deletingObj=%p deletingIndex=%ld deletingTotal=%ld\n",
                      static_cast<long long>(gPendingDeletes.size()), gOpenListCount, gPdInProgress,
                      reinterpret_cast<void*>(gPdDeletingObj), gPdDeletingIndex, gPdDeletingTotal);
-        // P44 诊断：正被 delete 的对象详情。若该对象确为 Texture/Buffer
-        // （resource != null），说明崩溃在其 ID3D12Resource::Release()。
         Dx12Object* dObj = gPdDeletingObj;
         if (dObj) {
             std::fprintf(stderr,
@@ -603,14 +451,10 @@ static LONG WINAPI dx12CrashFilter(EXCEPTION_POINTERS* ep) {
                          reinterpret_cast<void*>(dObj->resource.Get()),
                          reinterpret_cast<void*>(dObj->sourceTexture), dObj->mappedPtr, dObj->size);
         }
-        // P44 诊断：设备移除原因。若此前 GPU 已挂（TDR/页错误），后续任意
-        // D3D12 调用都会被调试层报为 CORRUPTION → break。此值可区分两者。
         if (gCtx.device) {
             std::fprintf(stderr, "[dx12] FATAL deviceRemovedReason=0x%08X\n",
                          static_cast<unsigned>(gCtx.device->GetDeviceRemovedReason()));
         }
-        // P44 诊断：栈回溯（模块名 + RVA）。即使没有 PDB 也能定位到"哪个模块的
-        // 哪段代码"；本 DLL 的 RVA 可用同版本 map/PDB 反查函数名。
         void* frames[48];
         USHORT nframes = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
         std::fprintf(stderr, "[dx12] FATAL backtrace: %u frames\n", static_cast<unsigned>(nframes));
@@ -633,10 +477,9 @@ static LONG WINAPI dx12CrashFilter(EXCEPTION_POINTERS* ep) {
         }
         std::fflush(stderr);
     }
-    return EXCEPTION_EXECUTE_HANDLER;  // 按原行为终止进程
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
-// 仅安装一次（进程级）。
 static void installCrashHandlerOnce() {
     static bool installed = false;
     if (installed) return;
@@ -644,19 +487,627 @@ static void installCrashHandlerOnce() {
     SetUnhandledExceptionFilter(&dx12CrashFilter);
 }
 
+// ---------------------------------------------------------------------------
+// P66：设备功能级 12_2 基线 —— 适配器选择与能力查询
+//
+// 旧实现是 D3D12CreateDevice(nullptr, level, ...)：nullptr 取的是"默认适配器"，
+// 在混合显卡机器上通常就是驱动主输出的核显（本机实测 Intel UHD 只能到 12_1、
+// MeshShaderTier=0），而窗口（GLFW/OpenGL）和实际渲染其实在独显上。设备与窗口
+// 不在同一块 GPU 上时，CreateSwapChainForHwnd 会对所有 tier 返回
+// E_ACCESSDENIED(0x80070005)，于是只能回退 CreateSwapChainForComposition——
+// 这正是 RTSS 之类挂在 HWND Present 上的 overlay 无法显示的原因之一。
+//
+// 现在改成：按 IDXGIFactory6::EnumAdapterByGpuPreference(HIGH_PERFORMANCE) 的顺序
+// 枚举硬件适配器，取第一块能建出 12_2 的设备；一块都没有就明确报错，不再像以前
+// 那样静默退到 11_0/12_1——那些级别下 mesh shader、DXR 1.1 之类目标特性根本不存在。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 设备功能级下限：12_2 == D3D12 Ultimate。
+constexpr D3D_FEATURE_LEVEL kRequiredFeatureLevel = D3D_FEATURE_LEVEL_12_2;
+
+constexpr D3D_FEATURE_LEVEL kProbeLevels[] = {
+    D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
+    D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+};
+
+// 某块适配器能建出的最高功能级；(D3D_FEATURE_LEVEL)0 表示完全不支持 D3D12。
+D3D_FEATURE_LEVEL probeHighestFeatureLevel(IDXGIAdapter* adapter) {
+    for (auto level : kProbeLevels) {
+        ComPtr<ID3D12Device> probe;
+        if (SUCCEEDED(D3D12CreateDevice(adapter, level, IID_PPV_ARGS(&probe)))) {
+            return level;
+        }
+    }
+    return static_cast<D3D_FEATURE_LEVEL>(0);
+}
+
+std::string adapterDescName(const DXGI_ADAPTER_DESC1& desc) {
+    char name[256] = {};
+    WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name), nullptr, nullptr);
+    return name;
+}
+
+// 枚举硬件适配器（跳过 WARP / Basic Render Driver 这类软件适配器），按 GPU 偏好
+// 顺序返回第一块支持 12_2 的。失败时 errorOut 里带上每块候选的最高功能级，方便
+// 用户在日志里直接看到是哪块卡不达标。
+bool selectDeviceAdapter(ComPtr<IDXGIAdapter1>& out, std::string& errorOut) {
+    constexpr UINT kMaxAdapters = 32;
+    std::string report;
+
+    // IDXGIFactory6（Win10 1803+）拿不到就退回默认枚举顺序。
+    ComPtr<IDXGIFactory6> factory6;
+    ComPtr<IDXGIFactory4> factory4;
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory6)))) {
+        factory6 = nullptr;
+    }
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory4)))) {
+        errorOut = "CreateDXGIFactory failed";
+        return false;
+    }
+
+    for (UINT i = 0; i < kMaxAdapters; ++i) {
+        ComPtr<IDXGIAdapter1> adapter;
+        if (factory6) {
+            if (FAILED(factory6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                            IID_PPV_ARGS(&adapter)))) {
+                break;
+            }
+        } else if (FAILED(factory4->EnumAdapters1(i, &adapter))) {
+            break;
+        }
+        DXGI_ADAPTER_DESC1 desc{};
+        if (FAILED(adapter->GetDesc1(&desc))) {
+            continue;
+        }
+        const std::string name = adapterDescName(desc);
+        if ((desc.Flags & static_cast<UINT>(DXGI_ADAPTER_FLAG_SOFTWARE)) != 0u) {
+            report += "  [software] " + name + "\n";
+            continue;
+        }
+        const D3D_FEATURE_LEVEL best = probeHighestFeatureLevel(adapter.Get());
+        report += "  " + name + " -> " + featureLevelName(best) + "\n";
+        if (best >= kRequiredFeatureLevel) {
+            out = adapter;
+            dbgLog("P66 adapter select: %s (highest FL=%s)", name.c_str(), featureLevelName(best));
+            return true;
+        }
+    }
+
+    errorOut = "no adapter supports D3D_FEATURE_LEVEL_12_2; candidates:\n" + report;
+    std::fprintf(stderr, "[dx12] %s", errorOut.c_str());
+    return false;
+}
+
+}  // namespace
+
+const char* featureLevelName(D3D_FEATURE_LEVEL level) {
+    switch (level) {
+        case D3D_FEATURE_LEVEL_12_2: return "12_2";
+        case D3D_FEATURE_LEVEL_12_1: return "12_1";
+        case D3D_FEATURE_LEVEL_12_0: return "12_0";
+        case D3D_FEATURE_LEVEL_11_1: return "11_1";
+        case D3D_FEATURE_LEVEL_11_0: return "11_0";
+        case D3D_FEATURE_LEVEL_10_1: return "10_1";
+        case D3D_FEATURE_LEVEL_10_0: return "10_0";
+        case D3D_FEATURE_LEVEL_9_3: return "9_3";
+        case D3D_FEATURE_LEVEL_9_2: return "9_2";
+        case D3D_FEATURE_LEVEL_9_1: return "9_1";
+        default: return "unknown";
+    }
+}
+
+const char* shaderModelName(D3D_SHADER_MODEL model) {
+    switch (model) {
+        case D3D_SHADER_MODEL_5_1: return "5.1";
+        case D3D_SHADER_MODEL_6_0: return "6.0";
+        case D3D_SHADER_MODEL_6_1: return "6.1";
+        case D3D_SHADER_MODEL_6_2: return "6.2";
+        case D3D_SHADER_MODEL_6_3: return "6.3";
+        case D3D_SHADER_MODEL_6_4: return "6.4";
+        case D3D_SHADER_MODEL_6_5: return "6.5";
+        case D3D_SHADER_MODEL_6_6: return "6.6";
+        case D3D_SHADER_MODEL_6_7: return "6.7";
+        case D3D_SHADER_MODEL_6_8: return "6.8";
+        case D3D_SHADER_MODEL_6_9: return "6.9";
+        default: break;
+    }
+    // 6.10 (0x6A) 尚未出现在 10.0.26100 SDK 的 D3D_SHADER_MODEL 枚举里（最高只到
+    // D3D_SHADER_MODEL_6_9 = 0x69），但运行时能报出来、kShaderModelCeiling 也钉在它上面，
+    // 所以单独判一次。放在 switch 之后是因为 C4063：case 标签取值若不在枚举值域内，
+    // /W4 会直接报"case 不是有效值"，而本项目 TreatWarningAsError=true。
+    if (model == kShaderModelCeiling) return "6.10";
+    return "unknown";
+}
+
+const char* shaderModelProfileSuffix(D3D_SHADER_MODEL model) {
+    switch (model) {
+        case D3D_SHADER_MODEL_6_0: return "6_0";
+        case D3D_SHADER_MODEL_6_1: return "6_1";
+        case D3D_SHADER_MODEL_6_2: return "6_2";
+        case D3D_SHADER_MODEL_6_3: return "6_3";
+        case D3D_SHADER_MODEL_6_4: return "6_4";
+        case D3D_SHADER_MODEL_6_5: return "6_5";
+        case D3D_SHADER_MODEL_6_6: return "6_6";
+        case D3D_SHADER_MODEL_6_7: return "6_7";
+        case D3D_SHADER_MODEL_6_8: return "6_8";
+        case D3D_SHADER_MODEL_6_9: return "6_9";
+        default: break;
+    }
+    // 同 shaderModelName：0x6A 不在 10.0.26100 SDK 的枚举值域内，只能出 switch 单独判。
+    if (model == kShaderModelCeiling) return "6_10";
+    return "";
+}
+
+D3D_SHADER_MODEL effectiveShaderModel(const DeviceContext::Capabilities& caps) {
+    // 注意：未查询成功时 caps.shaderModel 是 5_1，这里会老实返回 5_1，调用方据此
+    // 退到旧路径，而不是误以为能用 6.x。
+    return caps.shaderModel < kShaderModelCeiling ? caps.shaderModel : kShaderModelCeiling;
+}
+
+// ---------------------------------------------------------------------------
+// P67：DXC 探测（mesh shader 基础）
+// ---------------------------------------------------------------------------
+// 目的：把"本机能不能编译 mesh shader"变成一条确定的能力事实（日志 + JSON），
+// 并给出 dxcompiler.dll 的实际来源，便于后续把 AS/MS 管线接上去时直接复用。
+// 真正的 mesh 管线还需要 D3D12_PIPELINE_STATE_STREAM_DESC（AS/MS PSO）与 meshlet
+// 数据组织，本步不做。
+#if MCDR_HAVE_DXCAPI
+namespace {
+
+using PFN_DxcCreateInstance = HRESULT(WINAPI*)(REFCLSID, REFIID, LPVOID);
+
+// 最小可编译 mesh shader：只用于验证 DXC 能产出 ms_6_x 的 DXIL，不参与渲染。
+constexpr char kMeshSmokeHlsl[] = R"hlsl(
+struct MeshVertex { float4 position : SV_Position; };
+
+[outputtopology("triangle")]
+[numthreads(1, 1, 1)]
+void main(out vertices MeshVertex verts[3], out indices uint3 tris[1]) {
+    SetMeshOutputCounts(3, 1);
+    verts[0].position = float4(0.0, 0.0, 0.0, 1.0);
+    verts[1].position = float4(1.0, 0.0, 0.0, 1.0);
+    verts[2].position = float4(0.0, 1.0, 0.0, 1.0);
+    tris[0] = uint3(0, 1, 2);
+}
+)hlsl";
+
+std::string hexHr(HRESULT hr) {
+    char buf[16] = {};
+    std::snprintf(buf, sizeof(buf), "0x%08X", static_cast<unsigned>(hr));
+    return buf;
+}
+
+// 多行 DXC 诊断只留第一行（日志/JSON 里不宜铺开）。
+std::string firstLine(const std::string& text) {
+    const size_t nl = text.find_first_of("\r\n");
+    std::string line = nl == std::string::npos ? text : text.substr(0, nl);
+    while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) {
+        line.pop_back();
+    }
+    if (line.size() > 220) {
+        line.resize(220);
+        line += "...";
+    }
+    return line;
+}
+
+bool fileExists(const std::wstring& path) {
+    const DWORD attr = GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+// MCDR.dll 自身所在目录（将来随模组分发 dxcompiler.dll/dxil.dll 时放这里）。
+std::wstring moduleDirectory() {
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&moduleDirectory), &self)) {
+        return std::wstring();
+    }
+    wchar_t path[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(self, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        return std::wstring();
+    }
+    std::wstring dir(path, n);
+    const size_t slash = dir.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : dir.substr(0, slash);
+}
+
+// Windows SDK 里版本号最大的 bin\<ver>\x64（含 dxcompiler.dll/dxil.dll 的那一份）。
+std::wstring sdkDxcDirectory() {
+    const std::wstring root = L"C:\\Program Files (x86)\\Windows Kits\\10\\bin\\";
+    std::wstring best;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((root + L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        return std::wstring();
+    }
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            continue;
+        }
+        const std::wstring ver(fd.cFileName);
+        if (ver == L"." || ver == L".." || (!best.empty() && ver <= best)) {
+            continue;
+        }
+        if (fileExists(root + ver + L"\\x64\\dxcompiler.dll")) {
+            best = ver;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return best.empty() ? std::wstring() : root + best + L"\\x64";
+}
+
+// 搜索顺序：MCDR_DXC_DIR 环境变量 → MCDR.dll 同目录 → SDK 最新版本。
+std::wstring findDxcDirectory() {
+    std::vector<std::wstring> candidates;
+    if (const wchar_t* env = _wgetenv(L"MCDR_DXC_DIR")) {
+        if (env[0] != L'\0') {
+            candidates.emplace_back(env);
+        }
+    }
+    const std::wstring selfDir = moduleDirectory();
+    if (!selfDir.empty()) {
+        candidates.push_back(selfDir);
+    }
+    const std::wstring sdk = sdkDxcDirectory();
+    if (!sdk.empty()) {
+        candidates.push_back(sdk);
+    }
+    for (const std::wstring& dir : candidates) {
+        if (fileExists(dir + L"\\dxcompiler.dll")) {
+            return dir;
+        }
+    }
+    return std::wstring();
+}
+
+std::string toUtf8(const std::wstring& w) {
+    if (w.empty()) {
+        return std::string();
+    }
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), nullptr, 0,
+                                      nullptr, nullptr);
+    if (n <= 0) {
+        return std::string();
+    }
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), out.data(), n, nullptr,
+                        nullptr);
+    return out;
+}
+
+std::wstring toWide(const std::string& s) {
+    if (s.empty()) {
+        return std::wstring();
+    }
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    if (n <= 0) {
+        return std::wstring();
+    }
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), out.data(), n);
+    return out;
+}
+
+// 用 DXC 把 HLSL 编到 DXIL；成功时 outDxil 收到字节码，失败时 err 收到诊断首行。
+// P72：入口点与源码长度都变成显式参数（原实现写死 entry="main" 且要求 NUL 结尾），
+// 这样 as_6_x / ms_6_x / ps_6_x 都可以走同一条编译路径。
+bool compileWithDxc(IDxcUtils* utils, IDxcCompiler3* compiler, const char* source, size_t sourceLen,
+                    const std::string& entry, const std::string& target, std::string& err,
+                    std::vector<uint8_t>& outDxil) {
+    ComPtr<IDxcBlobEncoding> srcBlob;
+    if (FAILED(utils->CreateBlobFromPinned(source, static_cast<UINT32>(sourceLen), DXC_CP_UTF8,
+                                           &srcBlob))) {
+        err = "CreateBlobFromPinned failed";
+        return false;
+    }
+    DxcBuffer buffer{};
+    buffer.Ptr = srcBlob->GetBufferPointer();
+    buffer.Size = srcBlob->GetBufferSize();
+    buffer.Encoding = DXC_CP_UTF8;
+
+    const std::wstring targetW = toWide(target);
+    const std::wstring entryW = toWide(entry);
+    const wchar_t* args[] = {L"-T",  targetW.c_str(), L"-E", entryW.c_str(),
+                             L"-HV", L"2018",         L"-O3"};
+    ComPtr<IDxcResult> result;
+    const HRESULT hr =
+        compiler->Compile(&buffer, args, static_cast<UINT32>(std::size(args)), nullptr,
+                          IID_PPV_ARGS(&result));
+    if (FAILED(hr) || !result) {
+        err = "IDxcCompiler3::Compile entry failed hr=" + hexHr(hr);
+        return false;
+    }
+    HRESULT status = E_FAIL;
+    result->GetStatus(&status);
+    if (FAILED(status)) {
+        ComPtr<IDxcBlobEncoding> errBlob;
+        if (SUCCEEDED(result->GetErrorBuffer(&errBlob)) && errBlob) {
+            err.assign(static_cast<const char*>(errBlob->GetBufferPointer()),
+                       static_cast<size_t>(errBlob->GetBufferSize()));
+        } else {
+            err = "DXC compile failed hr=" + hexHr(status);
+        }
+        return false;
+    }
+    ComPtr<IDxcBlob> object;
+    if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr)) || !object) {
+        err = "DXC produced no DXIL object";
+        return false;
+    }
+    const auto* bytes = static_cast<const uint8_t*>(object->GetBufferPointer());
+    outDxil.assign(bytes, bytes + object->GetBufferSize());
+    return true;
+}
+
+}  // namespace
+#endif  // MCDR_HAVE_DXCAPI
+
+void probeDxc(DeviceContext::Capabilities& caps) {
+#if !MCDR_HAVE_DXCAPI
+    caps.dxcNote = "built without <dxcapi.h>";
+    (void)caps;
+#else
+    const std::wstring dir = findDxcDirectory();
+    if (dir.empty()) {
+        caps.dxcNote = "dxcompiler.dll not found (MCDR_DXC_DIR / MCDR.dll dir / Windows SDK)";
+        return;
+    }
+    const std::wstring dllPath = dir + L"\\dxcompiler.dll";
+    caps.dxcPath = toUtf8(dllPath);
+
+    HMODULE mod = LoadLibraryW(dllPath.c_str());
+    if (mod == nullptr) {
+        caps.dxcNote = "LoadLibraryW(dxcompiler.dll) failed err=" + std::to_string(GetLastError());
+        return;
+    }
+    const auto createInstance =
+        reinterpret_cast<PFN_DxcCreateInstance>(GetProcAddress(mod, "DxcCreateInstance"));
+    if (createInstance == nullptr) {
+        caps.dxcNote = "DxcCreateInstance export missing";
+        return;
+    }
+    ComPtr<IDxcUtils> utils;
+    ComPtr<IDxcCompiler3> compiler;
+    if (FAILED(createInstance(CLSID_DxcUtils, IID_PPV_ARGS(&utils))) || !utils
+        || FAILED(createInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))) || !compiler) {
+        caps.dxcNote = "DxcCreateInstance failed (dxil.dll missing next to dxcompiler.dll?)";
+        return;
+    }
+    caps.dxcAvailable = true;
+
+    // 冒烟编译目标：设备真实可用的最高 SM，但 mesh shader 下限是 6_6，而本机 DXC 1.8
+    // 只认到 6_8（6_9/6_10 会报 invalid profile），所以夹在 [6_6, 6_8]。
+    D3D_SHADER_MODEL model = effectiveShaderModel(caps);
+    if (model < D3D_SHADER_MODEL_6_6) {
+        model = D3D_SHADER_MODEL_6_6;
+    }
+    if (model > D3D_SHADER_MODEL_6_8) {
+        model = D3D_SHADER_MODEL_6_8;
+    }
+    const std::string profile = std::string("ms_") + shaderModelProfileSuffix(model);
+    caps.dxcProfile = profile;
+
+    std::string err;
+    std::vector<uint8_t> dxil;
+    if (compileWithDxc(utils.Get(), compiler.Get(), kMeshSmokeHlsl, std::strlen(kMeshSmokeHlsl),
+                       "main", profile, err, dxil)) {
+        caps.meshShaderCompileOk = true;
+        caps.dxcNote = "mesh smoke compile OK (" + profile + ", "
+                       + std::to_string(dxil.size()) + " bytes DXIL)";
+    } else {
+        caps.dxcNote = "mesh smoke compile failed: " + firstLine(err);
+    }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// P72：可复用的 DXC 编译入口（mesh shader 基础）
+// ---------------------------------------------------------------------------
+// probeDxc 只回答"这台机器能不能编译 mesh shader"，随后就把 IDxcUtils/IDxcCompiler3
+// 释放掉了；mesh 管线真正需要的是一个运行期可反复调用的编译入口：Java 侧给 HLSL 源码
+// + 入口点 + profile（as_6_6 / ms_6_6 / ps_6_0 ...），拿回 DXIL 字节码交给
+// createMeshPipeline。这里把 dxcompiler.dll 与两个接口缓存成进程级单例，只加载一次。
+bool compileHlslToDxil(const std::string& source, const std::string& entry, const std::string& profile,
+                       std::vector<uint8_t>& outDxil, std::string& err) {
+#if !MCDR_HAVE_DXCAPI
+    (void)source;
+    (void)entry;
+    (void)profile;
+    (void)outDxil;
+    err = "compileHlslToDxil: built without <dxcapi.h>";
+    return false;
+#else
+    struct CachedDxc {
+        HMODULE module = nullptr;
+        ComPtr<IDxcUtils> utils;
+        ComPtr<IDxcCompiler3> compiler;
+        bool tried = false;
+        std::string note;
+    };
+    static CachedDxc cached;  // 进程级单例；C++11 起函数内 static 初始化线程安全
+    if (!cached.tried) {
+        cached.tried = true;
+        const std::wstring dir = findDxcDirectory();
+        if (dir.empty()) {
+            cached.note = "dxcompiler.dll not found (MCDR_DXC_DIR / MCDR.dll dir / Windows SDK)";
+        } else {
+            const std::wstring dllPath = dir + L"\\dxcompiler.dll";
+            cached.module = LoadLibraryW(dllPath.c_str());
+            if (cached.module == nullptr) {
+                cached.note =
+                    "LoadLibraryW(dxcompiler.dll) failed err=" + std::to_string(GetLastError());
+            } else {
+                const auto createInstance = reinterpret_cast<PFN_DxcCreateInstance>(
+                    GetProcAddress(cached.module, "DxcCreateInstance"));
+                if (createInstance == nullptr) {
+                    cached.note = "DxcCreateInstance export missing";
+                } else if (FAILED(createInstance(CLSID_DxcUtils, IID_PPV_ARGS(&cached.utils)))
+                           || !cached.utils
+                           || FAILED(createInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&cached.compiler)))
+                           || !cached.compiler) {
+                    cached.note = "DxcCreateInstance failed (dxil.dll missing next to dxcompiler.dll?)";
+                } else {
+                    cached.note = "dxcompiler.dll loaded from " + toUtf8(dllPath);
+                }
+            }
+        }
+        dbgLogInfo("compileHlslToDxil: DXC init — %s", cached.note.c_str());
+    }
+    if (!cached.utils || !cached.compiler) {
+        err = "compileHlslToDxil: " + cached.note;
+        return false;
+    }
+    if (source.empty()) {
+        err = "compileHlslToDxil: empty HLSL source";
+        return false;
+    }
+    if (profile.empty()) {
+        err = "compileHlslToDxil: empty profile";
+        return false;
+    }
+    const std::string entryName = entry.empty() ? std::string("main") : entry;
+    if (!compileWithDxc(cached.utils.Get(), cached.compiler.Get(), source.data(), source.size(),
+                        entryName, profile, err, outDxil)) {
+        err = "compileHlslToDxil[" + profile + ":" + entryName + "]: " + firstLine(err);
+        return false;
+    }
+    dbgLogInfo("compileHlslToDxil: %s entry=%s -> %zu bytes DXIL", profile.c_str(), entryName.c_str(),
+               outDxil.size());
+    return true;
+#endif
+}
+
+void queryDeviceCapabilities(ID3D12Device* device, DeviceContext::Capabilities& caps) {
+    caps = DeviceContext::Capabilities{};
+    if (!device) {
+        return;
+    }
+    // 设备已经建出来了就算"查过"；单项 CheckFeatureSupport 失败就保持默认值（0 / false），
+    // 调用方据此做保守门控。
+    caps.queried = true;
+    caps.featureLevel = gCtx.featureLevel;
+
+    // 这个结构是 in/out：HighestShaderModel 必须先由调用方填一个"上限"，驱动才会回填
+    // 它支持的最高级别。但直接填 6.10(0x6a) 并不安全——较老的 d3d12 runtime 不认识
+    // 这个枚举值，CheckFeatureSupport 会直接失败（E_INVALIDARG），能力值便停在默认的
+    // 5.1（实测：12_2 设备曾被误报成 SM=5.1(0x51)）。因此从高到低逐档探测：第一个
+    // 成功的档位返回的就是该设备真实支持的最高级别。
+    static constexpr D3D_SHADER_MODEL kShaderModelProbes[] = {
+        static_cast<D3D_SHADER_MODEL>(0x6a),  // 6.10：SDK 头文件还未定义，驱动可能先支持
+        D3D_SHADER_MODEL_6_9, D3D_SHADER_MODEL_6_8, D3D_SHADER_MODEL_6_7, D3D_SHADER_MODEL_6_6,
+        D3D_SHADER_MODEL_6_5, D3D_SHADER_MODEL_6_4, D3D_SHADER_MODEL_6_3, D3D_SHADER_MODEL_6_2,
+        D3D_SHADER_MODEL_6_1, D3D_SHADER_MODEL_6_0, D3D_SHADER_MODEL_5_1,
+    };
+    for (D3D_SHADER_MODEL probe : kShaderModelProbes) {
+        D3D12_FEATURE_DATA_SHADER_MODEL query{};
+        query.HighestShaderModel = probe;
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &query, sizeof(query)))) {
+            caps.shaderModel = query.HighestShaderModel;
+            break;
+        }
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options7,
+                                              sizeof(options7)))) {
+        caps.meshShaderTier = options7.MeshShaderTier;
+        caps.samplerFeedbackTier = options7.SamplerFeedbackTier;
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5,
+                                              sizeof(options5)))) {
+        caps.raytracingTier = options5.RaytracingTier;
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS6 options6{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &options6,
+                                              sizeof(options6)))) {
+        caps.shadingRateTier = options6.VariableShadingRateTier;
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options,
+                                              sizeof(options)))) {
+        caps.resourceBindingTier = options.ResourceBindingTier;
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options12,
+                                              sizeof(options12)))) {
+        caps.enhancedBarriers = options12.EnhancedBarriersSupported != FALSE;
+    }
+
+    // P67：DXC/mesh shader 冒烟自检（不依赖 ID3D12Device，但如果这一层不成立，
+    // 后面接 AS/MS 管线就无从谈起，所以放在同一处一次性报出来）。
+    probeDxc(caps);
+}
+
+// SM 值写成十进制（D3D_SHADER_MODEL_6_8 == 0x68 == 104），tier 枚举按 d3d12.h 原值。
+std::string capabilitiesText(const DeviceContext::Capabilities& caps) {
+    char buf[384] = {};
+    std::snprintf(buf, sizeof(buf),
+                  "FL=%s SM=%s(0x%02X)/eff=%s mesh=%d samplerFeedback=%d rt=%d vrs=%d binding=%d "
+                  "enhancedBarriers=%d",
+                  featureLevelName(caps.featureLevel), shaderModelName(caps.shaderModel),
+                  static_cast<unsigned>(caps.shaderModel),
+                  shaderModelProfileSuffix(effectiveShaderModel(caps)),
+                  static_cast<int>(caps.meshShaderTier), static_cast<int>(caps.samplerFeedbackTier),
+                  static_cast<int>(caps.raytracingTier), static_cast<int>(caps.shadingRateTier),
+                  static_cast<int>(caps.resourceBindingTier), caps.enhancedBarriers ? 1 : 0);
+    std::string text(buf);
+    // P67：DXC（mesh shader 编译器）状态一并带出；完整路径与失败原因看 JSON。
+    text += " dxc=";
+    text += caps.dxcAvailable ? "yes" : "no";
+    if (!caps.dxcProfile.empty()) {
+        text += "(" + caps.dxcProfile + ")";
+    }
+    text += " meshSmoke=";
+    text += caps.meshShaderCompileOk ? "ok" : "fail";
+    return text;
+}
+
+// 定义在文件后段（见 jsonEscape）：能力 JSON 里要带 DXC 的 Windows 路径，反斜杠必须转义。
+static std::string jsonEscape(const std::string& in);
+
+// 注意：不含 feature_level / feature_level_value —— 适配器信息 JSON 里已经有这两个键了
+// （见 adapterInfoJson），同名键会让解析方拿到后者，所以这里只用 caps_* 语义的新键。
+std::string capabilitiesJson(const DeviceContext::Capabilities& caps) {
+    char buf[384] = {};
+    std::snprintf(buf, sizeof(buf),
+                  "\"shader_model\":\"%s\",\"shader_model_value\":%d,\"shader_model_effective\":\"%s\","
+                  "\"mesh_shader_tier\":%d,\"sampler_feedback_tier\":%d,"
+                  "\"raytracing_tier\":%d,\"shading_rate_tier\":%d,\"resource_binding_tier\":%d,"
+                  "\"enhanced_barriers\":%s,\"caps_queried\":%s",
+                  shaderModelName(caps.shaderModel), static_cast<int>(caps.shaderModel),
+                  shaderModelProfileSuffix(effectiveShaderModel(caps)),
+                  static_cast<int>(caps.meshShaderTier), static_cast<int>(caps.samplerFeedbackTier),
+                  static_cast<int>(caps.raytracingTier), static_cast<int>(caps.shadingRateTier),
+                  static_cast<int>(caps.resourceBindingTier),
+                  caps.enhancedBarriers ? "true" : "false", caps.queried ? "true" : "false");
+    std::string json(buf);
+    // P67：DXC/mesh shader 自检结果（dxc_note 里带失败原因或冒烟编译产物大小）。
+    json += ",\"dxc_available\":";
+    json += caps.dxcAvailable ? "true" : "false";
+    json += ",\"dxc_mesh_shader_compile_ok\":";
+    json += caps.meshShaderCompileOk ? "true" : "false";
+    json += ",\"dxc_profile\":\"" + jsonEscape(caps.dxcProfile) + "\"";
+    json += ",\"dxc_path\":\"" + jsonEscape(caps.dxcPath) + "\"";
+    json += ",\"dxc_note\":\"" + jsonEscape(caps.dxcNote) + "\"";
+    return json;
+}
+
 bool ensureDevice(std::string& errorOut) {
     installCrashHandlerOnce();
-    // P6 修复：guard 必须同时校验描述符堆齐备。若上次调用在堆创建中途失败
-    // （如 Sampler 堆 4096 超过 D3D12 上限 2048），gCtx.device 已置位但堆为
-    // null，此 guard 若只看 device 会短路返回 true，后续 createSampler/
-    // createTextureView 解引用 null 堆 → 原生 AV。堆全建成功才视为初始化完成。
     if (gCtx.device && gCtx.srvHeap && gCtx.srvCpuHeap && gCtx.rtvHeap && gCtx.frameRtvHeap && gCtx.dsvHeap
         && gCtx.samplerHeap && gCtx.drawHeap)
         return true;
 
-    // 诊断：D3D12 调试层默认**关闭**。调试层会对每次 API 调用做完整状态校验，
-    // 实测使绘制热路径每 draw 多出约 3µs（~800ns/命令），是帧率的主要瓶颈之一。
-    // 需要排查设备移除 / 描述符越界 / 状态错误时，设 DX12_DEBUG_LAYER=1 重新启用。
     bool debugEnabled = false;
     const char* dbgLayerEnv = std::getenv("DX12_DEBUG_LAYER");
     if (dbgLayerEnv && dbgLayerEnv[0] == '1') {
@@ -667,34 +1118,37 @@ bool ensureDevice(std::string& errorOut) {
         }
     }
 
-    const D3D_FEATURE_LEVEL levels[] = {
-        D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
-        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
-    };
+    // P66：先按 GPU 偏好顺序挑一块支持 12_2 的适配器，再在它上面建设备。
     ComPtr<ID3D12Device> device;
-    for (auto level : levels) {
-        if (SUCCEEDED(D3D12CreateDevice(nullptr, level, IID_PPV_ARGS(&device)))) {
-            gCtx.featureLevel = level;
-            break;
+    {
+        ComPtr<IDXGIAdapter1> chosen;
+        std::string selectError;
+        bool ok = selectDeviceAdapter(chosen, selectError);
+        if (ok && FAILED(D3D12CreateDevice(chosen.Get(), kRequiredFeatureLevel,
+                                           IID_PPV_ARGS(&device)))) {
+            // 探测通过却建不出设备（极罕见）：当成选择失败，走同一条错误路径。
+            ok = false;
+            selectError = "D3D12CreateDevice(12_2) failed on the selected adapter";
         }
-    }
-    if (!device && debugEnabled) {
-        // 部分系统缺少 SDK 调试层：D3D12CreateDevice 会失败，回退到无调试层重试。
-        debugEnabled = false;
-        for (auto level : levels) {
-            if (SUCCEEDED(D3D12CreateDevice(nullptr, level, IID_PPV_ARGS(&device)))) {
-                gCtx.featureLevel = level;
-                break;
-            }
+        if (!ok && debugEnabled) {
+            // 调试层偶尔会让设备创建失败：关掉调试层重选一次（与旧行为一致）。
+            debugEnabled = false;
+            selectError.clear();
+            ok = selectDeviceAdapter(chosen, selectError)
+                 && SUCCEEDED(D3D12CreateDevice(chosen.Get(), kRequiredFeatureLevel,
+                                                IID_PPV_ARGS(&device)));
         }
-    }
-    if (!device) {
-        errorOut = "D3D12CreateDevice failed at all feature levels";
-        return false;
+        if (!ok) {
+            errorOut = selectError.empty() ? std::string("no D3D12 12_2 adapter") : selectError;
+            return false;
+        }
+        gCtx.featureLevel = kRequiredFeatureLevel;
     }
     gCtx.device = device;
     gCtx.adapterName = queryAdapterName(device.Get());
-    // 存储与 device 绑定的 DXGI adapter（供 swapchain 创建使用，避免 factory/adapter 不匹配）。
+    queryDeviceCapabilities(device.Get(), gCtx.caps);
+    std::fprintf(stderr, "[dx12] device ready: %s FL=%s %s\n", gCtx.adapterName.c_str(),
+                 featureLevelName(gCtx.featureLevel), capabilitiesText(gCtx.caps).c_str());
     {
         LUID luid = device->GetAdapterLuid();
         ComPtr<IDXGIFactory4> tmpFactory;
@@ -702,14 +1156,10 @@ bool ensureDevice(std::string& errorOut) {
             tmpFactory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&gCtx.adapter));
         }
     }
-    // 取 InfoQueue（调试层启用后可用）用于设备移除时回读验证消息。
     if (debugEnabled) {
         if (FAILED(device->QueryInterface(IID_PPV_ARGS(&gCtx.infoQueue)))) {
             gCtx.infoQueue = nullptr;
         }
-        // P44 诊断：注册同步消息回调。调试层对 CORRUPTION 级消息默认 break
-        // （RaiseException → 崩溃），轮询 InfoQueue 拿不到那条消息；同步回调
-        // 能在抛异常前把确切的错误描述写入日志。
         if (gCtx.infoQueue) {
             ComPtr<ID3D12InfoQueue1> iq1;
             if (SUCCEEDED(gCtx.infoQueue.As(&iq1)) && iq1) {
@@ -725,34 +1175,27 @@ bool ensureDevice(std::string& errorOut) {
         }
     }
 
-    // 命令队列（P3 提交用）
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&gCtx.queue)))) {
         errorOut = "CreateCommandQueue failed";
         return false;
     }
-    // 时间戳频率（DeviceInfo.timestampPeriod = 1/freq 用）；失败则保持 0。
     gCtx.queue->GetTimestampFrequency(&gCtx.timestampFrequency);
 
-    // P6：全局队列 fence（createFence token 用，见 waitForQueueFenceValue）。
     if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gCtx.queueFence)))) {
         errorOut = "CreateFence(queue) failed";
         return false;
     }
 
-    // 描述符堆
     if (!createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvHeapSize,
                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, gCtx.srvHeap)
         ||
-        // P6：SRV 的 CPU-only 镜像堆（CopyDescriptorsSimple 复制源必须非
-        // SHADER_VISIBLE；texture view 的 cpuHandle 指向这里）
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvHeapSize,
                     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, gCtx.srvCpuHeap)
         || !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvHeapSize,
                        D3D12_DESCRIPTOR_HEAP_FLAG_NONE, gCtx.rtvHeap)
         ||
-        // P24：帧级瞬态 RTV 专用堆（与 backbuffer 持久 RTV 分离，见 beginRenderPass）
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kFrameRtvHeapSize,
                     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, gCtx.frameRtvHeap)
         || !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvHeapSize,
@@ -760,7 +1203,6 @@ bool ensureDevice(std::string& errorOut) {
         || !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerHeapSize,
                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, gCtx.samplerHeap)
         ||
-        // P6：瞬时 draw 描述符堆（ring x4，支持三帧飞行）
         !createHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kDrawHeapSize,
                     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, gCtx.drawHeap)) {
         errorOut = "CreateDescriptorHeap failed";
@@ -770,9 +1212,8 @@ bool ensureDevice(std::string& errorOut) {
     gCtx.rtvInc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     gCtx.dsvInc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     gCtx.samplerInc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-    gCtx.drawInc = gCtx.srvInc;  // 同属 CBV_SRV_UAV 类型，增量相同
+    gCtx.drawInc = gCtx.srvInc;
 
-    // P6：ExecuteIndirect 用 command signature
     {
         D3D12_INDIRECT_ARGUMENT_DESC arg{};
         arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
@@ -780,13 +1221,13 @@ bool ensureDevice(std::string& errorOut) {
         cs.NumArgumentDescs = 1;
         cs.pArgumentDescs = &arg;
         cs.ByteStride =
-            20;  // indexCount, instanceCount, startIndexLocation, baseVertexLocation, startInstanceLocation
+            20;
         if (FAILED(device->CreateCommandSignature(&cs, nullptr, IID_PPV_ARGS(&gCtx.cmdSigIndexed)))) {
             errorOut = "CreateCommandSignature(indexed) failed";
             return false;
         }
         arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
-        cs.ByteStride = 16;  // vertexCount, instanceCount, startVertexLocation, startInstanceLocation
+        cs.ByteStride = 16;
         if (FAILED(device->CreateCommandSignature(&cs, nullptr, IID_PPV_ARGS(&gCtx.cmdSigNonIndexed)))) {
             errorOut = "CreateCommandSignature(non-indexed) failed";
             return false;
@@ -801,9 +1242,6 @@ void destroyDevice() {
         CloseHandle(gCtx.queueFenceEvent);
         gCtx.queueFenceEvent = nullptr;
     }
-    // P46：延迟删除队列里的对象现在带 fence 门槛，正常路径会在后续帧被 GPU
-    // 追平后释放。进程退出时不会再有后续帧，这里先尽力等 queue fence 追平
-    // （最多 1s），再强制释放全部，避免遗留 live object。
     if (gCtx.queue && gCtx.queueFence) {
         UINT64 target = gCtx.queueFenceValue;
         if (gCtx.queueFence->GetCompletedValue() < target) {
@@ -816,8 +1254,6 @@ void destroyDevice() {
             }
         }
     }
-    // 进程退出前释放所有延迟删除对象（若此后不再有 submit，pending 不会
-    // 被 flush，需在此兜底）。
     flushPendingDeletes(/*force=*/true);
     gCtx = DeviceContext{};
     dbgLog("destroyDevice: done");
@@ -865,27 +1301,23 @@ D3D12_CPU_DESCRIPTOR_HANDLE allocRtvHandle(std::string& err) {
     return h;
 }
 
-// ---------------------------------------------------------------------------
-// 格式映射：官方 GpuFormat ordinal -> DXGI_FORMAT
-// 注意：DXGI 无 RGB/RGB16/RGB32 三通道格式，近似为 RGBA（同位数）。
-// ---------------------------------------------------------------------------
-
+// Format casting
 DXGI_FORMAT toDxgiFormat(int gpuFormat) {
     switch (gpuFormat) {
         case 0: return DXGI_FORMAT_R8_UNORM;  // R8_UNORM
         case 1: return DXGI_FORMAT_R8_SNORM;  // R8_SNORM
         case 2: return DXGI_FORMAT_R8G8_UNORM;  // RG8_UNORM
         case 3: return DXGI_FORMAT_R8G8_SNORM;  // RG8_SNORM
-        case 4: return DXGI_FORMAT_R8G8B8A8_UNORM;  // RGB8_UNORM (近似)
-        case 5: return DXGI_FORMAT_R8G8B8A8_SNORM;  // RGB8_SNORM (近似)
+        case 4: return DXGI_FORMAT_R8G8B8A8_UNORM;  // RGB8_UNORM (approximately)
+        case 5: return DXGI_FORMAT_R8G8B8A8_SNORM;  // RGB8_SNORM (approximately)
         case 6: return DXGI_FORMAT_R8G8B8A8_UNORM;  // RGBA8_UNORM
         case 7: return DXGI_FORMAT_R8G8B8A8_SNORM;  // RGBA8_SNORM
         case 8: return DXGI_FORMAT_R16_UNORM;  // R16_UNORM
         case 9: return DXGI_FORMAT_R16_SNORM;  // R16_SNORM
         case 10: return DXGI_FORMAT_R16G16_UNORM;  // RG16_UNORM
         case 11: return DXGI_FORMAT_R16G16_SNORM;  // RG16_SNORM
-        case 12: return DXGI_FORMAT_R16G16B16A16_UNORM;  // RGB16_UNORM (近似)
-        case 13: return DXGI_FORMAT_R16G16B16A16_SNORM;  // RGB16_SNORM (近似)
+        case 12: return DXGI_FORMAT_R16G16B16A16_UNORM;  // RGB16_UNORM (approximately)
+        case 13: return DXGI_FORMAT_R16G16B16A16_SNORM;  // RGB16_SNORM (approximately)
         case 14: return DXGI_FORMAT_R16G16B16A16_UNORM;  // RGBA16_UNORM
         case 15: return DXGI_FORMAT_R16G16B16A16_SNORM;  // RGBA16_SNORM
         case 16: return DXGI_FORMAT_R8_UINT;  // R8_UINT
@@ -900,21 +1332,21 @@ DXGI_FORMAT toDxgiFormat(int gpuFormat) {
         case 25: return DXGI_FORMAT_R16_SINT;  // R16_SINT
         case 26: return DXGI_FORMAT_R16G16_UINT;  // RG16_UINT
         case 27: return DXGI_FORMAT_R16G16_SINT;  // RG16_SINT
-        case 28: return DXGI_FORMAT_R16G16B16A16_UINT;  // RGB16_UINT (近似)
-        case 29: return DXGI_FORMAT_R16G16B16A16_SINT;  // RGB16_SINT (近似)
+        case 28: return DXGI_FORMAT_R16G16B16A16_UINT;  // RGB16_UINT (approximately)
+        case 29: return DXGI_FORMAT_R16G16B16A16_SINT;  // RGB16_SINT (approximately)
         case 30: return DXGI_FORMAT_R16G16B16A16_UINT;  // RGBA16_UINT
         case 31: return DXGI_FORMAT_R16G16B16A16_SINT;  // RGBA16_SINT
         case 32: return DXGI_FORMAT_R32_UINT;  // R32_UINT
         case 33: return DXGI_FORMAT_R32_SINT;  // R32_SINT
         case 34: return DXGI_FORMAT_R32G32_UINT;  // RG32_UINT
         case 35: return DXGI_FORMAT_R32G32_SINT;  // RG32_SINT
-        case 36: return DXGI_FORMAT_R32G32B32A32_UINT;  // RGB32_UINT (近似)
-        case 37: return DXGI_FORMAT_R32G32B32A32_SINT;  // RGB32_SINT (近似)
+        case 36: return DXGI_FORMAT_R32G32B32A32_UINT;  // RGB32_UINT (approximately)
+        case 37: return DXGI_FORMAT_R32G32B32A32_SINT;  // RGB32_SINT (approximately)
         case 38: return DXGI_FORMAT_R32G32B32A32_UINT;  // RGBA32_UINT
         case 39: return DXGI_FORMAT_R32G32B32A32_SINT;  // RGBA32_SINT
         case 40: return DXGI_FORMAT_R16_FLOAT;  // R16_FLOAT
         case 41: return DXGI_FORMAT_R16G16_FLOAT;  // RG16_FLOAT
-        case 42: return DXGI_FORMAT_R16G16B16A16_FLOAT;  // RGB16_FLOAT (近似)
+        case 42: return DXGI_FORMAT_R16G16B16A16_FLOAT;  // RGB16_FLOAT (approximately)
         case 43: return DXGI_FORMAT_R16G16B16A16_FLOAT;  // RGBA16_FLOAT
         case 44: return DXGI_FORMAT_R32_FLOAT;  // R32_FLOAT
         case 45: return DXGI_FORMAT_R32G32_FLOAT;  // RG32_FLOAT
@@ -927,7 +1359,7 @@ DXGI_FORMAT toDxgiFormat(int gpuFormat) {
         case 52: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;  // D32_FLOAT_S8_UINT
         case 53: return DXGI_FORMAT_D24_UNORM_S8_UINT;  // D24_UNORM_S8_UINT
         case 54: return DXGI_FORMAT_D16_UNORM;  // D16_UNORM
-        case 55: return DXGI_FORMAT_UNKNOWN;  // S8_UINT (无独立格式)
+        case 55: return DXGI_FORMAT_UNKNOWN;  // S8_UINT (there's no actual format target)
         default: return DXGI_FORMAT_UNKNOWN;
     }
 }
@@ -1000,8 +1432,11 @@ Dx12Object* createTexture(int usage, int format, int width, int height, int dept
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = std::max(1u, static_cast<UINT>(width));
     desc.Height = std::max(1u, static_cast<UINT>(height));
-    desc.DepthOrArraySize = std::max(1u, static_cast<UINT>(depthOrLayers));
-    desc.MipLevels = std::max(1u, static_cast<UINT>(mipLevels));
+    // DepthOrArraySize / MipLevels 是 UINT16：std::max 内部推导出 unsigned int，
+    // 赋值时的窄化在 /W4 下报 C4244（配合 TreatWarningAsError 即 C2220 构建失败），
+    // 故显式 static_cast<UINT16>。
+    desc.DepthOrArraySize = static_cast<UINT16>(std::max(1u, static_cast<UINT>(depthOrLayers)));
+    desc.MipLevels = static_cast<UINT16>(std::max(1u, static_cast<UINT>(mipLevels)));
     desc.Format = dxgi;
     desc.SampleDesc.Count = 1;
     desc.Flags = textureFlags(usage, format);
@@ -2659,6 +3094,9 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews, int col
                   x, y, w, h, depthView ? "yes" : "no");
     for (int i = 0; i < colorCount; ++i) {
         if (colorViews[i]) {
+#ifdef DX12_DEBUG_VERBOSE
+            // 整段诊断被括在 DX12_DEBUG_VERBOSE 里：默认构建下 DBG_LOG_DEBUG 展开为
+            // ((void)0)，tex/desc/cc 全成了未引用局部变量，/W4 会报 C4189。
             auto* tex = colorViews[i];
             auto desc = tex->resource->GetDesc();
             const float* cc = clearColors ? (clearColors + i * 4) : nullptr;
@@ -2666,6 +3104,7 @@ bool beginRenderPass(CommandContext* ctx, Dx12Object* const* colorViews, int col
                           (void*)tex, (UINT)desc.Width, (UINT)desc.Height, (int)tex->dxgiFormat,
                           cc ? (double)cc[0] : 0.0, cc ? (double)cc[1] : 0.0, cc ? (double)cc[2] : 0.0,
                           cc ? (double)cc[3] : 0.0);
+#endif
             // BUG-01 fix：diag loop 只打印日志，不再重复 push_back（主循环 L1701 已添加）。
         }
     }
@@ -3120,7 +3559,8 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
     };
     UINT correctedStride = 0;
     for (const PipelineDesc::InputElement& el : desc.inputElements) {
-        DXGI_FORMAT dfmt = toDxgiVertexFormat(el.format);
+        // 校正步长只按 ordinal 的字节宽度累加（ordinalByteSize）；这里原有一个
+        // DXGI_FORMAT dfmt = toDxgiVertexFormat(el.format) 从未被引用，/W4 报 C4189，已删除。
         UINT sz = ordinalByteSize(el.format);
         UINT end = static_cast<UINT>(el.offset) + sz;
         if (end > correctedStride) correctedStride = end;
@@ -3350,9 +3790,8 @@ Dx12Pipeline* createGraphicsPipeline(const PipelineDesc& desc, std::string& err)
 
     D3D12_DEPTH_WRITE_MASK depthWrite =
         (desc.hasDepth && desc.depthWrite) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-    D3D12_COMPARISON_FUNC depthFunc = desc.hasDepth
-                                          ? toD3d12Compare(static_cast<uint8_t>(desc.depthCompareOp))
-                                          : D3D12_COMPARISON_FUNC_ALWAYS;
+    // 注意：这里只需要 wDepthFunc —— 原先还并存一个未使用的 depthFunc（同表达式），
+    // 它在两条 buildPso 调用里都没被引用，/W4 报 C4189，已删除。
 
     // 始终同时创建两个 PSO：withDepth（DSV=D32_FLOAT）和
     // withoutDepth（DSV=UNKNOWN，depthEnable=false），以支持运行时 hasDepth 与
@@ -3415,8 +3854,12 @@ bool setPipeline(CommandContext* ctx, Dx12Pipeline* pipeline, bool hasDepth, std
     ctx->cachedPso = pso;
     // P6 纯色黑屏修复：D3D12 命令列表初始 topology 是 UNDEFINED，必须显式
     // IASetPrimitiveTopology，否则 GPU 丢弃全部图元（只有 clear 色可见）。
-    D3D12_PRIMITIVE_TOPOLOGY topo = toPrimitiveTopology(pipeline->topology);
-    ctx->commandList->IASetPrimitiveTopology(topo);
+    // P72：mesh 管线（AS/MS）没有 IA 阶段，PSO 里也没有输入布局，跳过 IA 状态设置。
+    D3D12_PRIMITIVE_TOPOLOGY topo = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    if (!pipeline->isMesh) {
+        topo = toPrimitiveTopology(pipeline->topology);
+        ctx->commandList->IASetPrimitiveTopology(topo);
+    }
     // P27：setPipeline 每 draw 调用一次（可上万次/帧），降级为 DEBUG 日志。
     DBG_LOG_DEBUG("setPipeline rootSig=%p pso=%p hasDepth=%d topoOrdinal=%d topo=%d",
                   (void*)pipeline->rootSignature.Get(), (void*)pso, (int)hasDepth, (int)pipeline->topology,
@@ -4599,15 +5042,7 @@ std::string adapterInfoJson() {
         default: vendor = vendorFallback; break;
     }
 
-    const char* featureLevel = "unknown";
-    switch (gCtx.featureLevel) {
-        case D3D_FEATURE_LEVEL_12_2: featureLevel = "12_2"; break;
-        case D3D_FEATURE_LEVEL_12_1: featureLevel = "12_1"; break;
-        case D3D_FEATURE_LEVEL_12_0: featureLevel = "12_0"; break;
-        case D3D_FEATURE_LEVEL_11_1: featureLevel = "11_1"; break;
-        case D3D_FEATURE_LEVEL_11_0: featureLevel = "11_0"; break;
-        default: break;
-    }
+    const char* featureLevel = featureLevelName(gCtx.featureLevel);
 
     // device_type：DXCore 可用就按它的三个布尔分类；否则只能退回 DXGI 的软件
     // 适配器标志（DXGI_ADAPTER_DESC 本身没有 Flags，只有 DESC1 有）。
@@ -4677,6 +5112,9 @@ std::string adapterInfoJson() {
     json += (core.isDetachable ? "true" : "false");
     json += ",\"dxcore\":";
     json += (core.ok ? "true" : "false");
+    // P66：12_2 能力基线（mesh shader tier / SM / DXR / VRS / enhanced barriers）。
+    json += ",";
+    json += capabilitiesJson(gCtx.caps);
     json += "}";
     return json;
 }
@@ -5206,17 +5644,24 @@ bool gAsyncOwnsPresent = false;
 // 此时上一帧 Present 通常早已完成（渲染线程耗时 ≪ 主线程录制耗时）→ 通常 0ms。
 // 若渲染线程落后则在此短暂阻塞——这是必要的正确性保证：GetCurrentBackBufferIndex
 // 只在 Present 之后轮转，提前 acquire 会拿到同一个 back buffer（两帧写同一处
-// → 闪帧/撕裂）。超时（100ms）后放行并告警，避免渲染线程异常时主线程永久挂起。
-void waitForPendingPresents() {
-    if (!gRenderRunning) return;
+// → 闪帧/撕裂）。
+// P68（GLFW_NO_API 崩溃根因）：超时后**不再放行**（旧实现在此 return 让主线程照常
+// acquire，于是本帧 blit 写到 Present 已翻转走的 back buffer → D3D12 ERROR #907 →
+// RemoveDevice 0x887A0005=DXGI_ERROR_ACCESS_DENIED，GLFW_NO_API 冷启动必崩）。
+// 现在返回 false，由 acquireSurface 放弃本帧（Java 侧跳过 blit，下一帧让 MC 重建 surface）。
+bool waitForPendingPresents(unsigned timeoutMs) {
+    if (!gRenderRunning) return true;
     std::unique_lock<std::mutex> lk(gPresentMtx);
-    if (gPresentedFrames >= gSubmittedFrames) return;
-    if (!gPresentCv.wait_for(lk, std::chrono::milliseconds(100),
+    if (gPresentedFrames >= gSubmittedFrames) return true;
+    if (!gPresentCv.wait_for(lk, std::chrono::milliseconds(timeoutMs),
                              [] { return gPresentedFrames >= gSubmittedFrames || !gRenderRunning; })) {
         dbgLog("waitForPendingPresents: TIMEOUT submitted=%llu presented=%llu (render thread stalled)",
                static_cast<unsigned long long>(gSubmittedFrames),
                static_cast<unsigned long long>(gPresentedFrames));
+        return false;
     }
+    // 两种唤醒条件都是安全的：帧已呈现（index 已轮转完毕），或渲染线程已停止（index 不会再动）。
+    return true;
 }
 
 // 等待渲染线程完成当前帧：信号 beginFrame + 等 submitDone，不销毁线程本身。
@@ -5237,7 +5682,10 @@ void waitForRenderThreadSubmit() {
     waitForPendingPresents();
 }
 
-bool initAsyncRenderer(UINT workerCount) {
+// 形参 unnamed：workerCount 是 ABI 已经发布出去的参数（mcdr_dx12InitAsyncRenderer 的第一个
+// 入参，名字保留在 mcdr_device.cppm 的声明上），但当前渲染线程只有一条，实现里用不到它。
+// 不写名字即可避免 /W4 的 C4100 未引用形参，同时不改动 C ABI。
+bool initAsyncRenderer(UINT) {
     std::string initErr;
     if (!ensureDevice(initErr)) return false;
     if (gRenderRunning) return true;

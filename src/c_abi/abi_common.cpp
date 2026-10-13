@@ -1,9 +1,14 @@
+
+
 // abi_common.cpp — the single implementation of the error channel, string
 // marshalling and logging shared by all six adapter translation units.
+#include "_d3d12_module_prelude.h"
 
-#include "abi_common.h"
-#include "../dx12/dx12_device.h"
+#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
+import mcdr.d3d12.device;
+
+import mcdr.abi.common;
 namespace mcdr::abi {
 
 namespace {

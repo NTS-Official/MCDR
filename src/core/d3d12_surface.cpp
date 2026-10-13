@@ -1,3 +1,9 @@
+module;
+
+#include "_d3d12_module_prelude.h"
+
+module mcdr.d3d12.device;
+
 // dx12-mc 原生 D3D12 层（C++）
 // P5 目标：DXGI swapchain（GpuSurfaceBackend 对应物）。
 // 设计参考：官方 com.mojang.blaze3d.vulkan.VulkanGpuSurface。
@@ -5,13 +11,6 @@
 // PresentMode 序数 = 官方枚举 ordinal：
 //   IMMEDIATE=0, MAILBOX=1, FIFO=2, FIFO_RELAXED=3
 // DXGI FLIP 模型支持 {IMMEDIATE, FIFO, FIFO_RELAXED}（MAILBOX 无直接对应）。
-
-#include "dx12_device.h"
-#include <dxgi.h>
-#include <dxgi1_2.h>
-#include <dxgi1_4.h>
-
-import std;
 // Diagnostic: fill backbuffer with colored clear instead of copying src texture.
 // Uncomment to test whether the backbuffer通路 itself works.
 // 屏幕变绿 => 通路正常，问题在 src 纹理内容；仍黑屏 => 跳到第三阶段检查 Present。
@@ -154,15 +153,119 @@ bool createCompositionSwapChain(IDXGIFactory2* factory2, ID3D12CommandQueue* que
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// 呈现子窗口（RTSS/OSD 修复）。
+//
+// 背景：GLFW 主窗口一旦通过 GL 呈现过至少一帧（SwapBuffers），DXGI 就再也不会
+// 接受在该 HWND 上创建 flip-model swapchain —— CreateSwapChainForHwnd 对所有
+// tier / 描述组合都返回 E_ACCESSDENIED (0x80070005)。这不是瞬态错误，而是
+// "该 HWND 的呈现权已经归 GL"的持久状态（实测脚本 _port\scprobe2.cpp：GL 上下文
+// 只创建不呈现 → S_OK；呈现过 5 帧 → 所有变体全 80070005）。
+//
+// 于是给呈现单独造一个子窗口：没有 GL 上下文、窗口类不含 CS_OWNDC，因此可以
+// 正常建立 HWND swapchain（_port\scprobe3.cpp：父窗口呈现过 GL 后，子窗口仍
+// S_OK）。除能呈现外，这条路径还让 OSD 注入器（RTSS / MSI Afterburner）能从
+// IDXGISwapChain1::GetDesc1().OutputWindow 拿到非空句柄，从而把覆盖层画进我们的
+// back buffer —— composition swapchain 的 OutputWindow 是空的，RTSS 因此无法
+// 定位 OSD（用户报告的"overlay 无法正确渲染"）。
+// ---------------------------------------------------------------------------
+constexpr wchar_t kPresentWindowClass[] = L"MCDR_D3D12_PresentChild";
+
+// 呈现子窗口的消息处理。三条都必须有，否则子窗口会破坏游戏输入/画面：
+//   - WM_NCHITTEST == HTTRANSPARENT：WS_EX_TRANSPARENT 只影响绘制顺序，不参与命中
+//     测试；子窗口铺满客户区时会把鼠标消息全部吃掉，表现为「游戏界面点不动」。
+//     返回 HTTRANSPARENT 后点击/滚轮穿透到父窗口（GLFW），原版输入路径不受影响。
+//   - WM_ERASEBKGND == 1：不擦背景。父窗口 resize 时本窗口会被 SetWindowPos 调整尺寸，
+//     若让系统用背景刷子擦一遍，就会在 swapchain 重新出画前整片闪黑（用户报告的
+//     「窗口 resize 后直接变为黑屏」）。
+//   - WM_MOUSEACTIVATE == MA_NOACTIVATE：点击穿透时不要把激活焦点从父窗口抢走。
+LRESULT CALLBACK presentationWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    default:
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+}
+
+HWND createPresentationWindow(HWND parent, UINT width, UINT height) {
+    if (!parent) return nullptr;
+    static const bool registered = []() {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW;  // 关键：不能带 CS_OWNDC
+        wc.lpfnWndProc = presentationWindowProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        // 不设背景刷子：本窗口的内容只来自 swapchain，任何系统擦除都会先露出黑底
+        // （配合 WM_ERASEBKGND 返回 1 一起避免 resize 期间闪黑）。
+        wc.hbrBackground = nullptr;
+        wc.lpszClassName = kPresentWindowClass;
+        if (RegisterClassExW(&wc)) return true;
+        return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }();
+    if (!registered) return nullptr;
+    const int w = width > 0 ? static_cast<int>(width) : 1;
+    const int h = height > 0 ? static_cast<int>(height) : 1;
+    // WS_EX_TRANSPARENT：命中最上层窗口判定跳过本窗口，鼠标消息仍由父窗口（GLFW）
+    // 接收，否则子窗口铺满客户区会把游戏输入全吃掉。
+    HWND child = CreateWindowExW(WS_EX_TRANSPARENT | WS_EX_NOPARENTNOTIFY, kPresentWindowClass,
+                                 L"MCDR D3D12 present", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, w,
+                                 h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!child) return nullptr;
+    SetWindowPos(child, HWND_TOP, 0, 0, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    return child;
+}
+
+void resizePresentationWindow(HWND child, UINT width, UINT height) {
+    if (!child || width == 0 || height == 0) return;
+    SetWindowPos(child, HWND_TOP, 0, 0, static_cast<int>(width), static_cast<int>(height),
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    RECT rc{};
+    GetWindowRect(child, &rc);
+    dbgLog("resizePresentationWindow: child=%p -> %ux%u (visible=%d rect=%dx%d)",
+           reinterpret_cast<void*>(child), width, height, IsWindowVisible(child) ? 1 : 0,
+           static_cast<int>(rc.right - rc.left), static_cast<int>(rc.bottom - rc.top));
+}
+
 // 为窗口创建 swapchain：
 //   1) 首选 CreateSwapChainForHwnd：多 tier（FLIP_DISCARD±TEARING / FLIP_SEQUENTIAL）
 //      并重试 3 轮（E_ACCESSDENIED 多为瞬态）；
 //   2) 全部被拒时回退 CreateSwapChainForComposition + DirectComposition（不绑定 HWND）。
 // reuse 非空且已是 composition 模式时直接复用其 composition 对象重建——对同一 HWND
 // 重复 CreateTargetForHwnd 会返回 DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED。
-bool createSwapChainForWindow(IDXGIFactory4* factory, ID3D12CommandQueue* queue, HWND win, UINT width,
-                              UINT height, const SwapChainBundle* reuse, SwapChainBundle& out,
-                              std::string& err) {
+// RTSS/Afterburner 等 overlay 通过改写交换链 vtable 的 Present 槽（索引 8）来挂 OSD。
+// 该槽若仍解析到 system32\dxgi.dll，说明本进程这条交换链根本没被 hook —— 这是
+// "RTSS OSD 不显示" 的决定性证据；若解析到 RTSSHooks64.dll，说明 hook 生效，问题在别处。
+static void logSwapChainPresentHook(IDXGISwapChain* sc) {
+    if (sc == nullptr) return;
+    void** vtbl = *reinterpret_cast<void***>(sc);
+    if (vtbl == nullptr) return;
+    void* present = vtbl[8];
+    if (present == nullptr) return;
+    HMODULE owner = nullptr;
+    ::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCWSTR>(present), &owner);
+    std::wstring ownerPath(MAX_PATH, L'\0');
+    const DWORD n = owner != nullptr ? ::GetModuleFileNameW(owner, ownerPath.data(), MAX_PATH) : 0;
+    ownerPath.resize(n);
+    std::wstring_view sv(ownerPath);
+    const size_t slash = sv.find_last_of(L"\\/");
+    if (slash != std::wstring_view::npos) sv.remove_prefix(slash + 1);
+    const auto* b = reinterpret_cast<const unsigned char*>(present);
+    dbgLog("swapchain Present slot=%p owner=%ls bytes=%02X %02X %02X %02X",
+           present, sv.empty() ? L"(unknown)" : std::wstring(sv).c_str(),
+           b[0], b[1], b[2], b[3]);
+}
+
+bool createSwapChainForWindow(IDXGIFactory4* factory, ID3D12CommandQueue* queue, HWND win,
+                              HWND presentWin, UINT width, UINT height, const SwapChainBundle* reuse,
+                              SwapChainBundle& out, std::string& err) {
     static constexpr struct {
         DXGI_SWAP_EFFECT effect;
         UINT flags;
@@ -173,10 +276,21 @@ bool createSwapChainForWindow(IDXGIFactory4* factory, ID3D12CommandQueue* queue,
         {DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, 0, "FLIP_SEQUENTIAL"},
     };
 
+    // RTSS/OSD 修复：优先把 swapchain 建在自建呈现子窗口上（presentWin）。GL 呈
+    // 现过的父窗口会被 DXGI 永久拒绝（E_ACCESSDENIED），子窗口不会。
+    const HWND chainWin = presentWin != nullptr ? presentWin : win;
+
     if (!reuse || !reuse->composition) {
         DXGI_SWAP_CHAIN_DESC1 sd{};
-        sd.Width = 1;   // 占位；configureSurface 时 ResizeBuffers 到实际尺寸
-        sd.Height = 1;
+        // resize 修复（关键）：这里必须用调用方给的目标尺寸建链，绝不能再用 1x1 占位。
+        // 原先固定 1x1、指望 configureSurface 的 ResizeBuffers 事后调整，但 flip model +
+        // 异步呈现线程持续 Present 时 ResizeBuffers 会一直返回 DXGI_ERROR_INVALID_CALL
+        // (0x887A0001)，configureSurface 于是走「重建 swapchain」回退，而重建又建出一个
+        // 1x1 的链，且重建路径不会再调 ResizeBuffers → 1x1 缓冲被拉伸铺满整个窗口，
+        // 用户看到的就是「resize 后黑屏」（实测：日志 recreated swapchain 2560x1334，
+        // 但读回 back buffer 尺寸仍是 1x1、颜色恒为 RGBA(24,22,14)）。
+        sd.Width = width > 0 ? width : 1;
+        sd.Height = height > 0 ? height : 1;
         sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         sd.Stereo = FALSE;
         sd.SampleDesc.Count = 1;
@@ -198,15 +312,20 @@ bool createSwapChainForWindow(IDXGIFactory4* factory, ID3D12CommandQueue* queue,
                 sd.SwapEffect = tier.effect;
                 sd.Flags = tier.flags;
                 HRESULT hr =
-                    factory->CreateSwapChainForHwnd(queue, win, &sd, nullptr, nullptr, &out.swapChain);
+                    factory->CreateSwapChainForHwnd(queue, chainWin, &sd, nullptr, nullptr, &out.swapChain);
                 if (SUCCEEDED(hr)) {
                     out.allowTearing = (tier.flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
-                    std::fprintf(stderr, "[dx12] swapchain OK (tier=%s pass=%d)\n", tier.label, pass);
+                    std::fprintf(stderr,
+                                 "[dx12] swapchain OK (tier=%s pass=%d hwnd=%s) — OSD/overlay-capable\n",
+                                 tier.label, pass,
+                                 presentWin != nullptr ? "present-child" : "game-window");
+                    logSwapChainPresentHook(out.swapChain.Get());
                     break;
                 }
                 lastHr = hr;
-                std::fprintf(stderr, "[dx12] swapchain tier %s failed hr=%08X (pass=%d)\n", tier.label,
-                             static_cast<unsigned>(hr), pass);
+                std::fprintf(stderr, "[dx12] swapchain tier %s failed hr=%08X (pass=%d hwnd=%s)\n",
+                             tier.label, static_cast<unsigned>(hr), pass,
+                             presentWin != nullptr ? "present-child" : "game-window");
             }
         }
     } else {
@@ -376,10 +495,24 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     // P33：CreateSwapChainForHwnd 在部分环境（Issue #11：NVIDIA 独显 + Intel 核显
     // 笔记本，所有 tier 返回 E_ACCESSDENIED 0x80070005）会被拒绝。先多 tier + 重试，
     // 仍失败则回退 CreateSwapChainForComposition + DirectComposition（不绑定 HWND）。
+    // RTSS/OSD 修复：给呈现单独建一个子窗口（原因见 createPresentationWindow 注释）。
+    // 它只用于 HWND swapchain；composition 回退时会把它销毁，避免黑窗口盖住合成画面。
+    HWND presentChild = createPresentationWindow(win, initW, initH);
+    if (presentChild != nullptr) {
+        std::fprintf(stderr, "[dx12] createSurface: presentation child hwnd=%p (%ux%u)\n",
+                     reinterpret_cast<void*>(presentChild), initW, initH);
+    } else if (win != nullptr) {
+        std::fprintf(stderr,
+                     "[dx12] createSurface: presentation child window creation failed (err=%lu); "
+                     "falling back to the GL window HWND\n",
+                     static_cast<unsigned long>(GetLastError()));
+    }
+    std::fflush(stderr);
+
     SwapChainBundle bundle;
     std::string scErr;
-    if (!createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, initW, initH, nullptr, bundle,
-                                  scErr)) {
+    if (!createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, presentChild, initW, initH, nullptr,
+                                  bundle, scErr)) {
         // 打印调试层消息辅助诊断
         if (ctx.infoQueue) {
             UINT64 n = ctx.infoQueue->GetNumStoredMessages();
@@ -398,6 +531,13 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
         err = scErr;
         return nullptr;
     }
+    if (bundle.composition && presentChild != nullptr) {
+        // 走了 DirectComposition 回退：画面由 visual 合成到主窗口，呈现子窗口只会
+        // 盖住它，直接销毁并回落到"无子窗口"的旧行为。
+        std::fprintf(stderr, "[dx12] createSurface: composition fallback -> destroying presentation child\n");
+        DestroyWindow(presentChild);
+        presentChild = nullptr;
+    }
     ComPtr<IDXGISwapChain1> swapChain1 = bundle.swapChain;
 
     ComPtr<IDXGISwapChain3> swapChain3;
@@ -408,6 +548,7 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
 
     Dx12Surface* s = new Dx12Surface();
     s->hwnd = hwnd;
+    s->presentWindow = presentChild;  // 非空 = swapchain 建在自建子窗口上（HWND 路径）
     s->swapChain = swapChain3;
     s->compositionMode = bundle.composition;
     s->dcompDevice = bundle.dcompDevice;
@@ -442,12 +583,18 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
     // 防御：glfwGetFramebufferSize 在某些时机（DWM 切换/显示器热插拔瞬间）会返回错误
     // 尺寸（如 854x1048 而非实际的 854x480）。若新高度相对旧高度偏差超过 2 倍且宽度
     // 未变化，视为无效回调，保留旧尺寸避免 swapchain 重建为错误比例导致黑屏。
-    if (s->width > 0 && s->height > 0 && width == s->width && height > static_cast<int>(s->height) * 2) {
+    // 比较前把 UINT 成员显式收成 int：width/height 是 int 入参（可能为负），
+    // 直接混比会触发 /W4 的 C4389 有符号/无符号不匹配。
+    const int curW = static_cast<int>(s->width);
+    const int curH = static_cast<int>(s->height);
+    if (curW > 0 && curH > 0 && width == curW && height > curH * 2) {
         dbgLog("configureSurface: rejecting invalid height %d (current %d), keeping old", height, s->height);
         s->presentMode = presentMode;
         return true;
     }
     s->presentMode = presentMode;
+    // 呈现子窗口跟随客户区尺寸（它是 swapchain 的实际宿主窗口）。
+    resizePresentationWindow(s->presentWindow, static_cast<UINT>(width), static_cast<UINT>(height));
 
     // 新尺寸与当前 swapchain 一致时，无需 ResizeBuffers（避免已重建的 swapchain
     // 被错误尺寸锁死后再调 ResizeBuffers 仍报 INVALID_CALL）。
@@ -462,11 +609,18 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
     // deviceWaitIdle 现已确保等待一个绝对高于 GPU 已完成值的 fence，
     // 避免提前返回导致 DWM 仍持有 backbuffer 引用而失败（DXGI_ERROR_INVALID_CALL）。
     // 镜像官方 VulkanGpuSurface 调整 swapchain 前的 waitIdle 语义。
+    //
+    // P70：除了等 GPU，还要先把呈现管线本身"静止"下来——异步渲染线程提交中的帧
+    // 会与 ResizeBuffers 并发访问同一条 swapchain，这是 INVALID_CALL 的主要来源。
+    waitForRenderThreadSubmit();          // 等异步渲染线程完成当前帧提交
+    if (!waitForPendingPresents(2000)) {  // 等已提交但尚未 Present 完成的帧
+        dbgLog("configureSurface: pending presents did not drain before ResizeBuffers (continuing)");
+    }
     if (!deviceWaitIdle(err)) {
         err = "deviceWaitIdle before ResizeBuffers failed: " + err;
         return false;
     }
-    dbgLog("configureSurface: idle ok, ResizeBuffers %dx%d mode=%d", width, height, presentMode);
+    dbgLogDebug("configureSurface: idle ok, ResizeBuffers %dx%d mode=%d", width, height, presentMode);
     // 防御：vanilla 在 acquire 与 present 之间若被窗口事件触发 configure，
     // 会残留"已 acquire 未 present"的 backbuffer；ResizeBuffers 对其返回
     // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE -> MC surfaceIsInvalid=true -> 之后
@@ -485,27 +639,55 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
             dbgLog("configureSurface: unbind composition content failed: %s", uErr.c_str());
         }
     }
+    // P71（真正的 INVALID_CALL 根因）：DXGI 明确规定 ResizeBuffers 之前必须释放所有对
+    // back buffer 的 direct/indirect 引用（"You must release all outstanding references to
+    // the swap chain's buffers before resizing"），否则固定返回 DXGI_ERROR_INVALID_CALL
+    // (0x887A0001)。旧实现把 s->backBuffers 一直持有到 retry 循环之后，于是 10 次重试
+    // 必然全败、每次都退化到「销毁并重建 swapchain」——重建之所以能成功，正是因为它在
+    // Reset 旧链时把这些引用释放掉了。修正后 flags/等待都只是次要条件。
+    for (auto& bb : s->backBuffers) {
+        if (bb) bb.Reset();
+    }
+    s->backBuffers.clear();
     // 使用 swap chain 创建时的格式，而非 s->format（后者可能因内存损坏/误用而变为无效值，
     // 导致 ResizeBuffers 以 0x887A0001 (DXGI_ERROR_INVALID_CALL) 失败）。
     const DXGI_FORMAT scFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
-    // composition swapchain 不支持 ALLOW_TEARING，ResizeBuffers 必须传 0。
-    const UINT scFlags = s->compositionMode ? 0 : DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    // P70（resize 噪音根因）：ResizeBuffers 的 flags 必须与创建 swapchain 时一致。
+    // 这里曾无条件传 DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING；而 createSwapChainForWindow
+    // 的多 tier 重试中，"不带 TEARING" 的 tier 成功时 s->allowTearing == false，
+    // 于是每次 ResizeBuffers 都因 flag 不匹配直接 INVALID_CALL，重试 10 次后走重建——
+    // 这正是「大尺寸 resize 间歇性失败 + 日志刷屏 + 重建丢状态」的来源。
+    // composition swapchain 不支持 ALLOW_TEARING，同样必须传 0。
+    const UINT scFlags =
+        s->compositionMode ? 0 : (s->allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     HRESULT hr = S_OK;
     // deviceWaitIdle 完成后 DWM 合成器可能仍在异步持有 backbuffer 引用（flip model
     // + 窗口/全屏切换时常见竞态）。多次重试 + 递增等待，最多等 ~1s。
     for (int retry = 0; retry < 10; ++retry) {
         if (retry > 0) {
             int waitMs = (1 << retry);  // 2,4,8,16,32,64,128,256,512 ms
-            dbgLog("configureSurface: retry %d after %dms", retry, waitMs);
+            dbgLogDebug("configureSurface: retry %d after %dms", retry, waitMs);
             std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
         }
         hr = s->swapChain->ResizeBuffers(kSurfaceBufferCount, static_cast<UINT>(width),
                                          static_cast<UINT>(height), scFmt, scFlags);
         if (SUCCEEDED(hr)) {
-            dbgLog("configureSurface: ResizeBuffers ok (retry=%d)", retry);
+            if (retry > 0) {
+                dbgLog("configureSurface: ResizeBuffers ok after %d retries", retry);
+            } else {
+                dbgLogDebug("configureSurface: ResizeBuffers ok (retry=0)");
+            }
             break;
         }
-        dbgLog("configureSurface: ResizeBuffers failed %s (retry=%d)", hrText(hr).c_str(), retry);
+        // P70：重试属于预期内的 DWM/flip 竞态，不是错误——第一次失败打一条可见日志，
+        // 后续降级到 DEBUG，避免拖动窗口时把日志刷满（原实现 10 次全为 WARN 级）。
+        if (retry == 0) {
+            dbgLog("configureSurface: ResizeBuffers failed %s (flags=0x%X tearing=%d) — retrying",
+                   hrText(hr).c_str(), scFlags, static_cast<int>(s->allowTearing));
+        } else {
+            dbgLogDebug("configureSurface: ResizeBuffers failed %s (retry=%d)", hrText(hr).c_str(),
+                        retry);
+        }
         // INVALID_CALL 与 NOT_CURRENTLY_AVAILABLE 同源：DWM 异步持有 backbuffer 引用时
         // 均可能出现，统一重试（递增等待，最多 ~1s）。
         if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE && hr != DXGI_ERROR_INVALID_CALL) break;
@@ -523,7 +705,9 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
         deviceWaitIdle(err);
         s->swapChain.Reset();
         s->backBuffers.clear();
-        s->rtvHandles.clear();
+        // P71：不清 rtvHandles —— 句柄在 rtvHeap 上是 bump 分配，保留复用即可；
+        // 旧实现每次重建都重新分配 3 个槽，反复 resize 会把 kRtvHeapSize 用尽
+        // （"RTV descriptor heap exhausted"），随后 configureSurface 直接失败。
         s->currentImageIndex = -1;
         s->lastBlitIndex = -1;
 
@@ -547,10 +731,15 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
         SwapChainBundle bundle;
         std::string rErr;
         if (!createSwapChainForWindow(factory.Get(), ctx.queue.Get(), reinterpret_cast<HWND>(s->hwnd),
-                                      static_cast<UINT>(width), static_cast<UINT>(height),
+                                      s->presentWindow, static_cast<UINT>(width), static_cast<UINT>(height),
                                       s->compositionMode ? &reuse : nullptr, bundle, rErr)) {
             err = rErr + " (recreate)";
             return false;
+        }
+        if (bundle.composition && s->presentWindow != nullptr) {
+            // 重建时退化成 composition：呈现子窗口只会盖住合成画面，销毁它。
+            DestroyWindow(s->presentWindow);
+            s->presentWindow = nullptr;
         }
         if (FAILED(bundle.swapChain.As(&s->swapChain))) {
             err = "swapchain does not support IDXGISwapChain3";
@@ -582,20 +771,33 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
 
     // 重新取 back buffers + RTV
     s->backBuffers.resize(kSurfaceBufferCount);
-    s->rtvHandles.clear();
     s->surfaceFences.assign(kSurfaceBufferCount, 0);  // P18：per-backbuffer fence 初值
+    // P71：RTV 句柄持久复用（见上文重建分支的说明）。只在本对象还没有句柄时分配。
+    if (s->rtvHandles.size() != kSurfaceBufferCount) {
+        s->rtvHandles.clear();
+        for (UINT i = 0; i < kSurfaceBufferCount; ++i) {
+            D3D12_CPU_DESCRIPTOR_HANDLE h = allocRtvHandle(err);
+            if (h.ptr == 0) {
+                return false;
+            }
+            s->rtvHandles.push_back(h);
+        }
+    }
     for (UINT i = 0; i < kSurfaceBufferCount; ++i) {
         hr = s->swapChain->GetBuffer(i, IID_PPV_ARGS(&s->backBuffers[i]));
         if (FAILED(hr)) {
             err = "GetBuffer failed " + hrText(hr);
             return false;
         }
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = allocRtvHandle(err);
-        if (rtv.ptr == 0) {
-            return false;
-        }
-        ctx.device->CreateRenderTargetView(s->backBuffers[i].Get(), nullptr, rtv);
-        s->rtvHandles.push_back(rtv);
+        ctx.device->CreateRenderTargetView(s->backBuffers[i].Get(), nullptr, s->rtvHandles[i]);
+    }
+    // resize 修复后的校验：重建/调整后的链真实尺寸必须等于请求尺寸。
+    // （1x1 占位 bug 时期这里会打印 1x1，就是用户看到的「resize 后黑屏」。）
+    if (!s->backBuffers.empty() && s->backBuffers[0]) {
+        const D3D12_RESOURCE_DESC bd0 = s->backBuffers[0]->GetDesc();
+        dbgLog("configureSurface: swapchain buffer0 = %llux%u (requested %dx%d)",
+               static_cast<unsigned long long>(bd0.Width), static_cast<unsigned>(bd0.Height),
+               static_cast<int>(width), static_cast<int>(height));
     }
     // P35：配置完成后才设为 active surface，确保渲染线程不会在 backBuffers 未就绪时 acquire。
     setActiveSurface(s);
@@ -614,7 +816,22 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
     // 已推迟到 blit 之前（Java Dx12GpuSurface.ensureAcquired），此时本帧录制已完成，
     // 上一帧 Present 通常早已结束 → 通常 0ms。同步/SYNC 路径（渲染线程未运行）下
     // waitForPendingPresents 内部直接返回，无额外开销。
-    waitForPendingPresents();
+    //
+    // P68（GLFW_NO_API 崩溃根因）：这里**必须**把同步失败当致命处理。旧实现在
+    // waitForPendingPresents 超时后照常往下 acquire → 本帧 blit 写到一个「Present 完成
+    // 后会翻转走」的 back buffer 上 → D3D12 ERROR #907（writes to a swapchain back buffer
+    // ... may only be executed when that back buffer is the current back buffer）→
+    // RemoveDevice(0x887A0005, DXGI_ERROR_ACCESS_DENIED) → 游戏崩溃。冷启动第一帧渲染
+    // 线程要 initBlitPipeline（实测 >100ms）必然触发，所以 GLFW_NO_API 模式下必崩。
+    // 现在给足冷启动余量；仍同步不上就放弃本帧：Java 侧 ensureAcquired() 返回 false →
+    // 跳过 blit（画面停上一帧，不写 swapchain），下一帧 acquireNextTexture() 补报
+    // SurfaceException 让 MC 走 surface 重建。
+    if (!waitForPendingPresents(2000)) {
+        err = "acquireSurface: present sync timeout (render thread stalled) — frame skipped to "
+              "avoid writing a non-current back buffer";
+        s->currentImageIndex = -1;
+        return false;
+    }
     // 以下两条为逐帧诊断（原为 dbgLog，每帧 2 次 stderr+文件 flush，实测 ~0.1-0.2ms/条，
     // 属帧关键路径纯开销）→ 降为 DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
     dbgLogDebug("acquireSurface: enter surface=%p", reinterpret_cast<void*>(s));
@@ -800,6 +1017,19 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex, std::s
         // 2. 绑定 RTV 和根签名
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[static_cast<size_t>(s->currentImageIndex)];
         cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        // P69：viewport / scissor 属于【命令列表状态】，不是 PSO 状态。blit 之前的
+        // 最后一次 render pass（GUI blur / post-chain 等）留下的 viewport/scissor 会
+        // 被这个"整屏"四边形继承，于是 blit 只覆盖 backbuffer 的一小块：未覆盖区域
+        // 保留 2-3 帧前的旧内容（旧场景 + 旧 RTSS OSD 文字），表现为用户报告的
+        // 「上一场景叠在当前场景下层并闪烁」以及「RTSS OSD 也重叠一份」。
+        // 尺寸取 backbuffer 资源自身描述，避免 s->width/height 在 resize 后短暂不一致。
+        const D3D12_RESOURCE_DESC bbDesc = dst->GetDesc();
+        D3D12_VIEWPORT blitVp{0.0f, 0.0f, static_cast<FLOAT>(bbDesc.Width),
+                              static_cast<FLOAT>(bbDesc.Height), 0.0f, 1.0f};
+        cmd->RSSetViewports(1, &blitVp);
+        D3D12_RECT blitSc{0, 0, static_cast<LONG>(bbDesc.Width), static_cast<LONG>(bbDesc.Height)};
+        cmd->RSSetScissorRects(1, &blitSc);
+        dbgLogDebug("blitSurface: viewport/scissor set %llux%llu", bbDesc.Width, bbDesc.Height);
         // 确保 blit 管线已初始化（首帧调用时 initBlitPipeline 尚未运行）
         std::string blitErr;
         initBlitPipeline(blitErr);
@@ -823,6 +1053,9 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex, std::s
         // 5. 绑定顶点/索引缓冲并绘制
         cmd->IASetVertexBuffers(0, 1, &bp->vbView);
         cmd->IASetIndexBuffer(&bp->ibView);
+        // P69：IA topology 同样是命令列表状态（D3D12 初值为 UNDEFINED），必须显式设置，
+        // 否则继承上一次 pass 的拓扑 → 整屏四边形退化/丢失，backbuffer 只被部分覆盖。
+        cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         dbgLogDebug("blitSurface: drawIndexed inst=1 firstIdx=0 firstVert=0");
         cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
         dbgLogDebug("blitSurface: drawIndexed done");
@@ -904,6 +1137,12 @@ void presentSurface(Dx12Surface* s) {
         s->suboptimal = true;
     } else if (FAILED(hr)) {
         dbgLog("presentSurface: FAILED %s", hrText(hr).c_str());
+        // P68：设备移除/重置时把真正的原因（GetDeviceRemovedReason + InfoQueue 最近消息）
+        // 打进日志。未开调试层时，日志里只有一个 0x887A0005，看不出是「写了非当前
+        // back buffer」（DXGI_ERROR_ACCESS_DENIED）还是真正的 GPU hang/TDR。
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+            logDeviceStatus("presentSurface: FAILED");
+        }
         s->suboptimal = true;
     } else {
         // 每帧成功路径：默认级别下静默（stderr/文件写位于帧关键路径上）。
@@ -947,7 +1186,12 @@ void destroySurface(Dx12Surface* s) {
     // CORRUPTION 警告的根本原因）。
     flushPendingDeletes();
     if (getActiveSurface() == s) setActiveSurface(nullptr);
+    // 先释放 swapchain（delete s），再销毁它的呈现宿主窗口，顺序不能反：
+    // 窗口还活着时 DWM 仍持有该窗口的呈现资源引用。
+    HWND presentChild = s->presentWindow;
+    s->presentWindow = nullptr;
     delete s;
+    if (presentChild != nullptr) DestroyWindow(presentChild);
     dbgLog("destroySurface: done surface=%p", reinterpret_cast<void*>(s));
 }
 
@@ -955,7 +1199,10 @@ void destroySurface(Dx12Surface* s) {
 void destroySurfaceNoWaitIdle(Dx12Surface* s) {
     if (!s) return;
     if (getActiveSurface() == s) setActiveSurface(nullptr);
+    HWND presentChild = s->presentWindow;
+    s->presentWindow = nullptr;
     delete s;
+    if (presentChild != nullptr) DestroyWindow(presentChild);
 }
 
 // P6 诊断：读回 back buffer 采样像素。内部先等 GPU 完全空闲（同步一帧），

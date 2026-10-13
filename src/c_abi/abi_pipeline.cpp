@@ -1,4 +1,37 @@
-// abi_bridge_p4.cpp — graphics pipeline creation/destruction.
+
+
+// abi_pipeline.cpp — graphics pipeline creation/destruction
+//
+// Group: graphics pipelines (originally abi_bridge_p4.cpp).
+// 合并自：abi_bridge_p4.cpp
+//
+#include "_d3d12_module_prelude.h"
+
+#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
+
+import mcdr.d3d12.device;
+import mcdr.d3d12.mesh;
+import mcdr.d3d12.async_bundle;
+import mcdr.d3d12.async_descriptor;
+import mcdr.d3d12.async_executor;
+import mcdr.d3d12.async_fence;
+import mcdr.abi.common;
+
+using namespace d3d12_mc;
+
+// ===========================================================================
+// 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
+// 共享前言（prelude / mcdr_abi.h / 各模块 import）统一放在文件顶部，下面每一段
+// 保留原单元的文件头注释与代码本体，内容逐字节未改。
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 来源单元：abi_bridge_p4.cpp
+// ---------------------------------------------------------------------------
+
+
+
+// abi_pipeline.cpp — graphics pipeline creation/destruction.（合并自 abi_bridge_p4.cpp）
 //
 // Replaces jni_bridge_p4.cpp (172 lines). That file's entire body was a
 // hand-written little-endian unpacker for the packed descriptor ByteBuffer the
@@ -11,14 +44,6 @@
 // Here the descriptor is a real struct (mcdr_pipeline_desc) whose layout the
 // Java side mirrors with MemoryLayout.structLayout and whose offsets are
 // verified at load time by mcdrABILayout(). There is nothing left to unpack.
-
-#include "abi_common.h"
-
-#include "../dx12/dx12_device.h"
-
-#include <cstdint>
-#include <string>
-#include <vector>
 
 namespace {
 

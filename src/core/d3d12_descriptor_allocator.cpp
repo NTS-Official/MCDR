@@ -1,8 +1,12 @@
+module;
+
+#include "_d3d12_module_prelude.h"
+
+module mcdr.d3d12.descriptor_allocator;
+
 // dx12-mc 原生 D3D12 层（C++）
 // P33：线程安全分段描述符分配器实现。
 // 设计说明见 dx12_descriptor_allocator.h 顶部注释（ASYNC-01 分区隔离方案）。
-
-#include "dx12_descriptor_allocator.h"
 
 namespace d3d12_mc {
 

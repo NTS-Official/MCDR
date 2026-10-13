@@ -1,5 +1,3 @@
-#pragma once
-
 // dx12-mc 异步渲染基础设施（P33）：分区描述符分配器
 //
 // 方案取舍：不使用“每 worker CPU-only 镜像堆 + 主线程 CopyDescriptorsSimple
@@ -22,18 +20,13 @@
 // 帧槽数固定为 kAsyncFrameSlots（与主循环计划的最大在飞帧数一致），worker
 // 数可配（<= kMaxAsyncWorkers）。
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
+module;
 
-#include <d3d12.h>
-#include <wrl/client.h>
+#include "_d3d12_module_prelude.h"
 
-#include <array>
-#include <atomic>
-#include <cstdint>
+export module mcdr.d3d12.async_descriptor;
 
-namespace d3d12_mc {
+export namespace d3d12_mc {
 
 using Microsoft::WRL::ComPtr;
 

@@ -1,11 +1,3 @@
-#pragma once
-
-// 禁用 Windows min/max 宏，避免与 std::max/std::min 冲突（须在任何
-// windows.h/d3d12.h 之前定义）。
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-
 // dx12-mc 原生 D3D12 层（C++）
 // P33：线程安全分段描述符分配器（SegmentedDescriptorAllocator）。
 //
@@ -34,23 +26,19 @@
 //     submit 已等 N 完成」的约束同理，见 dx12_device.cpp L80-87 注释）。
 //     到期的段调用 resetSection() 把游标归零即可整段复用，无需逐槽 free。
 //
-// 线程安全声明（本文件对外契约）：
+// 线程安全声明（本模块对外契约）：
 //   * 不同 worker、不同段：零竞争、无共享可变状态。
 //   * 同段内并发 allocSlot：std::atomic fetch_add 保证返回索引互不相同；
 //     同段内 freeSlot / allocSlot 慢路径 / resetSection 以 std::mutex 互斥。
 //   * 对象的构造、reset()、析构须在"所有段已无并发分配"的帧边界执行。
 
-#include <d3d12.h>
-#include <wrl/client.h>
+module;
 
-#include <atomic>
-#include <climits>
-#include <cstdint>
-#include <memory>
-#include <mutex>
-#include <vector>
+#include "_d3d12_module_prelude.h"
 
-namespace d3d12_mc {
+export module mcdr.d3d12.descriptor_allocator;
+
+export namespace d3d12_mc {
 
 using Microsoft::WRL::ComPtr;
 

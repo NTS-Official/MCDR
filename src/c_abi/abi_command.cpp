@@ -1,4 +1,37 @@
-// abi_bridge_p3.cpp — command layer: encoder lifecycle, copies, clears, render
+
+
+// abi_command.cpp — command layer: encoder lifecycle, copies, clears, render pass, timestamp queries and the async-renderer control channel
+//
+// Group: command recording (originally abi_bridge_p3.cpp).
+// 合并自：abi_bridge_p3.cpp
+//
+#include "_d3d12_module_prelude.h"
+
+#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
+
+import mcdr.d3d12.device;
+import mcdr.d3d12.mesh;
+import mcdr.d3d12.async_bundle;
+import mcdr.d3d12.async_descriptor;
+import mcdr.d3d12.async_executor;
+import mcdr.d3d12.async_fence;
+import mcdr.abi.common;
+
+using namespace d3d12_mc;
+
+// ===========================================================================
+// 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
+// 共享前言（prelude / mcdr_abi.h / 各模块 import）统一放在文件顶部，下面每一段
+// 保留原单元的文件头注释与代码本体，内容逐字节未改。
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 来源单元：abi_bridge_p3.cpp
+// ---------------------------------------------------------------------------
+
+
+
+// abi_command.cpp — command layer: encoder lifecycle, copies, clears, render（合并自 abi_bridge_p3.cpp）
 // pass, timestamp queries and the async-renderer control channel.
 //
 // Replaces jni_bridge_p3.cpp (421 lines). The translation is mechanical, with
@@ -20,23 +53,17 @@
 //     depends on that. Only a genuine failure (queue fence uninitialised,
 //     CreateEvent failure) sets the last error.
 
-#include "abi_common.h"
-#include "../dx12/dx12_device.h"
-
-import std;
-import std.compat;
-
 extern "C" {
 
-int64_t MCDR_CALL mcdr_dx12GetTimestampFrequency(void) {
+int64_t MCDR_CALL MCDR_D3D12_get_timestamp_frequency(void) {
     return static_cast<int64_t>(d3d12_mc::getTimestampFrequency());
 }
 
-mcdr_command_ctx* MCDR_CALL mcdr_dx12CreateCommandEncoder(void) {
+mcdr_command_ctx* MCDR_CALL MCDR_D3D12_create_command_encoder(void) {
     std::string err;
     d3d12_mc::CommandContext* ctx = d3d12_mc::createCommandEncoder(err);
     if (!ctx) {
-        return mcdr::abi::failWithPtr<d3d12_mc::CommandContext>("mcdr_dx12CreateCommandEncoder", err);
+        return mcdr::abi::failWithPtr<d3d12_mc::CommandContext>("MCDR_D3D12_create_command_encoder", err);
     }
     return ctx;
 }

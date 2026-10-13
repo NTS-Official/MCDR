@@ -1,6 +1,8 @@
-#include "dx12_async_fence.h"
+module;
 
-import std;
+#include "_d3d12_module_prelude.h"
+
+module mcdr.d3d12.async_fence;
 
 namespace d3d12_mc {
 

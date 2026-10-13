@@ -1,4 +1,37 @@
-// abi_bridge_p5.cpp — DXGI swapchain surface entry points.
+
+
+// abi_surface.cpp — DXGI swapchain surface: create/configure/acquire/blit/present, back-buffer handles, pixel readback
+//
+// Group: DXGI surface (originally abi_bridge_p5.cpp).
+// 合并自：abi_bridge_p5.cpp
+//
+#include "_d3d12_module_prelude.h"
+
+#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
+
+import mcdr.d3d12.device;
+import mcdr.d3d12.mesh;
+import mcdr.d3d12.async_bundle;
+import mcdr.d3d12.async_descriptor;
+import mcdr.d3d12.async_executor;
+import mcdr.d3d12.async_fence;
+import mcdr.abi.common;
+
+using namespace d3d12_mc;
+
+// ===========================================================================
+// 本文件是合并后的 C ABI 适配单元，按**功能**命名（不再按移植阶段 pX）。
+// 共享前言（prelude / mcdr_abi.h / 各模块 import）统一放在文件顶部，下面每一段
+// 保留原单元的文件头注释与代码本体，内容逐字节未改。
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 来源单元：abi_bridge_p5.cpp
+// ---------------------------------------------------------------------------
+
+
+
+// abi_surface.cpp — DXGI swapchain surface entry points.（合并自 abi_bridge_p5.cpp）
 //
 // Replaces jni_bridge_p5.cpp (438 lines). Two things changed beyond the
 // mechanical translation:
@@ -14,16 +47,7 @@
 //     array; the diagnostic stderr lines the source project relied on are kept
 //     verbatim so existing log captures still work.
 
-#include "abi_common.h"
 
-#include "../dx12/dx12_device.h"
-
-#include <cstdint>
-#include <cstdio>
-#include <string>
-#include <vector>
-
-using namespace d3d12_mc;
 
 namespace {
 

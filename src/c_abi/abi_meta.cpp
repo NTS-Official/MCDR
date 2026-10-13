@@ -1,3 +1,5 @@
+
+
 // abi_meta.cpp — the ABI's own surface: version, layout self-check, error
 // reporting and log verbosity.
 //
@@ -9,12 +11,14 @@
 // the native side publishes one (name, offset, size) triple per mirrored field
 // and the Java side compares it against its own MemoryLayouts before any other
 // entry point is called.
+#include "_d3d12_module_prelude.h"
 
-#include "abi_common.h"
-#include "../dx12/dx12_device.h"   // d3d12_mc::setLogLevel
+#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
-import std;
 
+import mcdr.d3d12.device;
+
+import mcdr.abi.common;
 namespace mcdr::abi {
 
 namespace {
@@ -92,6 +96,27 @@ const std::vector<mcdr_abi_field>& layoutTable() {
         MCDR_FIELD(mcdr_pipeline_desc, bindingCount),
         MCDR_FIELD(mcdr_pipeline_desc, _pad2),
         MCDR_FIELD(mcdr_pipeline_desc, bindings),
+
+        // P72 mesh-shader pipeline. The Java mirror must carry exactly these
+        // fields with these sizes, or MCDRLayout.verify() aborts at load time.
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, asData),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, asLen),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, _pad0),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, msData),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, msLen),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, _pad1),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, psData),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, psLen),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, colorCount),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, colorTargets),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, hasDepth),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, _pad2),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, depth),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, cullEnabled),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, polygonMode),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, bindingCount),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, _pad3),
+        MCDR_FIELD(mcdr_mesh_pipeline_desc, bindings),
     };
     return table;
 }

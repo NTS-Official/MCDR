@@ -1,45 +1,34 @@
-#pragma once
+// dx12-mc 原生 D3D12 层（C++）——设备 / 资源 / 命令 / 管线 / surface 的模块接口单元
+//
+// 本文件由 MCDR\src\dx12\dx12_device.h 逐行改写而来（仅去掉 #pragma once、NOMINMAX
+// 守卫、#include 与 namespace 包裹，其余声明保持逐字不变），职责与迁移前的头文件一致。
+//
+// 模块边界（迁移决策）：
+//   * 本模块同时容纳 dx12_device.h 里的全部声明，以及原本只在该头文件里声明、
+//     实现在 dx12_surface.cpp 的 Dx12Surface 系列 —— 因为 dx12_device.cpp 与
+//     dx12_surface.cpp 互相调用（device 的 submitCommandList 写 gActiveSurface；
+//     surface 的 createSurface/configureSurface 调用 deviceContext() 与
+//     allocRtvHandle），拆成两个模块会形成 import 环。
+//   * 异步基础设施（MainCommandExecutor / BundleRecorderPool /
+//     PartitionedDescriptorAllocator）各自独立成模块；本模块**不** import 它们 ——
+//     DeviceContext 里没有任何异步成员，异步对象是 dx12_device.cpp 里的文件级
+//     静态量，只在实现单元里引用。若此处 import 就会与各 async .cpp（实现单元，
+//     需要 deviceContext()）形成 import 环。
+//   * Dx12Surface 定义在 gActiveSurface 之前，故无需为它写前向声明；BlitPipeline
+//     仍保留前向声明（DeviceContext 持有 std::unique_ptr<BlitPipeline>）。
 
-// 禁用 Windows min/max 宏，避免与 std::max/std::min 冲突（须在任何
-// windows.h/d3d12.h 之前定义）。
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
+module;
 
-// dx12-mc 原生 D3D12 层（C++）
-// P2 目标：D3D12 设备上下文 + 资源创建（texture/buffer/sampler/view）+ 自检。
-// P3 目标：命令层（CommandEncoder 双缓冲提交 + fence 同步 + copy/clear +
-//          render pass 生命周期 + timestamp query）。
-// 设计参考：官方 com.mojang.blaze3d.vulkan.VulkanDevice / VulkanGpuTexture /
-// VulkanGpuBuffer.Direct / VulkanGpuSampler / VulkanGpuTextureView /
-// VulkanCommandEncoder / VulkanRenderPass。
+#include "_d3d12_module_prelude.h"
 
-#include <d3d12.h>
-#include <d3d12sdklayers.h>
-#include <d3dcompiler.h>
-#include <dxgi1_4.h>
-#include <dcomp.h>
-#include <wrl/client.h>
+export module mcdr.d3d12.device;
 
-#include <cstdint>
-#include <memory>
-#include <thread>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
 
-// P33 async：异步渲染基础设施（MainCommandExecutor + BundleRecorderPool）
-#include "dx12_async_executor.h"
-#include "dx12_async_bundle.h"
-#include "dx12_async_descriptor.h"
-
-namespace d3d12_mc {
+export namespace d3d12_mc {
 
 using Microsoft::WRL::ComPtr;
 
 // P15: 日志分级 - ERROR/WARNING 始终输出；INFO/DEBUG 默认关闭，需 DX12_LOG_VERBOSE=1
-
 enum class DbgLogLevel : int {
     ERR = 0,
     WARN = 1,
@@ -60,15 +49,16 @@ void dbgLogDebug(const char* fmt, ...);
 void setLogLevel(int level);
 
 // 高频调试宏：默认静默，DX12_LOG_VERBOSE=1 或编译时 DX12_DEBUG_VERBOSE 宏开启
+// 注意：宏展开必须写全命名空间（d3d12_mc::）——否则在 namespace 之外使用该宏的 TU
+// （例如 MCDR\src\c_abi\abi_command.cpp 的 mcdr_dx12CopyBuffer）在
+// DX12_DEBUG_VERBOSE 打开时会报 C3861「dbgLogDebug: 找不到标识符」。
 #ifdef DX12_DEBUG_VERBOSE
-#define DBG_LOG_DEBUG(...) dbgLogDebug(__VA_ARGS__)
+#define DBG_LOG_DEBUG(...) ::d3d12_mc::dbgLogDebug(__VA_ARGS__)
 #else
 #define DBG_LOG_DEBUG(...) ((void)0)
 #endif
 
-// ---------------------------------------------------------------------------
 // P22: 前向声明（DeviceContext 使用 std::unique_ptr<BlitPipeline>，需完整类型）
-// ---------------------------------------------------------------------------
 struct BlitPipeline;
 
 // ---------------------------------------------------------------------------
@@ -76,6 +66,10 @@ struct BlitPipeline;
 // ---------------------------------------------------------------------------
 struct DeviceContext {
     ComPtr<ID3D12Device> device;
+    // P72：mesh shader 管线必须用 D3D12_PIPELINE_STATE_STREAM_DESC，而它只挂在
+    // ID3D12Device2 上（D3D12_GRAPHICS_PIPELINE_STATE_DESC/CreateGraphicsPipelineState
+    // 无法表达 AS/MS 阶段）。首次创建 mesh 管线时 QueryInterface 一次并缓存。
+    ComPtr<ID3D12Device2> device2;
 
     ComPtr<ID3D12DescriptorHeap> srvHeap;      // SRV（SHADER_VISIBLE）
     // P6：SRV 的 CPU-only 镜像堆（非 SHADER_VISIBLE）。CopyDescriptorsSimple
@@ -106,6 +100,38 @@ struct DeviceContext {
     std::string adapterName;
     ComPtr<IDXGIAdapter> adapter;  // 与 device 绑定的 DXGI adapter（用于 CreateDXGIFactoryForAdapter）
     D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
+
+    // P66：设备能力基线。设备创建后立即用 CheckFeatureSupport 填好（见
+    // queryDeviceCapabilities），既写进适配器信息 JSON 供 Java 侧读取，也作为
+    // mesh shader（ms_6_6/as_6_6）、DXR、VRS 等特性的门控依据。12_2 是这些特性
+    // 的共同下限，所以 ensureDevice 现在只接受支持 12_2 的适配器。
+    struct Capabilities {
+        D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_12_2;  // 由 ensureDevice 覆写
+        D3D_SHADER_MODEL shaderModel = D3D_SHADER_MODEL_5_1;  // 最高 SM；mesh shader 需 6_6+
+        D3D12_MESH_SHADER_TIER meshShaderTier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+        D3D12_SAMPLER_FEEDBACK_TIER samplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
+        D3D12_RAYTRACING_TIER raytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+        D3D12_VARIABLE_SHADING_RATE_TIER shadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+        D3D12_RESOURCE_BINDING_TIER resourceBindingTier = D3D12_RESOURCE_BINDING_TIER_1;
+        bool enhancedBarriers = false;
+        bool queried = false;  // false = CheckFeatureSupport 未被调用/全部失败
+
+        // P67：DXC（Shader Model 6.x / mesh shader 编译器）可用性。D3DCompile 只到
+        // SM 5.1，mesh shader（ms_6_6/as_6_6）必须由 DXC 编译；设备初始化时会动态
+        // 加载 dxcompiler.dll 并做一次 mesh shader 冒烟编译，作为「mesh shader 基础」
+        // 的自检（真正的 mesh 管线还需要 AS/MS 的 D3D12_PIPELINE_STATE_STREAM_DESC，
+        // 尚未实现）。
+        bool dxcAvailable = false;        // dxcompiler.dll 已加载且能拿到 IDxcCompiler3
+        bool meshShaderCompileOk = false;  // 冒烟编译（目标 ms_6_x）是否成功
+        std::string dxcPath;    // 实际加载到的 dxcompiler.dll 完整路径
+        std::string dxcProfile;  // 冒烟编译使用的 target，如 "ms_6_6"
+        std::string dxcNote;    // 失败原因或 DXC 版本信息
+
+        constexpr bool meshShadersSupported() const {
+            return meshShaderTier >= D3D12_MESH_SHADER_TIER_1;
+        }
+    };
+    Capabilities caps;
     UINT64 timestampFrequency = 0;  // 从 GetTimestampFrequency 获取（DeviceInfo.timestampPeriod 用）
     ComPtr<ID3D12CommandQueue> queue;   // 图形队列（提交命令用）
 
@@ -154,8 +180,41 @@ struct Dx12Object {
 // 设备生命周期
 // ---------------------------------------------------------------------------
 // 创建/复用全局设备上下文；失败时填充 errorOut 并返回 false。
+// P66：设备必须建在支持 D3D_FEATURE_LEVEL_12_2 的硬件适配器上（按 GPU 偏好顺序
+// 挑选，不再是 D3D12CreateDevice(nullptr, ...) 的默认适配器——混合显卡机器上默认
+// 适配器常是核显，既拿不到 12_2，也会让 CreateSwapChainForHwnd 全部 E_ACCESSDENIED）。
 bool ensureDevice(std::string& errorOut);
 void destroyDevice();
+
+// P66：D3D_FEATURE_LEVEL → "12_2" 短名；未知值返回 "unknown"。
+const char* featureLevelName(D3D_FEATURE_LEVEL level);
+// P66：本工程允许的最高着色器模型 = 6.10。SDK 10.0.26100 的 d3d12.h 只定义到
+// D3D_SHADER_MODEL_6_9，6_10 用数值补齐（0x6a）。真正能用多高取驱动上报值与这个
+// 上限的较小者（见 effectiveShaderModel）；另外 DXC 也必须够新——SDK 自带的
+// DXIL/DXC 1.8 只认到 6_8，6_9/6_10 会直接报 "invalid profile"。
+constexpr D3D_SHADER_MODEL kShaderModelCeiling = static_cast<D3D_SHADER_MODEL>(0x6a);
+// "6.8" / "6.10"（日志与 JSON 用）与 "6_8" / "6_10"（DXIL target 后缀用）。
+const char* shaderModelName(D3D_SHADER_MODEL model);
+const char* shaderModelProfileSuffix(D3D_SHADER_MODEL model);
+// 驱动上报的最高 SM 与 kShaderModelCeiling 取小；着色器编译/PSO 目标用它。
+D3D_SHADER_MODEL effectiveShaderModel(const DeviceContext::Capabilities& caps);
+// P66：查一遍 12_2 相关能力（SM / mesh shader tier / DXR / VRS / enhanced barriers）。
+void queryDeviceCapabilities(ID3D12Device* device, DeviceContext::Capabilities& caps);
+// P66：能力摘要（一行日志用）与 JSON 片段（无前导逗号，供适配器信息 JSON 拼接）。
+std::string capabilitiesText(const DeviceContext::Capabilities& caps);
+std::string capabilitiesJson(const DeviceContext::Capabilities& caps);
+
+// P67：探测 DXC 编译器（运行时动态加载，绝不静态链接 dxcompiler.lib），并做一次
+// mesh shader 冒烟编译，结果写回 caps 的 dxc* 字段。dxcompiler.dll 搜索顺序：
+// 环境变量 MCDR_DXC_DIR → MCDR.dll 同目录（将来随模组分发 DXC 时放这里）→
+// Windows SDK 最新的 bin\<ver>\x64。整段探测失败不致命，只记录原因。
+void probeDxc(DeviceContext::Capabilities& caps);
+
+// P72：运行期 HLSL → DXIL 编译入口（DXC，进程内缓存 dxcompiler.dll 与接口）。
+// mesh shader（as_6_x / ms_6_x）只能由 DXC 产出，Java 侧把源码 + 入口点 + profile
+// 交给这里，拿回 DXIL 字节码再喂给 createMeshPipeline。失败时 err 带 DXC 诊断首行。
+bool compileHlslToDxil(const std::string& source, const std::string& entry, const std::string& profile,
+                       std::vector<uint8_t>& outDxil, std::string& err);
 
 // JNI 层访问设备上下文（读 adapterName/featureLevel）。
 DeviceContext& deviceContext();
@@ -221,7 +280,21 @@ void unmapBuffer(Dx12Object* buffer);
 // 三 ring：帧 N 用 index (N-1)%3，帧 N+3 复用同一 index 时 submit 已等 N 完成。
 // （双 ring + 等 value-2 会差一帧：帧 N+2 复用帧 N 的 allocator 但只等了 N-1。）
 // ---------------------------------------------------------------------------
-struct Dx12Pipeline;  // forward，CommandContext 持有其裸指针
+// Dx12Pipeline 的完整定义提前到这里：CommandContext / BundleRecorder 都按值或
+// 按名引用它，且不应各自前向声明（模块内前向声明会得到另一个模块归属的类型，
+// 链接期报 LNK2001）。原本它在 PipelineDesc 之前，现前移到 CommandContext 之前。
+struct Dx12Pipeline {
+    ComPtr<ID3D12RootSignature> rootSignature;
+    ComPtr<ID3D12PipelineState> withDepth;  // 总是创建；DSV=D32_FLOAT（镜像官方 depthAttachmentFormat=126）
+    ComPtr<ID3D12PipelineState> withoutDepth;  // 仅 depthState==null 时创建；DSV=UNKNOWN
+    int topology = 4;  // MC PrimitiveTopology ordinal（setPipeline 时 IASetPrimitiveTopology 用）
+    // P6：per-slot 修正 stride（由 inputElements 实际格式推算，覆盖 Java 侧 getVertexSize() 的错误值）
+    std::unordered_map<int, UINT> vertexStrides;
+    // P72：mesh 管线（AS/MS）标记。mesh PSO 没有 IA 阶段，setPipeline 不再设置
+    // IASetPrimitiveTopology（IA 状态对 mesh 管线无效，且 PSO 里本就不含输入布局）。
+    bool isMesh = false;
+};
+
 
 // P64：帧级瞬态 RTV/DSV 缓存键。(资源指针, mip) 唯一决定视图内容（见 makeRtvDesc）。
 struct RtvDsvKey {
@@ -231,8 +304,10 @@ struct RtvDsvKey {
 };
 struct RtvDsvKeyHash {
     size_t operator()(const RtvDsvKey& k) const {
+        // 黄金比例常数按 size_t 取：x64 下与 0x9E3779B97F4A7C15ULL 等价，x86 下让乘法
+        // 直接落在 32 位域内，避免 C4244（size_t 只有 32 位时 64 位常量会被截断）。
         return std::hash<void*>()(reinterpret_cast<void*>(k.resource))
-               ^ (std::hash<UINT>()(k.mip) * 0x9E3779B97F4A7C15ULL);
+               ^ (std::hash<UINT>()(k.mip) * static_cast<size_t>(0x9E3779B97F4A7C15ULL));
     }
 };
 
@@ -360,7 +435,21 @@ void waitForRenderThreadSubmit();
 // GetCurrentBackBufferIndex 之前必须调用它——Present 未完成时 index 不会轮转，
 // 提前 acquire 会拿到同一个 back buffer（两帧写同一处 → 闪帧/撕裂）。
 // 正常情况（主线程录制耗时 ≫ 渲染线程 Present 耗时）返回 0ms。
-void waitForPendingPresents();
+//
+// 返回 true = 已同步（此时 acquire 是安全的，index 在本次 acquire 期间不会轮转）；
+// false = 超过 timeoutMs 仍未同步。**超时绝不能放行**：Present 一旦在 acquire 之后
+// 完成，back buffer index 就轮转，本帧的 blit 会写到已经翻转走的 buffer 上，D3D12
+// 直接以 DXGI_ERROR_ACCESS_DENIED 移除设备。实测（GLFW_NO_API 冷启动第一帧）：
+// 渲染线程还在 initBlitPipeline，主线程 100ms 超时放行 → D3D12 ERROR #907
+// "A command list, which writes to a swapchain back buffer, may only be executed when
+// that back buffer is the current back buffer" → RemoveDevice → 0x887A0005 崩溃。
+bool waitForPendingPresents(unsigned timeoutMs = 100);
+
+// 诊断：把 ID3D12Device::GetDeviceRemovedReason() 与 InfoQueue 最近若干条消息打进日志。
+// 设备移除（Present 返回 0x887A0005 等）时调用——没有这一行的话，未开调试层时日志里
+// 只剩 "presentSurface: FAILED DXGI_ERROR_DEVICE_REMOVED"，看不到真正原因
+// （实测漏掉的是上面那条 ERROR #907 / DXGI_ERROR_ACCESS_DENIED）。
+void logDeviceStatus(const char* tag);
 // 非阻塞：请求渲染线程开始下一帧。返回 true 表示成功排队，false 表示正在处理上一帧。
 bool asyncRenderBeginFrame(CommandContext* ctx, std::string& err);
 // 阻塞：等到本帧提交完成（或超时 ms）。
@@ -504,15 +593,6 @@ DXGI_FORMAT toDxgiVertexFormat(int gpuFormat);
 // ---------------------------------------------------------------------------
 // 图形管线（P4）：D3DCompile(vs_5_1/ps_5_1) + root signature + 双 PSO
 // ---------------------------------------------------------------------------
-struct Dx12Pipeline {
-    ComPtr<ID3D12RootSignature> rootSignature;
-    ComPtr<ID3D12PipelineState> withDepth;  // 总是创建；DSV=D32_FLOAT（镜像官方 depthAttachmentFormat=126）
-    ComPtr<ID3D12PipelineState> withoutDepth;  // 仅 depthState==null 时创建；DSV=UNKNOWN
-    int topology = 4;  // MC PrimitiveTopology ordinal（setPipeline 时 IASetPrimitiveTopology 用）
-    // P6：per-slot 修正 stride（由 inputElements 实际格式推算，覆盖 Java 侧 getVertexSize() 的错误值）
-    std::unordered_map<int, UINT> vertexStrides;
-};
-
 // Java 侧 dx12CreateGraphicsPipeline 的 desc 解析产物（字段语义见 Dx12Native Javadoc）。
 struct PipelineDesc {
     struct ColorTarget {
@@ -628,6 +708,14 @@ constexpr UINT kSurfaceBufferCount = 3;  // 镜像官方 minImageCount max(3, mi
 struct Dx12Surface {
     ComPtr<IDXGISwapChain3> swapChain;
     uintptr_t hwnd = 0;  // 重建 swapchain 时需要；ResizeBuffers 失败时销毁重建用
+    // RTSS/OSD 修复：GLFW 主窗口一旦用 GL 呈现过画面，DXGI 就永久拒绝对该 HWND
+    // 创建 flip-model swapchain（CreateSwapChainForHwnd → E_ACCESSDENIED
+    // 0x80070005，实测见 _port\scprobe2.cpp）。因此呈现改用本 surface 自建的子
+    // 窗口（无 GL、类样式不含 CS_OWNDC），它同时让 OSD 注入器（RTSS/Afterburner）
+    // 能从 GetDesc1().OutputWindow 拿到窗口句柄——composition swapchain 的
+    // OutputWindow 为空，RTSS 因此无法定位覆盖层。为 nullptr 时走旧行为（直接
+    // 用 hwnd，或 composition 回退）。
+    HWND presentWindow = nullptr;
     UINT width = 1;
     UINT height = 1;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -639,9 +727,14 @@ struct Dx12Surface {
     // 尚未写入的 buffer（全 0 假黑屏）。blit 成功时记录此处。
     int lastBlitIndex = -1;
     bool suboptimal = false;
+    // 临时 OSD / resize 诊断字段（debugReadbackIn、debugDumpAfterMs、debugDumpDone、
+    // debugDumpCreateTick）已于 P70 清理（known_bugs.md §5）。需要回读画面时用 ABI 的
+    // mcdr_dx12ReadbackSurfacePixels 手动触发，不要再往每帧路径里塞诊断代码。
     // P65：实际创建的 swapchain 是否带 DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING（tier1 成功）。
     // 仅当为 true 时才能在 Present 时传 DXGI_PRESENT_ALLOW_TEARING，否则 Present
     // 返回 DXGI_ERROR_INVALID_CALL。窗口/全屏切换可能重建 swapchain，故每次创建后更新。
+    // P70：ResizeBuffers 的 flags 也必须与之保持一致——曾无条件传 ALLOW_TEARING，
+    // 当成功 tier 不带 tearing 时每次 resize 都返回 INVALID_CALL。
     bool allowTearing = false;
     // P33 fallback：CreateSwapChainForHwnd 被拒（E_ACCESSDENIED 0x80070005，见
     // Issue #11）时改用 CreateSwapChainForComposition + DirectComposition 呈现。
@@ -737,5 +830,5 @@ std::string enumerateAdaptersJson();
 // 驱动版本 / 驱动描述 / 硬件·集显·可拆卸分类来自运行期动态加载的 DXCore，
 // DXCore 不可用时这些字段回落为 ""/false，其余字段全部来自 DXGI。
 std::string adapterInfoJson();
-
 }  // namespace d3d12_mc
+
