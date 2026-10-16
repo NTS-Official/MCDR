@@ -4,6 +4,8 @@ module;
 
 module mcdr.d3d12.async_fence;
 
+import mcdr.error;
+
 namespace d3d12_mc {
 
 namespace {
@@ -13,28 +15,36 @@ UINT64 nowMsSteady() {
     return static_cast<UINT64>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
 }
 
+// HRESULT -> "0x%08X"（模块单元不得 import 设备模块，实现单元各自持有一份）。
+std::string hrText(HRESULT hr) {
+    char buf[16]{};
+    std::snprintf(buf, sizeof(buf), "0x%08X", static_cast<unsigned>(hr));
+    return std::string(buf);
+}
+
 }  // namespace
 
 AsyncFenceManager::~AsyncFenceManager() { shutdown(); }
 
-bool AsyncFenceManager::init(ID3D12Device* device, ID3D12CommandQueue* queue) {
-    if (!device || !queue) return false;
-    if (m_running.load()) return true;  // 已初始化
+mcdr::Result<void> AsyncFenceManager::init(ID3D12Device* device, ID3D12CommandQueue* queue) {
+    if (!device || !queue) return mcdr::err("AsyncFenceManager::init", "device/queue is null");
+    if (m_running.load()) return {};  // 已初始化
 
     m_queue = queue;
-    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
-        return false;
+    const HRESULT hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence));
+    if (FAILED(hr)) {
+        return mcdr::err("AsyncFenceManager::init", "CreateFence failed: " + hrText(hr));
     }
     // manual-reset：登记新回调时唤醒监控线程。
     m_wakeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!m_wakeEvent) {
         m_fence.Reset();
         m_queue.Reset();
-        return false;
+        return mcdr::err("AsyncFenceManager::init", "CreateEventW failed");
     }
     m_running.store(true);
     m_monitorThread = std::thread(&AsyncFenceManager::monitorThread, this);
-    return true;
+    return {};
 }
 
 bool AsyncFenceManager::signal(UINT64 fenceValue) {

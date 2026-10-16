@@ -1,14 +1,17 @@
-
-
 // abi_common.cpp — the single implementation of the error channel, string
-// marshalling and logging shared by all six adapter translation units.
+// marshalling and logging shared by all nine adapter implementation units of
+// module mcdr.abi.common.
+//
+module;
+
 #include "_d3d12_module_prelude.h"
+
+module mcdr.abi.common;
 
 #include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
 import mcdr.d3d12.device;
 
-import mcdr.abi.common;
 namespace mcdr::abi {
 
 namespace {
@@ -53,8 +56,18 @@ int32_t failWith(const char* what, const std::string& err) {
 void failVoid(const char* what, const std::string& err) {
     setLastError(what, err);
     // Same stderr diagnostics the JNI adapters emitted, so an existing log
-    // capture still shows which entry point failed and why.
-    std::fprintf(stderr, "[mcdr] %s: %s\n", what ? what : "?", err.c_str());
+    // capture still shows which entry point failed and why. The line carries the
+    // shared native prefix (see formatLogPrefix), with `mcdr` as the logger name:
+    // the error channel stays separately greppable from the `dx12` diagnostics.
+    char line[2304];
+    const int n = d3d12_mc::formatLogPrefix(line, sizeof(line), "ERROR", "mcdr");
+    if (n > 0 && static_cast<size_t>(n) < sizeof(line)) {
+        std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n), "%s: %s", what ? what : "?",
+                      err.c_str());
+        std::fprintf(stderr, "%s\n", line);
+    } else {
+        std::fprintf(stderr, "[mcdr] %s: %s\n", what ? what : "?", err.c_str());
+    }
     std::fflush(stderr);
 }
 

@@ -14,6 +14,8 @@ module;
 
 export module mcdr.d3d12.async_fence;
 
+import mcdr.error;  // mcdr::Result<T> / mcdr::Error / mcdr::err()：失败上报改走 std::expected
+
 export namespace d3d12_mc {
 
 using Microsoft::WRL::ComPtr;
@@ -29,8 +31,8 @@ public:
     AsyncFenceManager(const AsyncFenceManager&) = delete;
     AsyncFenceManager& operator=(const AsyncFenceManager&) = delete;
 
-    // 创建内部 ID3D12Fence（初值 0）并启动监控线程。
-    bool init(ID3D12Device* device, ID3D12CommandQueue* queue);
+    // 创建内部 ID3D12Fence（初值 0）并启动监控线程。失败返回 mcdr::Error。
+    mcdr::Result<void> init(ID3D12Device* device, ID3D12CommandQueue* queue);
     bool valid() const { return m_fence != nullptr; }
 
     // queue->Signal(m_fence, fenceValue)。

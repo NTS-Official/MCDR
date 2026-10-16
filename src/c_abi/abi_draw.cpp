@@ -1,11 +1,13 @@
-
-
 // abi_draw.cpp — draw-command recording inside a render pass
 //
 // Group: draw calls (originally abi_bridge_p6.cpp).
 // 合并自：abi_bridge_p6.cpp
 //
+module;
+
 #include "_d3d12_module_prelude.h"
+
+module mcdr.abi.common;
 
 #include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
@@ -15,7 +17,8 @@ import mcdr.d3d12.async_bundle;
 import mcdr.d3d12.async_descriptor;
 import mcdr.d3d12.async_executor;
 import mcdr.d3d12.async_fence;
-import mcdr.abi.common;
+// mcdr.error 是叶子模块，不 import 就取不到 mcdr::Error（import 不传递）。
+import mcdr.error;
 
 using namespace d3d12_mc;
 
@@ -28,8 +31,6 @@ using namespace d3d12_mc;
 // ---------------------------------------------------------------------------
 // 来源单元：abi_bridge_p6.cpp
 // ---------------------------------------------------------------------------
-
-
 
 // abi_draw.cpp — draw-command recording inside a render pass.（合并自 abi_bridge_p6.cpp）
 //
@@ -54,18 +55,16 @@ thread_local std::vector<d3d12_mc::DrawBinding> gBindingScratch;
 extern "C" {
 
 int32_t MCDR_CALL mcdr_dx12SetPipeline(mcdr_command_ctx* ctx, mcdr_pipeline* pipeline, int32_t hasDepth) {
-    std::string err;
-    if (!d3d12_mc::setPipeline(ctx, pipeline, hasDepth != 0, err)) {
-        return mcdr::abi::failWith("mcdr_dx12SetPipeline", err);
+    if (const auto r = d3d12_mc::setPipeline(ctx, pipeline, hasDepth != 0); !r) {
+        return mcdr::abi::failWith("mcdr_dx12SetPipeline", r.error().message);
     }
     return 1;
 }
 
 int32_t MCDR_CALL mcdr_dx12SetScissor(mcdr_command_ctx* ctx, int32_t x, int32_t y, int32_t width,
                                       int32_t height) {
-    std::string err;
-    if (!d3d12_mc::setScissor(ctx, x, y, width, height, err)) {
-        return mcdr::abi::failWith("mcdr_dx12SetScissor", err);
+    if (const auto r = d3d12_mc::setScissor(ctx, x, y, width, height); !r) {
+        return mcdr::abi::failWith("mcdr_dx12SetScissor", r.error().message);
     }
     return 1;
 }
@@ -73,26 +72,23 @@ int32_t MCDR_CALL mcdr_dx12SetScissor(mcdr_command_ctx* ctx, int32_t x, int32_t 
 // MC 26.2: RenderPassBackend gained setViewport(int,int,int,int).
 int32_t MCDR_CALL mcdr_dx12SetViewport(mcdr_command_ctx* ctx, int32_t x, int32_t y, int32_t width,
                                        int32_t height) {
-    std::string err;
-    if (!d3d12_mc::setViewport(ctx, x, y, width, height, err)) {
-        return mcdr::abi::failWith("mcdr_dx12SetViewport", err);
+    if (const auto r = d3d12_mc::setViewport(ctx, x, y, width, height); !r) {
+        return mcdr::abi::failWith("mcdr_dx12SetViewport", r.error().message);
     }
     return 1;
 }
 
 int32_t MCDR_CALL mcdr_dx12SetVertexBuffer(mcdr_command_ctx* ctx, int32_t slot, mcdr_object* buffer,
                                            int64_t offset, int32_t stride) {
-    std::string err;
-    if (!d3d12_mc::setVertexBuffer(ctx, slot, buffer, offset, stride, err)) {
-        return mcdr::abi::failWith("mcdr_dx12SetVertexBuffer", err);
+    if (const auto r = d3d12_mc::setVertexBuffer(ctx, slot, buffer, offset, stride); !r) {
+        return mcdr::abi::failWith("mcdr_dx12SetVertexBuffer", r.error().message);
     }
     return 1;
 }
 
 int32_t MCDR_CALL mcdr_dx12SetIndexBuffer(mcdr_command_ctx* ctx, mcdr_object* buffer, int32_t indexType) {
-    std::string err;
-    if (!d3d12_mc::setIndexBuffer(ctx, buffer, indexType, err)) {
-        return mcdr::abi::failWith("mcdr_dx12SetIndexBuffer", err);
+    if (const auto r = d3d12_mc::setIndexBuffer(ctx, buffer, indexType); !r) {
+        return mcdr::abi::failWith("mcdr_dx12SetIndexBuffer", r.error().message);
     }
     return 1;
 }
@@ -120,52 +116,51 @@ int32_t MCDR_CALL mcdr_dx12PushDescriptors(mcdr_command_ctx* ctx, const mcdr_bin
         dst.view = src.view;
     }
 
-    std::string err;
-    if (!d3d12_mc::pushDescriptors(ctx, gBindingScratch, err)) {
+    if (const auto r = d3d12_mc::pushDescriptors(ctx, gBindingScratch); !r) {
         // Issue #10 in the source project: the Java call site could only report
         // "dx12PushDescriptors failed" because the real reason (descriptor heap
         // exhausted / stale view / illegal CBV) never left native code. The
         // message now crosses the boundary and Java raises it.
-        return mcdr::abi::failWith("mcdr_dx12PushDescriptors", err);
+        return mcdr::abi::failWith("mcdr_dx12PushDescriptors", r.error().message);
     }
     return 1;
 }
 
 int32_t MCDR_CALL mcdr_dx12DrawIndexed(mcdr_command_ctx* ctx, int32_t indexCount, int32_t instanceCount,
                                        int32_t firstIndex, int32_t baseVertex, int32_t firstInstance) {
-    std::string err;
-    if (!d3d12_mc::drawIndexedInstanced(ctx, static_cast<UINT>(indexCount), static_cast<UINT>(instanceCount),
-                                        static_cast<INT>(firstIndex), static_cast<INT>(baseVertex),
-                                        static_cast<UINT>(firstInstance), err)) {
-        return mcdr::abi::failWith("mcdr_dx12DrawIndexed", err);
+    if (const auto r = d3d12_mc::drawIndexedInstanced(ctx, static_cast<UINT>(indexCount),
+                                                      static_cast<UINT>(instanceCount),
+                                                      static_cast<INT>(firstIndex), static_cast<INT>(baseVertex),
+                                                      static_cast<UINT>(firstInstance));
+        !r) {
+        return mcdr::abi::failWith("mcdr_dx12DrawIndexed", r.error().message);
     }
     return 1;
 }
 
 int32_t MCDR_CALL mcdr_dx12Draw(mcdr_command_ctx* ctx, int32_t vertexCount, int32_t instanceCount,
                                 int32_t firstVertex, int32_t firstInstance) {
-    std::string err;
-    if (!d3d12_mc::drawInstanced(ctx, static_cast<UINT>(vertexCount), static_cast<UINT>(instanceCount),
-                                 static_cast<UINT>(firstVertex), static_cast<UINT>(firstInstance), err)) {
-        return mcdr::abi::failWith("mcdr_dx12Draw", err);
+    if (const auto r = d3d12_mc::drawInstanced(ctx, static_cast<UINT>(vertexCount),
+                                               static_cast<UINT>(instanceCount), static_cast<UINT>(firstVertex),
+                                               static_cast<UINT>(firstInstance));
+        !r) {
+        return mcdr::abi::failWith("mcdr_dx12Draw", r.error().message);
     }
     return 1;
 }
 
 int32_t MCDR_CALL mcdr_dx12DrawIndexedIndirect(mcdr_command_ctx* ctx, mcdr_object* commands, int64_t offset,
                                                int32_t drawCount) {
-    std::string err;
-    if (!d3d12_mc::drawIndexedIndirect(ctx, commands, offset, static_cast<UINT>(drawCount), err)) {
-        return mcdr::abi::failWith("mcdr_dx12DrawIndexedIndirect", err);
+    if (const auto r = d3d12_mc::drawIndexedIndirect(ctx, commands, offset, static_cast<UINT>(drawCount)); !r) {
+        return mcdr::abi::failWith("mcdr_dx12DrawIndexedIndirect", r.error().message);
     }
     return 1;
 }
 
 int32_t MCDR_CALL mcdr_dx12DrawIndirect(mcdr_command_ctx* ctx, mcdr_object* commands, int64_t offset,
                                         int32_t drawCount) {
-    std::string err;
-    if (!d3d12_mc::drawIndirect(ctx, commands, offset, static_cast<UINT>(drawCount), err)) {
-        return mcdr::abi::failWith("mcdr_dx12DrawIndirect", err);
+    if (const auto r = d3d12_mc::drawIndirect(ctx, commands, offset, static_cast<UINT>(drawCount)); !r) {
+        return mcdr::abi::failWith("mcdr_dx12DrawIndirect", r.error().message);
     }
     return 1;
 }

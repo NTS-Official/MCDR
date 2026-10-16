@@ -24,6 +24,7 @@ export module mcdr.d3d12.mesh;
 // 消费方不需要经本模块看到 Dx12Pipeline / CommandContext，也就不需要 re-export。
 // （曾经用 export import 试过绕开 LNK2001，实测无效——真正的修法见下。）
 import mcdr.d3d12.device;   // PipelineDesc / Dx12Pipeline / CommandContext / deviceContext（仅本单元内部使用）
+import mcdr.error;          // Result<T> / Error / err()：失败上报改走 std::expected，不再用 std::string& err
 
 export namespace d3d12_mc {
 
@@ -49,7 +50,7 @@ struct MeshPipelineDesc {
     std::vector<PipelineDesc::Binding> bindings;
 };
 
-// 创建 mesh 管线（失败返回 nullptr 并把原因写入 err）。root signature 用 1.1 版本且
+// 创建 mesh 管线（失败返回 mcdr::Error，成功返回句柄）。root signature 用 1.1 版本且
 // 不带 ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT（mesh 管线没有 IA 阶段）。
 //
 // 返回/入参刻意用不透明指针（void*）而不是 Dx12Pipeline*/CommandContext*：
@@ -58,8 +59,10 @@ struct MeshPipelineDesc {
 // （Dx12Pipeline@$$_Amcdr.dx12.device）—— 两侧修饰名不可能一致，LNK2001。
 // 句柄在 Java 侧本来就只是 long，消费方全程只搬运不解引用，因此换上不透明指针
 // 后 ABI 语义不变，且彻底摆脱跨模块类型修饰差异。
+// 句柄本身即 void*，失败改由 mcdr::Result 承载（mcdr.error 是叶子模块：只依赖标准库，
+// 谁都能 import，不会形成 import 环）。
 
-void* createMeshPipeline(const MeshPipelineDesc& desc, std::string& err);
+mcdr::Result<void*> createMeshPipeline(const MeshPipelineDesc& desc);
 
 // 本机是否具备 mesh 管线的最小条件（12_2 + mesh shader tier ≥ 1 + DXC 能编 ms_6_x
 // + 能拿到 ID3D12Device2）。why 收到不满足的原因（可为 nullptr）。
@@ -67,11 +70,11 @@ bool meshPipelineSupported(std::string* why);
 
 // DispatchMesh：x/y/z = 线程组数量（ctx 为 mcdr_command_ctx 句柄）。要求当前已
 // setPipeline 一个 mesh 管线。
-bool dispatchMesh(void* ctx, int x, int y, int z, std::string& err);
+mcdr::Result<void> dispatchMesh(void* ctx, int x, int y, int z);
 
 }  // export namespace d3d12_mc —— 导出接口到此为止
 
-// 实现见 dx12_mesh_impl.cpp（模块实现单元）。导出函数的定义【不能】放在接口单元里：
+// 实现见 src\advanced\d3d12_mesh_base.cpp（【普通翻译单元】，不是模块实现单元）。导出函数的定义【不能】放在接口单元里：
 // 实测接口单元内的定义会把签名中的 device 类型记成模块私有名
 // （Dx12Pipeline@$$_Amcdr.dx12.device），而消费方按公共名 @1 引用 → LNK2001。
 // 放到实现单元后两侧修饰名一致（与 mcdr_device.cppm + dx12_device.cpp 同一套路数）。

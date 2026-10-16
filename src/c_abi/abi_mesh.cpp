@@ -1,11 +1,13 @@
-
-
 // abi_mesh.cpp — P72 mesh-shader pipeline and HLSL -> DXIL compilation
 //
 // Group: mesh shading (originally abi_bridge_p7.cpp).
 // 合并自：abi_bridge_p7.cpp
 //
+module;
+
 #include "_d3d12_module_prelude.h"
+
+module mcdr.abi.common;
 
 #include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
@@ -15,7 +17,6 @@ import mcdr.d3d12.async_bundle;
 import mcdr.d3d12.async_descriptor;
 import mcdr.d3d12.async_executor;
 import mcdr.d3d12.async_fence;
-import mcdr.abi.common;
 
 using namespace d3d12_mc;
 
@@ -28,8 +29,6 @@ using namespace d3d12_mc;
 // ---------------------------------------------------------------------------
 // 来源单元：abi_bridge_p7.cpp
 // ---------------------------------------------------------------------------
-
-
 
 // abi_mesh.cpp — P72: mesh-shader pipeline + HLSL -> DXIL compilation. (合并自 abi_bridge_p7.cpp)
 //
@@ -90,15 +89,17 @@ int32_t MCDR_CALL mcdr_dx12CompileShaderDxc(const char* source, int32_t sourceLe
     }
 
     std::vector<uint8_t> dxil;
-    std::string err;
     // An empty entry point means "main", matching the graphics path's hardcoded
     // entry and keeping the Java side from having to know the default.
     const std::string entryPoint =
         (entry != nullptr && entry[0] != '\0') ? std::string(entry) : std::string("main");
 
-    if (!d3d12_mc::compileHlslToDxil(std::string(source, static_cast<size_t>(sourceLen)), entryPoint, profile, dxil,
-                                     err)) {
-        return failWith(kCompile, err.empty() ? std::string("DXC produced no bytecode") : err);
+    if (const auto r = d3d12_mc::compileHlslToDxil(std::string(source, static_cast<size_t>(sourceLen)),
+                                                   entryPoint, profile, dxil);
+        !r) {
+        return failWith(kCompile,
+                        r.error().message.empty() ? std::string("DXC produced no bytecode")
+                                                  : r.error().message);
     }
 
     const auto size = static_cast<int32_t>(dxil.size());
@@ -196,12 +197,13 @@ PipelinePtr* MCDR_CALL mcdr_dx12CreateMeshPipeline(const mcdr_mesh_pipeline_desc
         d.bindings[static_cast<size_t>(i)].reg = desc->bindings[i].reg;
     }
 
-    std::string err;
-    void* pipeline = d3d12_mc::createMeshPipeline(d, err);
-    if (pipeline == nullptr) {
-        return failWithPtr<PipelinePtr>(kCreateMesh, err);
+    auto r = d3d12_mc::createMeshPipeline(d);
+    if (!r) {
+        // 全限定：ADL 不会把 mcdr::abi 拉进来（实参是 std::unexpected<mcdr::Error>，
+        // 关联命名空间只有 std 与 mcdr），所以这里不能靠 ADL 找 failResultPtr。
+        return mcdr::abi::failResultPtr<PipelinePtr>(kCreateMesh, r.error());
     }
-    return static_cast<PipelinePtr*>(pipeline);
+    return static_cast<PipelinePtr*>(*r);
 }
 
 int32_t MCDR_CALL mcdr_dx12DispatchMesh(mcdr_command_ctx* ctx, int32_t x, int32_t y, int32_t z) {
@@ -214,9 +216,8 @@ int32_t MCDR_CALL mcdr_dx12DispatchMesh(mcdr_command_ctx* ctx, int32_t x, int32_
         return failWith(kDispatch, "thread group counts must be positive");
     }
 
-    std::string err;
-    if (!d3d12_mc::dispatchMesh(ctx, x, y, z, err)) {
-        return failWith(kDispatch, err.empty() ? std::string("DispatchMesh failed") : err);
+    if (auto r = d3d12_mc::dispatchMesh(ctx, x, y, z); !r) {
+        return mcdr::abi::failResult(kDispatch, r.error());
     }
     return 1;
 }

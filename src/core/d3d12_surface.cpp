@@ -4,6 +4,8 @@ module;
 
 module mcdr.d3d12.device;
 
+import mcdr.error;
+
 // dx12-mc 原生 D3D12 层（C++）
 // P5 目标：DXGI swapchain（GpuSurfaceBackend 对应物）。
 // 设计参考：官方 com.mojang.blaze3d.vulkan.VulkanGpuSurface。
@@ -34,6 +36,8 @@ std::string hrText(HRESULT hr) {
     snprintf(buf, sizeof(buf), "HRESULT 0x%08lX", static_cast<unsigned long>(hr));
     return buf;
 }
+
+// P100：逐帧追踪开关定义在模块接口（mcdr_device.cppm 的 frameTraceEnabled，inline）。
 
 // 把当前线程消息队列抽干 ms 毫秒。CreateSwapChainForHwnd 返回 E_ACCESSDENIED
 // (0x80070005) 时多为瞬态：窗口刚由 GLFW 创建、DWM 尚未完成重定向，或被第三方
@@ -76,59 +80,52 @@ PFN_DCompositionCreateDevice resolveDCompCreateDevice() {
 // 解绑/绑定 composition visual 的内容。DirectComposition 会持有 swapchain 的
 // backbuffer 引用，因此在 ResizeBuffers / 释放 swapchain 前必须先
 // SetContent(nullptr) + Commit，否则 ResizeBuffers 返回 DXGI_ERROR_INVALID_CALL。
-bool setCompositionContent(IDCompositionVisual* visual, IDCompositionDevice* dev, IUnknown* content,
-                           std::string& err) {
+mcdr::Result<void> setCompositionContent(IDCompositionVisual* visual, IDCompositionDevice* dev,
+                                        IUnknown* content) {
     if (!visual || !dev) {
-        err = "composition visual/device null";
-        return false;
+        return mcdr::err("setCompositionContent", "composition visual/device null");
     }
     HRESULT hr = visual->SetContent(content);
     if (FAILED(hr)) {
-        err = "IDCompositionVisual::SetContent failed " + hrText(hr);
-        return false;
+        return mcdr::err("setCompositionContent", "IDCompositionVisual::SetContent failed " + hrText(hr));
     }
     hr = dev->Commit();
     if (FAILED(hr)) {
-        err = "IDCompositionDevice::Commit failed " + hrText(hr);
-        return false;
+        return mcdr::err("setCompositionContent", "IDCompositionDevice::Commit failed " + hrText(hr));
     }
-    return true;
+    return {};
 }
 
 // 为本 HWND 建立 DirectComposition 合成链（device/target/visual）。
-bool initComposition(HWND win, SwapChainBundle& b, std::string& err) {
+mcdr::Result<void> initComposition(HWND win, SwapChainBundle& b) {
     PFN_DCompositionCreateDevice createDevice = resolveDCompCreateDevice();
     if (!createDevice) {
-        err = "dcomp.dll / DCompositionCreateDevice unavailable";
-        return false;
+        return mcdr::err("initComposition", "dcomp.dll / DCompositionCreateDevice unavailable");
     }
     HRESULT hr = createDevice(nullptr, __uuidof(IDCompositionDevice),
                               reinterpret_cast<void**>(b.dcompDevice.GetAddressOf()));
     if (FAILED(hr)) {
-        err = "DCompositionCreateDevice failed " + hrText(hr);
-        return false;
+        return mcdr::err("initComposition", "DCompositionCreateDevice failed " + hrText(hr));
     }
     hr = b.dcompDevice->CreateTargetForHwnd(win, TRUE, b.dcompTarget.GetAddressOf());
     if (FAILED(hr)) {
-        err = "IDCompositionDevice::CreateTargetForHwnd failed " + hrText(hr);
-        return false;
+        return mcdr::err("initComposition",
+                         "IDCompositionDevice::CreateTargetForHwnd failed " + hrText(hr));
     }
     hr = b.dcompDevice->CreateVisual(b.dcompVisual.GetAddressOf());
     if (FAILED(hr)) {
-        err = "IDCompositionDevice::CreateVisual failed " + hrText(hr);
-        return false;
+        return mcdr::err("initComposition", "IDCompositionDevice::CreateVisual failed " + hrText(hr));
     }
     hr = b.dcompTarget->SetRoot(b.dcompVisual.Get());
     if (FAILED(hr)) {
-        err = "IDCompositionTarget::SetRoot failed " + hrText(hr);
-        return false;
+        return mcdr::err("initComposition", "IDCompositionTarget::SetRoot failed " + hrText(hr));
     }
-    return true;
+    return {};
 }
 
 // 创建 composition swapchain 并把内容绑定到 visual 上。
-bool createCompositionSwapChain(IDXGIFactory2* factory2, ID3D12CommandQueue* queue, UINT width, UINT height,
-                                SwapChainBundle& b, std::string& err) {
+mcdr::Result<void> createCompositionSwapChain(IDXGIFactory2* factory2, ID3D12CommandQueue* queue, UINT width,
+                                             UINT height, SwapChainBundle& b) {
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = width > 0 ? width : 1;
     sd.Height = height > 0 ? height : 1;
@@ -143,14 +140,14 @@ bool createCompositionSwapChain(IDXGIFactory2* factory2, ID3D12CommandQueue* que
     sd.Flags = 0;                                      // composition 不支持 ALLOW_TEARING
     HRESULT hr = factory2->CreateSwapChainForComposition(queue, &sd, nullptr, &b.swapChain);
     if (FAILED(hr)) {
-        err = "CreateSwapChainForComposition failed " + hrText(hr);
-        return false;
+        return mcdr::err("createCompositionSwapChain",
+                         "CreateSwapChainForComposition failed " + hrText(hr));
     }
-    if (!setCompositionContent(b.dcompVisual.Get(), b.dcompDevice.Get(), b.swapChain.Get(), err))
-        return false;
+    auto bind = setCompositionContent(b.dcompVisual.Get(), b.dcompDevice.Get(), b.swapChain.Get());
+    if (!bind) return bind;
     b.composition = true;
     b.allowTearing = false;
-    return true;
+    return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +167,53 @@ bool createCompositionSwapChain(IDXGIFactory2* factory2, ID3D12CommandQueue* que
 // 定位 OSD（用户报告的"overlay 无法正确渲染"）。
 // ---------------------------------------------------------------------------
 constexpr wchar_t kPresentWindowClass[] = L"MCDR_D3D12_PresentChild";
+
+// P96（启动/退出"白幕"）：把窗口客户区刷成黑色。
+// 背景：GLFW 主窗口自身从不接收任何内容 —— D3D12 的呈现全部发生在上面那个自建子窗口
+// （见前文说明），而子窗口的类背景刷是 nullptr 且 WM_ERASEBKGND 返回 1（故意不擦），
+// 于是两个"没有任何呈现"的窗口期里，DWM 显示的是**未绘制的白色表面**：
+//   - 启动：窗口创建/显示之后、第一帧 Present 之前（数字捕获实测 6 帧近白：ours1 idx
+//     408-413，白像素占客户区 94.7%）；
+//   - 退出：子窗口被销毁、而 GLFW 主窗口尚未销毁的瞬间（实测 ours1 idx 1880-1881，
+//     白像素占整个捕获矩形 99.9% = 用户报告的"退出游戏时出现一个画幅尺寸为启动时
+//     窗口尺寸的白幕"）。
+// 我们没有能力把 swapchain 的画面搬回 GDI 表面，所以这两个时刻用黑幕代替白幕：
+// 黑色是安全默认值（不刺眼、不误导为"画面还在"）。
+static void paintWindowBlack(HWND hwnd) {
+    if (hwnd == nullptr || !IsWindow(hwnd)) return;
+    HDC dc = GetDC(hwnd);
+    if (dc == nullptr) return;
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    FillRect(dc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    ReleaseDC(hwnd, dc);
+}
+
+// 销毁呈现子窗口前调用：子窗口消失后暴露出来的是父窗口（GLFW）从未绘制过的客户区
+// （白色）。先把父窗口刷黑，退出时看到的就是黑幕而不是白幕。
+static void paintParentBlackBeforeDestroy(HWND child) {
+    if (child == nullptr) return;
+    paintWindowBlack(GetParent(child));
+}
+
+// P96 诊断（临时）：把窗口/子窗口的几何、可见性与"类背景刷"打进日志。
+// 用途：定位"退出游戏时出现一个画幅尺寸为启动时窗口尺寸的白幕"的来源 ——
+// 白幕只可能是 (a) 父窗口从未绘制的客户区、(b) 类背景刷被系统擦出来的颜色、
+// (c) 窗口在被销毁前后被 resize 成别的尺寸导致捕获矩形整块落在客户区里。
+static void logWindowState(const char* tag, HWND hwnd) {
+    if (hwnd == nullptr) {
+        dbgLogInfo("P96 %s: hwnd=null", tag);
+        return;
+    }
+    RECT rc{};
+    GetWindowRect(hwnd, &rc);
+    wchar_t cls[128] = {};
+    GetClassNameW(hwnd, cls, 128);
+    auto brush = reinterpret_cast<void*>(GetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND));
+    dbgLogInfo("P96 %s: hwnd=%p cls=%ls rect=%ld,%ld %ldx%ld visible=%d iconic=%d classBrush=%p", tag,
+               reinterpret_cast<void*>(hwnd), cls, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+               static_cast<int>(IsWindowVisible(hwnd)), static_cast<int>(IsIconic(hwnd)), brush);
+}
 
 // 呈现子窗口的消息处理。三条都必须有，否则子窗口会破坏游戏输入/画面：
 //   - WM_NCHITTEST == HTTRANSPARENT：WS_EX_TRANSPARENT 只影响绘制顺序，不参与命中
@@ -217,6 +261,11 @@ HWND createPresentationWindow(HWND parent, UINT width, UINT height) {
                                  L"MCDR D3D12 present", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, w,
                                  h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!child) return nullptr;
+    // P96：子窗口在第一次 Present 之前是一块未绘制的白面（类背景刷为 nullptr、
+    // WM_ERASEBKGND 返回 1），父窗口客户区同样从未被绘制过 —— 先都刷黑，
+    // 让"启动到第一帧"这段窗口期显示黑幕而不是白幕。
+    paintWindowBlack(child);
+    paintWindowBlack(parent);
     SetWindowPos(child, HWND_TOP, 0, 0, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     return child;
 }
@@ -227,7 +276,7 @@ void resizePresentationWindow(HWND child, UINT width, UINT height) {
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
     RECT rc{};
     GetWindowRect(child, &rc);
-    dbgLog("resizePresentationWindow: child=%p -> %ux%u (visible=%d rect=%dx%d)",
+    dbgLogDebug("resizePresentationWindow: child=%p -> %ux%u (visible=%d rect=%dx%d)",
            reinterpret_cast<void*>(child), width, height, IsWindowVisible(child) ? 1 : 0,
            static_cast<int>(rc.right - rc.left), static_cast<int>(rc.bottom - rc.top));
 }
@@ -263,9 +312,9 @@ static void logSwapChainPresentHook(IDXGISwapChain* sc) {
            b[0], b[1], b[2], b[3]);
 }
 
-bool createSwapChainForWindow(IDXGIFactory4* factory, ID3D12CommandQueue* queue, HWND win,
-                              HWND presentWin, UINT width, UINT height, const SwapChainBundle* reuse,
-                              SwapChainBundle& out, std::string& err) {
+mcdr::Result<void> createSwapChainForWindow(IDXGIFactory4* factory, ID3D12CommandQueue* queue, HWND win,
+                                           HWND presentWin, UINT width, UINT height,
+                                           const SwapChainBundle* reuse, SwapChainBundle& out) {
     static constexpr struct {
         DXGI_SWAP_EFFECT effect;
         UINT flags;
@@ -303,7 +352,7 @@ bool createSwapChainForWindow(IDXGIFactory4* factory, ID3D12CommandQueue* queue,
         HRESULT lastHr = E_FAIL;
         for (int pass = 0; pass < kPasses && !out.swapChain; ++pass) {
             if (pass > 0) {
-                dbgLog("createSwapChainForWindow: all HWND tiers failed (last hr=0x%08X), "
+                dbgLogError("createSwapChainForWindow: all HWND tiers failed (last hr=0x%08X), "
                        "retry pass=%d (pump %dms)",
                        static_cast<unsigned>(lastHr), pass, pass * 60);
                 pumpWindowMessages(pass * 60);
@@ -315,62 +364,65 @@ bool createSwapChainForWindow(IDXGIFactory4* factory, ID3D12CommandQueue* queue,
                     factory->CreateSwapChainForHwnd(queue, chainWin, &sd, nullptr, nullptr, &out.swapChain);
                 if (SUCCEEDED(hr)) {
                     out.allowTearing = (tier.flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
-                    std::fprintf(stderr,
-                                 "[dx12] swapchain OK (tier=%s pass=%d hwnd=%s) — OSD/overlay-capable\n",
-                                 tier.label, pass,
-                                 presentWin != nullptr ? "present-child" : "game-window");
+                    dbgLogInfo("swapchain OK (tier=%s pass=%d hwnd=%s) — OSD/overlay-capable",
+                               tier.label, pass,
+                               presentWin != nullptr ? "present-child" : "game-window");
                     logSwapChainPresentHook(out.swapChain.Get());
                     break;
                 }
                 lastHr = hr;
-                std::fprintf(stderr, "[dx12] swapchain tier %s failed hr=%08X (pass=%d hwnd=%s)\n",
-                             tier.label, static_cast<unsigned>(hr), pass,
-                             presentWin != nullptr ? "present-child" : "game-window");
+                dbgLog("swapchain tier %s failed hr=%08X (pass=%d hwnd=%s)", tier.label,
+                       static_cast<unsigned>(hr), pass,
+                       presentWin != nullptr ? "present-child" : "game-window");
             }
         }
     } else {
-        dbgLog("createSwapChainForWindow: composition surface -> recreate composition directly");
+        dbgLogInfo("createSwapChainForWindow: composition surface -> recreate composition directly");
     }
 
-    if (out.swapChain) return true;
+    if (out.swapChain) return {};
 
     // DirectComposition 回退
     if (win == nullptr) {
-        err = "swapchain creation failed: HWND invalid, cannot use composition fallback";
-        return false;
+        return mcdr::err("createSwapChainForWindow",
+                         "swapchain creation failed: HWND invalid, cannot use composition fallback");
     }
     ComPtr<IDXGIFactory2> factory2;
     if (FAILED(factory->QueryInterface(IID_PPV_ARGS(&factory2)))) {
-        err = "swapchain creation failed (HWND tiers) and factory lacks IDXGIFactory2";
-        return false;
+        return mcdr::err("createSwapChainForWindow",
+                         "swapchain creation failed (HWND tiers) and factory lacks IDXGIFactory2");
     }
 
-    std::string cErr;
     if (reuse && reuse->composition) {
         out.dcompDevice = reuse->dcompDevice;
         out.dcompTarget = reuse->dcompTarget;
         out.dcompVisual = reuse->dcompVisual;
-        setCompositionContent(out.dcompVisual.Get(), out.dcompDevice.Get(), nullptr, cErr);
-    } else if (!initComposition(win, out, cErr)) {
-        err = "swapchain HWND tiers failed; composition fallback failed: " + cErr;
-        return false;
+        (void)setCompositionContent(out.dcompVisual.Get(), out.dcompDevice.Get(), nullptr);
+    } else {
+        auto comp = initComposition(win, out);
+        if (!comp) {
+            return mcdr::err("createSwapChainForWindow",
+                             "swapchain HWND tiers failed; composition fallback failed: " +
+                                 comp.error().message);
+        }
     }
-    if (!createCompositionSwapChain(factory2.Get(), queue, width, height, out, cErr)) {
-        err = "swapchain HWND tiers failed; composition fallback failed: " + cErr;
-        return false;
+    auto created = createCompositionSwapChain(factory2.Get(), queue, width, height, out);
+    if (!created) {
+        return mcdr::err("createSwapChainForWindow",
+                         "swapchain HWND tiers failed; composition fallback failed: " +
+                             created.error().message);
     }
-    std::fprintf(stderr, "[dx12] composition swapchain OK (%ux%u)\n", width, height);
-    return true;
+    dbgLogInfo("composition swapchain OK (%ux%u)", width, height);
+    return {};
 }
 
 // 取 surface 的 back buffer index 对应的 RTV（blit 后可用；P5 自检不用）。
 }  // namespace
 
-Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
+mcdr::Result<void*> createSurface(uintptr_t hwnd) {
     DeviceContext& ctx = deviceContext();
     if (!ctx.device || !ctx.queue) {
-        err = "device not initialized (call dx12CreateDevice first)";
-        return nullptr;
+        return mcdr::err("createSurface", "device not initialized (call dx12CreateDevice first)");
     }
 
     // P33 诊断：清空调试层消息（防止自测期间累积的旧消息干扰本次判断）
@@ -388,10 +440,20 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
                         case D3D12_MESSAGE_SEVERITY_CORRUPTION: sev = "CORRUPTION"; break;
                         case D3D12_MESSAGE_SEVERITY_ERROR: sev = "ERROR"; break;
                         case D3D12_MESSAGE_SEVERITY_WARNING: sev = "WARNING"; break;
+                        case D3D12_MESSAGE_SEVERITY_INFO: sev = "INFO"; break;
                         default: break;
                     }
-                    std::fprintf(stderr, "[dx12] PreSwapInfoQueue[%s] %s\n", sev,
-                                 msg->pDescription ? msg->pDescription : "");
+                    const int sevInt = static_cast<int>(msg->Severity);
+                    if (sevInt <= static_cast<int>(D3D12_MESSAGE_SEVERITY_ERROR)) {
+                        dbgLogError("PreSwapInfoQueue[%s] %s", sev,
+                                    msg->pDescription ? msg->pDescription : "");
+                    } else if (sevInt == static_cast<int>(D3D12_MESSAGE_SEVERITY_WARNING)) {
+                        dbgLogWarn("PreSwapInfoQueue[%s] %s", sev,
+                                   msg->pDescription ? msg->pDescription : "");
+                    } else {
+                        dbgLogInfo("PreSwapInfoQueue[%s] %s", sev,
+                                   msg->pDescription ? msg->pDescription : "");
+                    }
                 }
             }
             ctx.infoQueue->ClearStoredMessages();
@@ -399,12 +461,11 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     }
     DXGI_ADAPTER_DESC devDesc{};
     if (!ctx.adapter) {
-        err = "createSurface: ctx.adapter is null";
-        return nullptr;
+        return mcdr::err("createSurface", "createSurface: ctx.adapter is null");
     }
     ctx.adapter->GetDesc(&devDesc);
-    std::fprintf(stderr, "[dx12] createSurface: devLuid=%08X%08X desc=%S\n", devDesc.AdapterLuid.LowPart,
-                 devDesc.AdapterLuid.HighPart, devDesc.Description);
+    dbgLogDebug("createSurface: devLuid=%08X%08X desc=%S", devDesc.AdapterLuid.LowPart,
+                devDesc.AdapterLuid.HighPart, devDesc.Description);
     std::fflush(stderr);
     // #region debug-point A:hwnd-validation
     HWND win = nullptr;
@@ -418,17 +479,17 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
         wchar_t className[256]{};
         GetClassNameW(win, className, 255);
         classStyle = GetClassLongPtrW(win, GCL_STYLE);
-        std::fprintf(stderr,
-                     "[dx12] createSurface: isWindow=%d wndTid=%lu wndPid=%lu curTid=%lu curPid=%lu "
-                     "clientRect=%ld,%ld-%ld,%ld hasRect=%d classStyle=0x%llx CS_OWNDC=%d CS_CLASSDC=%d "
-                     "CS_PARENTDC=%d class=%S\n",
-                     IsWindow(win) ? 1 : 0, static_cast<unsigned long>(wndTid),
-                     static_cast<unsigned long>(wndPid), static_cast<unsigned long>(GetCurrentThreadId()),
-                     static_cast<unsigned long>(GetCurrentProcessId()), static_cast<long>(rc.left),
-                     static_cast<long>(rc.top), static_cast<long>(rc.right), static_cast<long>(rc.bottom),
-                     hasRect ? 1 : 0, static_cast<unsigned long long>(classStyle),
-                     (classStyle & CS_OWNDC) ? 1 : 0, (classStyle & CS_CLASSDC) ? 1 : 0,
-                     (classStyle & CS_PARENTDC) ? 1 : 0, className);
+        dbgLogDebug(
+            "createSurface: isWindow=%d wndTid=%lu wndPid=%lu curTid=%lu curPid=%lu "
+            "clientRect=%ld,%ld-%ld,%ld hasRect=%d classStyle=0x%llx CS_OWNDC=%d CS_CLASSDC=%d "
+            "CS_PARENTDC=%d class=%S",
+            IsWindow(win) ? 1 : 0, static_cast<unsigned long>(wndTid),
+            static_cast<unsigned long>(wndPid), static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long>(GetCurrentProcessId()), static_cast<long>(rc.left),
+            static_cast<long>(rc.top), static_cast<long>(rc.right), static_cast<long>(rc.bottom),
+            hasRect ? 1 : 0, static_cast<unsigned long long>(classStyle),
+            (classStyle & CS_OWNDC) ? 1 : 0, (classStyle & CS_CLASSDC) ? 1 : 0,
+            (classStyle & CS_PARENTDC) ? 1 : 0, className);
     }
     // #endregion
 
@@ -436,23 +497,21 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     // (0x80070005，见 Issue #11)。GLFW 窗口类固定带 CS_OWNDC，此处仅作信息记录；
     // 真正的兜底是 createSwapChainForWindow() 内的多 tier 重试 + Composition 回退。
     if (win != nullptr && (classStyle & CS_OWNDC) != 0) {
-        std::fprintf(stderr, "[dx12] createSurface: window class has CS_OWNDC (GLFW); "
-                             "composition fallback available if HWND tiers are denied\n");
+        dbgLogInfo("createSurface: window class has CS_OWNDC (GLFW); "
+                   "composition fallback available if HWND tiers are denied");
     }
 
     ComPtr<IDXGIFactory4> factory;
     // 诊断：上一次运行在「CS_OWNDC 提示」之后、configureSurface 打印之前静默中断且无任何
     // 错误输出（见 debug.log）。此处按步骤打点并 fflush，以便把中断位置精确定位到
     // 具体调用（CreateDXGIFactory1 / EnumAdapters / ctx.adapter 赋值）。
-    std::fprintf(stderr, "[dx12] createSurface: step=CreateDXGIFactory1 begin\n");
+    dbgLogDebug("createSurface: step=CreateDXGIFactory1 begin");
     std::fflush(stderr);
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
-    std::fprintf(stderr, "[dx12] createSurface: step=CreateDXGIFactory1 done hr=%08X\n",
-                 static_cast<unsigned>(hr));
+    dbgLogDebug("createSurface: step=CreateDXGIFactory1 done hr=%08X", static_cast<unsigned>(hr));
     std::fflush(stderr);
     if (FAILED(hr)) {
-        err = "CreateDXGIFactory1 failed " + hrText(hr);
-        return nullptr;
+        return mcdr::err("createSurface", "CreateDXGIFactory1 failed " + hrText(hr));
     }
     // 确保 factory 能访问 device 所在的 adapter（防止多 GPU 系统上 factory/adapter 不匹配）
     {
@@ -468,17 +527,17 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
             }
         }
     }
-    std::fprintf(stderr, "[dx12] createSurface: step=adapter-scan done adapter=%p\n",
-                 reinterpret_cast<void*>(ctx.adapter.Get()));
+    dbgLogDebug("createSurface: step=adapter-scan done adapter=%p",
+                reinterpret_cast<void*>(ctx.adapter.Get()));
     std::fflush(stderr);
 
     // P3.1 诊断：打印 SwapChain 格式，确认不是深度/单通道格式
-    dbgLog("configureSurface: swapchain format=DXGI_FORMAT_R8G8B8A8_UNORM (scFmt=%d)",
+    dbgLogInfo("configureSurface: swapchain format=DXGI_FORMAT_R8G8B8A8_UNORM (scFmt=%d)",
            static_cast<int>(DXGI_FORMAT_R8G8B8A8_UNORM));
 
     // P33：诊断——打印 HWND 值，帮助排查 E_ACCESSDENIED 问题。
-    std::fprintf(stderr, "[dx12] dx12CreateSurface: hwnd=0x%llx queue=0x%p\n",
-                 static_cast<unsigned long long>(hwnd), reinterpret_cast<void*>(ctx.queue.Get()));
+    dbgLogDebug("dx12CreateSurface: hwnd=0x%llx queue=0x%p", static_cast<unsigned long long>(hwnd),
+                reinterpret_cast<void*>(ctx.queue.Get()));
     std::fflush(stderr);
 
     // 初始尺寸：composition 回退路径需要真实客户区尺寸；HWND 路径仍用 1x1 占位
@@ -499,20 +558,20 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     // 它只用于 HWND swapchain；composition 回退时会把它销毁，避免黑窗口盖住合成画面。
     HWND presentChild = createPresentationWindow(win, initW, initH);
     if (presentChild != nullptr) {
-        std::fprintf(stderr, "[dx12] createSurface: presentation child hwnd=%p (%ux%u)\n",
-                     reinterpret_cast<void*>(presentChild), initW, initH);
+        dbgLogDebug("createSurface: presentation child hwnd=%p (%ux%u)",
+                    reinterpret_cast<void*>(presentChild), initW, initH);
     } else if (win != nullptr) {
-        std::fprintf(stderr,
-                     "[dx12] createSurface: presentation child window creation failed (err=%lu); "
-                     "falling back to the GL window HWND\n",
-                     static_cast<unsigned long>(GetLastError()));
+        dbgLog(
+            "createSurface: presentation child window creation failed (err=%lu); "
+            "falling back to the GL window HWND",
+            static_cast<unsigned long>(GetLastError()));
     }
     std::fflush(stderr);
 
     SwapChainBundle bundle;
-    std::string scErr;
-    if (!createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, presentChild, initW, initH, nullptr,
-                                  bundle, scErr)) {
+    auto swapChainRes = createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, presentChild, initW,
+                                                 initH, nullptr, bundle);
+    if (!swapChainRes) {
         // 打印调试层消息辅助诊断
         if (ctx.infoQueue) {
             UINT64 n = ctx.infoQueue->GetNumStoredMessages();
@@ -522,19 +581,28 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
                 std::vector<char> buf(len > 0 ? len : 1);
                 D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
                 if (SUCCEEDED(ctx.infoQueue->GetMessage(static_cast<UINT>(i), msg, &len))) {
-                    std::fprintf(stderr, "[dx12] InfoQueue[%u] %s\n", static_cast<unsigned>(i),
-                                 msg->pDescription ? msg->pDescription : "");
+                    const int sevInt = static_cast<int>(msg->Severity);
+                    if (sevInt <= static_cast<int>(D3D12_MESSAGE_SEVERITY_ERROR)) {
+                        dbgLogError("InfoQueue[%u] %s", static_cast<unsigned>(i),
+                                    msg->pDescription ? msg->pDescription : "");
+                    } else if (sevInt == static_cast<int>(D3D12_MESSAGE_SEVERITY_WARNING)) {
+                        dbgLogWarn("InfoQueue[%u] %s", static_cast<unsigned>(i),
+                                   msg->pDescription ? msg->pDescription : "");
+                    } else {
+                        dbgLogInfo("InfoQueue[%u] %s", static_cast<unsigned>(i),
+                                   msg->pDescription ? msg->pDescription : "");
+                    }
                 }
             }
             ctx.infoQueue->ClearStoredMessages();
         }
-        err = scErr;
-        return nullptr;
+        return mcdr::err("createSurface", swapChainRes.error().message);
     }
     if (bundle.composition && presentChild != nullptr) {
         // 走了 DirectComposition 回退：画面由 visual 合成到主窗口，呈现子窗口只会
         // 盖住它，直接销毁并回落到"无子窗口"的旧行为。
-        std::fprintf(stderr, "[dx12] createSurface: composition fallback -> destroying presentation child\n");
+        dbgLogInfo("createSurface: composition fallback -> destroying presentation child");
+        paintParentBlackBeforeDestroy(presentChild);
         DestroyWindow(presentChild);
         presentChild = nullptr;
     }
@@ -542,8 +610,7 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
 
     ComPtr<IDXGISwapChain3> swapChain3;
     if (FAILED(swapChain1.As(&swapChain3))) {
-        err = "swapchain does not support IDXGISwapChain3";
-        return nullptr;
+        return mcdr::err("createSurface", "swapchain does not support IDXGISwapChain3");
     }
 
     Dx12Surface* s = new Dx12Surface();
@@ -558,7 +625,7 @@ Dx12Surface* createSurface(uintptr_t hwnd, std::string& err) {
     s->allowTearing = bundle.allowTearing;
     // 注意：不在此处 setActiveSurface！surface 必须在 configureSurface 完成后
     // 才设为 active，否则渲染线程会在 backBuffers 为空时尝试 acquire 导致无限循环。
-    return s;
+    return static_cast<void*>(s);
 }
 
 std::vector<int> surfacePresentModes() {
@@ -566,11 +633,16 @@ std::vector<int> surfacePresentModes() {
     return {0, 2, 3};
 }
 
-bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, std::string& err) {
+mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int presentMode) {
     DeviceContext& ctx = deviceContext();
+    // P98 诊断（用户报告：加载屏幕弹出瞬间帧时间骤增、启动加载界面进度条冻结）：
+    // 把 configureSurface 各段耗时量出来，定位主线程停顿发生在哪一步。
+    const double p98t0 = nowMs();
+    double p98waitRenderMs = -1.0;
+    double p98waitPresentsMs = -1.0;
+    double p98idleMs = -1.0;
     if (!s || !s->swapChain) {
-        err = "surface not created";
-        return false;
+        return mcdr::err("configureSurface", "surface not created");
     }
     // 窗口最小化/边框切换瞬间 WM_SIZE 可能传 0 尺寸——ResizeBuffers 对 0 尺寸
     // 返回 DXGI_ERROR_INVALID_CALL (0x887A0001)，保持旧尺寸继续，不视为错误。
@@ -578,7 +650,7 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
     // 同源竞态），交由下方重试循环处理。
     if (width <= 0 || height <= 0) {
         s->presentMode = presentMode;
-        return true;
+        return {};
     }
     // 防御：glfwGetFramebufferSize 在某些时机（DWM 切换/显示器热插拔瞬间）会返回错误
     // 尺寸（如 854x1048 而非实际的 854x480）。若新高度相对旧高度偏差超过 2 倍且宽度
@@ -590,7 +662,7 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
     if (curW > 0 && curH > 0 && width == curW && height > curH * 2) {
         dbgLog("configureSurface: rejecting invalid height %d (current %d), keeping old", height, s->height);
         s->presentMode = presentMode;
-        return true;
+        return {};
     }
     s->presentMode = presentMode;
     // 呈现子窗口跟随客户区尺寸（它是 swapchain 的实际宿主窗口）。
@@ -599,8 +671,9 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
     // 新尺寸与当前 swapchain 一致时，无需 ResizeBuffers（避免已重建的 swapchain
     // 被错误尺寸锁死后再调 ResizeBuffers 仍报 INVALID_CALL）。
     if (static_cast<UINT>(width) == s->width && static_cast<UINT>(height) == s->height) {
-        dbgLog("configureSurface: size unchanged %dx%d, skip ResizeBuffers", width, height);
-        return true;
+        dbgLogInfo("configureSurface: size unchanged %dx%d, skip ResizeBuffers (P98 total=%.1f ms)", width, height,
+               nowMs() - p98t0);
+        return {};
     }
 
     // ResizeBuffers 前必须等 GPU 完全空闲：FLIP model 下 backbuffer 仍被
@@ -612,21 +685,39 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
     //
     // P70：除了等 GPU，还要先把呈现管线本身"静止"下来——异步渲染线程提交中的帧
     // 会与 ResizeBuffers 并发访问同一条 swapchain，这是 INVALID_CALL 的主要来源。
+    const double p98tWaitRender0 = nowMs();
     waitForRenderThreadSubmit();          // 等异步渲染线程完成当前帧提交
+    p98waitRenderMs = nowMs() - p98tWaitRender0;
     if (!waitForPendingPresents(2000)) {  // 等已提交但尚未 Present 完成的帧
         dbgLog("configureSurface: pending presents did not drain before ResizeBuffers (continuing)");
     }
-    if (!deviceWaitIdle(err)) {
-        err = "deviceWaitIdle before ResizeBuffers failed: " + err;
-        return false;
+    p98waitPresentsMs = nowMs() - p98tWaitRender0 - p98waitRenderMs;
+    const double p98tIdle0 = nowMs();
+    {
+        auto idleRes = deviceWaitIdle();
+        if (!idleRes) {
+            return mcdr::err("configureSurface", "deviceWaitIdle before ResizeBuffers failed: " +
+                                                     idleRes.error().message);
+        }
     }
+    p98idleMs = nowMs() - p98tIdle0;
     dbgLogDebug("configureSurface: idle ok, ResizeBuffers %dx%d mode=%d", width, height, presentMode);
     // 防御：vanilla 在 acquire 与 present 之间若被窗口事件触发 configure，
     // 会残留"已 acquire 未 present"的 backbuffer；ResizeBuffers 对其返回
     // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE -> MC surfaceIsInvalid=true -> 之后
     // 不再 acquire/blit/present -> 画面冻结（渲染仍继续）。先 Present 释放。
-    if (s->currentImageIndex >= 0) {
-        dbgLog("configureSurface: releasing acquired backbuffer idx=%d before ResizeBuffers",
+    //
+    // P95b（叠帧 + OSD 重叠）：判据必须是 bufferHeld，不能再用 currentImageIndex。
+    // currentImageIndex 由渲染线程在 presentSurface 末尾置 -1，而本函数跑在主线程：
+    // 异步呈现路径下这是一处数据竞争，主线程可能读到过期值（>=0），于是对一张**已经
+    // present 过**的 back buffer 再 Present 一次。两个后果正好是用户报告的现象：
+    //   1) flip 链被多推一帧 → 上一帧的画面再次上屏（"上一帧和这一帧叠在一起"）；
+    //   2) 挂在 Present 上的 OSD 注入器（RTSS/Afterburner）对同一张 buffer 再画一遍
+    //      OSD（错位双份）——因此"判据是 OSD 重叠"。
+    // bufferHeld 是原子量并与 acquire/present 严格配对，读到 true 才代表真的还持有
+    // 一张未 present 的 back buffer。
+    if (s->bufferHeld.exchange(false)) {
+        dbgLogDebug("configureSurface: releasing acquired backbuffer idx=%d before ResizeBuffers",
                s->currentImageIndex);
         s->swapChain->Present(0, 0);
         s->currentImageIndex = -1;
@@ -634,9 +725,10 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
     // composition 模式：DirectComposition 持有 backbuffer 引用，ResizeBuffers /
     // 释放 swapchain 前必须先解绑 visual 内容并 Commit，否则报 INVALID_CALL。
     if (s->compositionMode) {
-        std::string uErr;
-        if (!setCompositionContent(s->dcompVisual.Get(), s->dcompDevice.Get(), nullptr, uErr)) {
-            dbgLog("configureSurface: unbind composition content failed: %s", uErr.c_str());
+        auto unbind = setCompositionContent(s->dcompVisual.Get(), s->dcompDevice.Get(), nullptr);
+        if (!unbind) {
+            dbgLogError("configureSurface: unbind composition content failed: %s",
+                        unbind.error().message.c_str());
         }
     }
     // P71（真正的 INVALID_CALL 根因）：DXGI 明确规定 ResizeBuffers 之前必须释放所有对
@@ -663,6 +755,12 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
     HRESULT hr = S_OK;
     // deviceWaitIdle 完成后 DWM 合成器可能仍在异步持有 backbuffer 引用（flip model
     // + 窗口/全屏切换时常见竞态）。多次重试 + 递增等待，最多等 ~1s。
+    // P96 诊断：把"要 resize 到多少"与此刻窗口/子窗口的真实几何一起记录 —— 用于判断
+    // 退出时 2560x1334 的重配置是否同时改变了窗口尺寸（白幕是否只是"整块落在客户区里"）。
+    dbgLogInfo("P96 configureSurface: target=%ux%u presentWindow=%p", static_cast<unsigned>(width),
+               static_cast<unsigned>(height), reinterpret_cast<void*>(s->presentWindow));
+    logWindowState("configureSurface child", s->presentWindow);
+    logWindowState("configureSurface parent", s->presentWindow ? GetParent(s->presentWindow) : nullptr);
     for (int retry = 0; retry < 10; ++retry) {
         if (retry > 0) {
             int waitMs = (1 << retry);  // 2,4,8,16,32,64,128,256,512 ms
@@ -673,7 +771,7 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
                                          static_cast<UINT>(height), scFmt, scFlags);
         if (SUCCEEDED(hr)) {
             if (retry > 0) {
-                dbgLog("configureSurface: ResizeBuffers ok after %d retries", retry);
+                dbgLogInfo("configureSurface: ResizeBuffers ok after %d retries", retry);
             } else {
                 dbgLogDebug("configureSurface: ResizeBuffers ok (retry=0)");
             }
@@ -696,13 +794,14 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
         // ResizeBuffers 全部失败（flip model 限制）：参照 VulkanGpuSurface.configure()
         // 的做法——销毁旧 swapchain 后重建全新 swapchain（同样尺寸、同样 HWND）。
         // 必须先 Release 旧 swapchain，否则 CreateSwapChainForHwnd 返回 E_ACCESSDENIED。
-        dbgLog("configureSurface: ResizeBuffers FAILED after 10 retries, falling back to recreate");
-        // 先 Present 释放任何残留的 acquired backbuffer
-        if (s->currentImageIndex >= 0) {
+        dbgLogError("configureSurface: ResizeBuffers FAILED after 10 retries, falling back to recreate");
+        // 先 Present 释放任何残留的 acquired backbuffer（同样只用 bufferHeld 判定，
+        // 避免对已 present 的 buffer 再推一帧 —— 见上文 P95b 说明）。
+        if (s->bufferHeld.exchange(false)) {
             s->swapChain->Present(0, 0);
             s->currentImageIndex = -1;
         }
-        deviceWaitIdle(err);
+        (void)deviceWaitIdle();
         s->swapChain.Reset();
         s->backBuffers.clear();
         // P71：不清 rtvHandles —— 句柄在 rtvHeap 上是 bump 分配，保留复用即可；
@@ -716,8 +815,7 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
         ComPtr<IDXGIFactory4> factory;
         hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
         if (FAILED(hr)) {
-            err = "CreateDXGIFactory1 failed " + hrText(hr);
-            return false;
+            return mcdr::err("configureSurface", "CreateDXGIFactory1 failed " + hrText(hr));
         }
         // 已是 composition 模式时复用现有 composition 对象（对同一 HWND 重复
         // CreateTargetForHwnd 会返回 WINDOW_ALREADY_COMPOSED），直接重建 swapchain。
@@ -729,38 +827,39 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
             reuse.dcompVisual = s->dcompVisual;
         }
         SwapChainBundle bundle;
-        std::string rErr;
-        if (!createSwapChainForWindow(factory.Get(), ctx.queue.Get(), reinterpret_cast<HWND>(s->hwnd),
-                                      s->presentWindow, static_cast<UINT>(width), static_cast<UINT>(height),
-                                      s->compositionMode ? &reuse : nullptr, bundle, rErr)) {
-            err = rErr + " (recreate)";
-            return false;
+        auto recreated = createSwapChainForWindow(factory.Get(), ctx.queue.Get(),
+                                                  reinterpret_cast<HWND>(s->hwnd), s->presentWindow,
+                                                  static_cast<UINT>(width), static_cast<UINT>(height),
+                                                  s->compositionMode ? &reuse : nullptr, bundle);
+        if (!recreated) {
+            return mcdr::err("configureSurface", recreated.error().message + " (recreate)");
         }
         if (bundle.composition && s->presentWindow != nullptr) {
             // 重建时退化成 composition：呈现子窗口只会盖住合成画面，销毁它。
+            paintParentBlackBeforeDestroy(s->presentWindow);
             DestroyWindow(s->presentWindow);
             s->presentWindow = nullptr;
         }
         if (FAILED(bundle.swapChain.As(&s->swapChain))) {
-            err = "swapchain does not support IDXGISwapChain3";
-            return false;
+            return mcdr::err("configureSurface", "swapchain does not support IDXGISwapChain3");
         }
         s->compositionMode = bundle.composition;
         s->dcompDevice = bundle.dcompDevice;
         s->dcompTarget = bundle.dcompTarget;
         s->dcompVisual = bundle.dcompVisual;
         s->allowTearing = bundle.allowTearing;
-        dbgLog("configureSurface: recreated swapchain %dx%d (composition=%d)", width, height,
+        dbgLogInfo("configureSurface: recreated swapchain %dx%d (composition=%d)", width, height,
                static_cast<int>(s->compositionMode));
     }
 
     // composition 模式：把 visual 内容重新绑回（ResizeBuffers 后的同一 swapchain，
     // 或重建后的新 swapchain）。
     if (s->compositionMode) {
-        std::string bErr;
-        if (!setCompositionContent(s->dcompVisual.Get(), s->dcompDevice.Get(), s->swapChain.Get(), bErr)) {
-            err = "configureSurface: rebind composition content failed: " + bErr;
-            return false;
+        auto rebind = setCompositionContent(s->dcompVisual.Get(), s->dcompDevice.Get(), s->swapChain.Get());
+        if (!rebind) {
+            return mcdr::err("configureSurface",
+                             "configureSurface: rebind composition content failed: " +
+                                 rebind.error().message);
         }
     }
 
@@ -776,18 +875,15 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
     if (s->rtvHandles.size() != kSurfaceBufferCount) {
         s->rtvHandles.clear();
         for (UINT i = 0; i < kSurfaceBufferCount; ++i) {
-            D3D12_CPU_DESCRIPTOR_HANDLE h = allocRtvHandle(err);
-            if (h.ptr == 0) {
-                return false;
-            }
-            s->rtvHandles.push_back(h);
+            auto rtv = allocRtvHandle();
+            if (!rtv) return std::unexpected<mcdr::Error>(std::move(rtv.error()));
+            s->rtvHandles.push_back(rtv.value());
         }
     }
     for (UINT i = 0; i < kSurfaceBufferCount; ++i) {
         hr = s->swapChain->GetBuffer(i, IID_PPV_ARGS(&s->backBuffers[i]));
         if (FAILED(hr)) {
-            err = "GetBuffer failed " + hrText(hr);
-            return false;
+            return mcdr::err("configureSurface", "GetBuffer failed " + hrText(hr));
         }
         ctx.device->CreateRenderTargetView(s->backBuffers[i].Get(), nullptr, s->rtvHandles[i]);
     }
@@ -795,7 +891,7 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
     // （1x1 占位 bug 时期这里会打印 1x1，就是用户看到的「resize 后黑屏」。）
     if (!s->backBuffers.empty() && s->backBuffers[0]) {
         const D3D12_RESOURCE_DESC bd0 = s->backBuffers[0]->GetDesc();
-        dbgLog("configureSurface: swapchain buffer0 = %llux%u (requested %dx%d)",
+        dbgLogDebug("configureSurface: swapchain buffer0 = %llux%u (requested %dx%d)",
                static_cast<unsigned long long>(bd0.Width), static_cast<unsigned>(bd0.Height),
                static_cast<int>(width), static_cast<int>(height));
     }
@@ -803,13 +899,33 @@ bool configureSurface(Dx12Surface* s, int width, int height, int presentMode, st
     setActiveSurface(s);
     dbgLogInfo("configureSurface: registered active surface=%p bbCount=%u", reinterpret_cast<void*>(s),
                static_cast<UINT>(s->backBuffers.size()));
-    return true;
+    {
+        const double p98total = nowMs() - p98t0;
+        const double p98other = p98total - (p98waitRenderMs < 0.0 ? 0.0 : p98waitRenderMs) -
+                                (p98waitPresentsMs < 0.0 ? 0.0 : p98waitPresentsMs) -
+                                (p98idleMs < 0.0 ? 0.0 : p98idleMs);
+        dbgLogInfo("P98 configureSurface: %dx%d total=%.1f ms (waitRender=%.1f waitPresents=%.1f idle=%.1f resize+rest=%.1f)",
+               width, height, p98total, p98waitRenderMs, p98waitPresentsMs, p98idleMs, p98other);
+    }
+    return {};
 }
 
-bool acquireSurface(Dx12Surface* s, std::string& err) {
+mcdr::Result<void> acquireSurface(Dx12Surface* s) {
+    // P98 诊断：主线程帧间隔（>200 ms 视为停顿/掉帧），用于定位用户报告的
+    // 「加载屏幕弹出瞬间帧时间骤增」。acquire 每帧一次，是主线程帧节拍的天然探针。
+    {
+        static double sP98LastAcquireMs = 0.0;
+        const double p98now = nowMs();
+        if (sP98LastAcquireMs > 0.0) {
+            const double p98gap = p98now - sP98LastAcquireMs;
+            if (p98gap > 200.0) {
+                dbgLogInfo("P98 main-thread frame hitch: %.1f ms since previous acquire", p98gap);
+            }
+        }
+        sP98LastAcquireMs = p98now;
+    }
     if (!s || !s->swapChain) {
-        err = "surface not created";
-        return false;
+        return mcdr::err("acquireSurface", "surface not created");
     }
     // P48（多帧飞行）：Present 尚未完成时 GetCurrentBackBufferIndex 不会轮转，会返回
     // 上一帧已 Present 的同一个 back buffer（两帧写同一处 → 闪帧/撕裂）。真实 acquire
@@ -827,10 +943,10 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
     // 跳过 blit（画面停上一帧，不写 swapchain），下一帧 acquireNextTexture() 补报
     // SurfaceException 让 MC 走 surface 重建。
     if (!waitForPendingPresents(2000)) {
-        err = "acquireSurface: present sync timeout (render thread stalled) — frame skipped to "
-              "avoid writing a non-current back buffer";
         s->currentImageIndex = -1;
-        return false;
+        return mcdr::err("acquireSurface",
+                         "acquireSurface: present sync timeout (render thread stalled) — frame skipped to "
+                         "avoid writing a non-current back buffer");
     }
     // 以下两条为逐帧诊断（原为 dbgLog，每帧 2 次 stderr+文件 flush，实测 ~0.1-0.2ms/条，
     // 属帧关键路径纯开销）→ 降为 DEBUG，需 DX12_LOG_VERBOSE=1 才输出。
@@ -846,16 +962,16 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
         // 让渲染线程稍后重试；若 backBuffers 已就绪但 index 异常，尝试通过
         // GetBufferCount 交叉验证 swapchain 状态。
         if (bbCount == 0) {
-            err = "acquireSurface: backBuffers empty (surface not configured yet)";
-        } else {
-            // 交叉验证：从 swapchain desc 获取实际 buffer 数
-            DXGI_SWAP_CHAIN_DESC1 sd{};
-            HRESULT hr = s->swapChain->GetDesc1(&sd);
-            err = "GetCurrentBackBufferIndex returned invalid index=" + std::to_string(rawIdx)
-                  + " bbCount=" + std::to_string(bbCount) + " scGetDesc_hr=" + hrText(hr)
-                  + " BufferCount=" + std::to_string(sd.BufferCount);
+            return mcdr::err("acquireSurface",
+                             "acquireSurface: backBuffers empty (surface not configured yet)");
         }
-        return false;
+        // 交叉验证：从 swapchain desc 获取实际 buffer 数
+        DXGI_SWAP_CHAIN_DESC1 sd{};
+        HRESULT hr = s->swapChain->GetDesc1(&sd);
+        return mcdr::err("acquireSurface",
+                         "GetCurrentBackBufferIndex returned invalid index=" + std::to_string(rawIdx) +
+                             " bbCount=" + std::to_string(bbCount) + " scGetDesc_hr=" + hrText(hr) +
+                             " BufferCount=" + std::to_string(sd.BufferCount));
     }
     // P18：如果重用的是上一帧的 back buffer（上次 blit 可能还没完成），
     // 等待该 buffer 对应的 fence 完成，再允许 CPU 写入。
@@ -869,12 +985,12 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
         if (needed > 0 && ctx.queueFence) {
             UINT64 cv = ctx.queueFence->GetCompletedValue();
             if (cv < needed) {
-                dbgLog("acquireSurface: wait fence idx=%d needed=%llu cv=%llu", s->currentImageIndex,
+                dbgLogDebug("acquireSurface: wait fence idx=%d needed=%llu cv=%llu", s->currentImageIndex,
                        static_cast<unsigned long long>(needed), static_cast<unsigned long long>(cv));
-                std::string w;
-                if (!waitForQueueFenceValue(needed, 5000000000ULL, w)) {
-                    err = "acquireSurface: " + w;
-                    return false;
+                auto fenceRes = waitForQueueFenceValue(needed, 5000000000ULL);
+                if (!fenceRes) {
+                    return mcdr::err("acquireSurface",
+                                     "acquireSurface: " + fenceRes.error().message);
                 }
             }
         }
@@ -884,7 +1000,13 @@ bool acquireSurface(Dx12Surface* s, std::string& err) {
     // currentImageIndex 才能读到正确的 backBuffer，否则会读到上一帧 blit 的
     // 旧数据（表现为黑屏/错误内容）。
     s->lastBlitIndex = s->currentImageIndex;
-    return true;
+    // P95：新的一帧开始（已 acquire），但还没有 blit 过 —— presentSurface 靠这个标志
+    // 拒绝 present 一张本帧从未写入的 back buffer。
+    s->blittedThisFrame.store(false, std::memory_order_release);
+    // P95b：本 surface 现在真的持有"已 acquire 未 present"的 back buffer。
+    // 只有这个原子标志为 true 时才允许在 configureSurface 里用 Present(0,0) 释放它。
+    s->bufferHeld.store(true, std::memory_order_release);
+    return {};
 }
 
 // 返回当前 acquire 的 back buffer 原始 ID3D12Resource 指针。
@@ -903,18 +1025,15 @@ uintptr_t getActiveColorTextureHandle(CommandContext* ctx) {
     return reinterpret_cast<uintptr_t>(ctx->activeColorTargets[0]->resource.Get());
 }
 
-bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex, std::string& err) {
+mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex) {
     if (!ctx || !ctx->commandList) {
-        err = "no command list";
-        return false;
+        return mcdr::err("blitSurface", "no command list");
     }
     if (!s || s->currentImageIndex < 0) {
-        err = "no acquired back buffer";
-        return false;
+        return mcdr::err("blitSurface", "no acquired back buffer");
     }
     if (!ctx->listOpen) {
-        err = "command list not open (call dx12BeginCommandList first)";
-        return false;
+        return mcdr::err("blitSurface", "command list not open (call dx12BeginCommandList first)");
     }
     // srcTex 为 null 时仅做纯红色 clear（无 copy），用于渲染循环自检。
     if (!srcTex || !srcTex->resource) {
@@ -991,7 +1110,7 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex, std::s
         cmd->ClearRenderTargetView(rtv, black, 0, nullptr);
         transitionTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         dbgLogDebug("blitSurface: srcTex=null — clear backbuffer to black");
-        return true;
+        return {};
     }
 
     // P22: Draw-based blit（全屏四边形）— 绕过 CopyTextureRegion 格式不兼容问题。
@@ -1031,34 +1150,42 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex, std::s
         cmd->RSSetScissorRects(1, &blitSc);
         dbgLogDebug("blitSurface: viewport/scissor set %llux%llu", bbDesc.Width, bbDesc.Height);
         // 确保 blit 管线已初始化（首帧调用时 initBlitPipeline 尚未运行）
-        std::string blitErr;
-        initBlitPipeline(blitErr);
-        if (!blitErr.empty()) {
-            dbgLog("blitSurface: initBlitPipeline FAILED: %s", blitErr.c_str());
-            err = "blitSurface: " + blitErr;
-            return false;
+        auto blitInit = initBlitPipeline();
+        if (!blitInit) {
+            dbgLogError("blitSurface: initBlitPipeline FAILED: %s", blitInit.error().message.c_str());
+            return mcdr::err("blitSurface", "blitSurface: " + blitInit.error().message);
         }
         const BlitPipeline* bp = getBlitPipeline();
-        cmd->SetGraphicsRootSignature(bp->rootSig.Get());
-        cmd->SetPipelineState(bp->pso.Get());
-        dbgLogDebug("blitSurface: set blit rootSig=%p pso=%p", reinterpret_cast<void*>(bp->rootSig.Get()),
-                    reinterpret_cast<void*>(bp->pso.Get()));
-
-        // 3+4. 源纹理过渡 + SRV 分配 + 根描述符表绑定（一步完成）
-        if (!blitBindSourceTexture(ctx, srcTex, cmd, err)) {
-            dbgLog("blitSurface: blitBindSourceTexture FAILED: %s", err.c_str());
-            return false;
+        if (bp == nullptr) {
+            return mcdr::err("blitSurface", "blitSurface: blit pipeline unavailable after init");
         }
+        // P104b：SMAA 已移到世界层（GameRenderer 画完世界、GUI 还没画时对主渲染目标就地
+        // 应用，见 applySmaaToTexture）。最终 blit 回到**纯线性升采样**：这里若还做抗锯齿，
+        // 整帧（世界 + GUI）会被一起柔化，界面就发虚了 —— 也就是用户报告的 GUI 柔化问题。
+        {
+            cmd->SetGraphicsRootSignature(bp->rootSig.Get());
+            cmd->SetPipelineState(bp->pso.Get());
+            dbgLogDebug("blitSurface: set blit rootSig=%p pso=%p", reinterpret_cast<void*>(bp->rootSig.Get()),
+                        reinterpret_cast<void*>(bp->pso.Get()));
 
-        // 5. 绑定顶点/索引缓冲并绘制
-        cmd->IASetVertexBuffers(0, 1, &bp->vbView);
-        cmd->IASetIndexBuffer(&bp->ibView);
-        // P69：IA topology 同样是命令列表状态（D3D12 初值为 UNDEFINED），必须显式设置，
-        // 否则继承上一次 pass 的拓扑 → 整屏四边形退化/丢失，backbuffer 只被部分覆盖。
-        cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        dbgLogDebug("blitSurface: drawIndexed inst=1 firstIdx=0 firstVert=0");
-        cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
-        dbgLogDebug("blitSurface: drawIndexed done");
+            // 3+4. 源纹理过渡 + SRV 分配 + 根描述符表绑定（一步完成）
+            auto blitBind = blitBindSourceTexture(ctx, srcTex, cmd);
+            if (!blitBind) {
+                dbgLogError("blitSurface: blitBindSourceTexture FAILED: %s",
+                            blitBind.error().message.c_str());
+                return blitBind;
+            }
+
+            // 5. 绑定顶点/索引缓冲并绘制
+            cmd->IASetVertexBuffers(0, 1, &bp->vbView);
+            cmd->IASetIndexBuffer(&bp->ibView);
+            // P69：IA topology 同样是命令列表状态（D3D12 初值为 UNDEFINED），必须显式设置，
+            // 否则继承上一次 pass 的拓扑 → 整屏四边形退化/丢失，backbuffer 只被部分覆盖。
+            cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            dbgLogDebug("blitSurface: drawIndexed inst=1 firstIdx=0 firstVert=0");
+            cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
+            dbgLogDebug("blitSurface: drawIndexed done");
+        }
 
         // 6. RENDER_TARGET → PRESENT
         transitionTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
@@ -1085,11 +1212,111 @@ bool blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* srcTex, std::s
     // 记录本帧 blit 写入的 back buffer 下标（present 后 currentImageIndex=-1，
     // readback 必须用此值才能读到真实画面）。
     s->lastBlitIndex = s->currentImageIndex;
-    return true;
+    // P95：本帧已有内容 —— presentSurface 只在这种情况下才 Present。
+    s->blittedThisFrame.store(true, std::memory_order_release);
+    // P100：逐帧追踪（MCDR_FRAME_LOG=1）——本帧 blit 的源/目标 + 本帧累计清屏次数。
+    if (frameTraceEnabled()) {
+        static unsigned long long p100BlitFrames = 0;
+        ++p100BlitFrames;
+        DeviceContext& dc = deviceContext();
+        dbgLogInfo("P100 blit: blitFrame=%llu src=%p dst=%p idx=%d clearColor=%llu clearDepth=%llu "
+                   "clearColorRgn=%llu clearDepthRgn=%llu lastClearColor=%p lastClearDepth=%p srcMatchesClear=%d",
+                   p100BlitFrames, reinterpret_cast<const void*>(srcTex), reinterpret_cast<const void*>(dst),
+                   s->currentImageIndex, static_cast<unsigned long long>(dc.clearColorCalls),
+                   static_cast<unsigned long long>(dc.clearDepthCalls),
+                   static_cast<unsigned long long>(dc.clearColorRegionCalls),
+                   static_cast<unsigned long long>(dc.clearDepthRegionCalls), dc.lastClearColorTexture,
+                   dc.lastClearDepthTexture,
+                   (srcTex != nullptr && dc.lastClearColorTexture == static_cast<const void*>(srcTex)) ? 1 : 0);
+    }
+    return {};
+}
+
+// P106：纹理 → 纹理（可缩放）blit。GUI 的独立全尺寸目标靠它把世界层结果从主渲染目标
+// 搬过去：主渲染目标在 renderScale != 100 时是缩放尺寸（如 1281x720），GUI 目标是窗口
+// 尺寸（854x480），所以必须走带线性采样的整屏三角形，而不是 1:1 的 CopyTextureRegion。
+mcdr::Result<void> blitTextureToTexture(CommandContext* ctx, Dx12Object* src, Dx12Object* dst) {
+    if (!ctx || !ctx->commandList || !src || !src->resource || !dst || !dst->resource) {
+        return mcdr::err("blitTextureToTexture", "blitTextureToTexture: null ctx/src/dst");
+    }
+    if (src->resource.Get() == dst->resource.Get()) {
+        return mcdr::err("blitTextureToTexture", "blitTextureToTexture: src and dst are the same resource");
+    }
+
+    ID3D12GraphicsCommandList* cmd = ctx->commandList;
+    const D3D12_RESOURCE_DESC srcDesc = src->resource->GetDesc();
+    const D3D12_RESOURCE_DESC dstDesc = dst->resource->GetDesc();
+    if (dstDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dstDesc.SampleDesc.Count != 1) {
+        return mcdr::err("blitTextureToTexture",
+                         "blitTextureToTexture: dst is not a single-sampled 2D texture");
+    }
+
+    // 目标当渲染目标用：view/scissor 取目标自身尺寸（避免继承上一次 pass 的状态，
+    // 那正是 P69 叠帧问题的成因）。
+    auto rtv = acquireTextureRtv(ctx, dst);
+    if (!rtv) {
+        return mcdr::err("blitTextureToTexture", "blitTextureToTexture: " + rtv.error().message);
+    }
+    auto blitInit = initBlitPipeline();
+    if (!blitInit) {
+        return mcdr::err("blitTextureToTexture", "blitTextureToTexture: " + blitInit.error().message);
+    }
+    const BlitPipeline* bp = getBlitPipeline();
+    if (bp == nullptr) {
+        return mcdr::err("blitTextureToTexture", "blitTextureToTexture: blit pipeline unavailable");
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dstRtv = rtv.value();
+    cmd->OMSetRenderTargets(1, &dstRtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<FLOAT>(dstDesc.Width), static_cast<FLOAT>(dstDesc.Height), 0.0f, 1.0f};
+    cmd->RSSetViewports(1, &vp);
+    D3D12_RECT sc{0, 0, static_cast<LONG>(dstDesc.Width), static_cast<LONG>(dstDesc.Height)};
+    cmd->RSSetScissorRects(1, &sc);
+    transitionTextureTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    cmd->SetGraphicsRootSignature(bp->rootSig.Get());
+    cmd->SetPipelineState(bp->pso.Get());
+    // 源过渡 + SRV 分配 + 根描述符表绑定（一步完成，与 blitSurface 同一条路径）。
+    auto bind = blitBindSourceTexture(ctx, src, cmd);
+    if (!bind) {
+        return mcdr::err("blitTextureToTexture", "blitTextureToTexture: " + bind.error().message);
+    }
+
+    cmd->IASetVertexBuffers(0, 1, &bp->vbView);
+    cmd->IASetIndexBuffer(&bp->ibView);
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
+
+    // 源回 RENDER_TARGET（世界层那一帧仍可能被 PostChain/清深度使用），目标留在
+    // RENDER_TARGET 供随后 GUI pass 直接画。
+    transitionTextureTo(ctx, src, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    dbgLogDebug("blitTextureToTexture: %llux%llu -> %llux%llu", srcDesc.Width, srcDesc.Height, dstDesc.Width,
+                dstDesc.Height);
+    return {};
 }
 
 void presentSurface(Dx12Surface* s) {
     if (!s || !s->swapChain) {
+        return;
+    }
+    // P95（叠帧/闪烁根因）：只有本帧真的 blit 过才 Present。vanilla 的 blit/present 门只看
+    // 包装层的 hasBlittedTexture / isAcquired（com/mojang/blaze3d/systems/GpuSurface.java），
+    // 与我们后端是否真的 acquire + blit 成功脱钩：P48 推迟 acquire 失败时
+    // D3D12GpuSurface.ensureAcquired() 只是静默跳过 blit，vanilla 随后照旧 present()。
+    // 此处若无条件 Present，DXGI 会 flip 到一张本帧从未写过的 back buffer —— 启动期是
+    // 未初始化内存，稳态是 2~3 帧前的旧内容，表现为「上一帧和这一帧叠在一起 / 闪烁」，
+    // 而挂在每次 Present 上的 OSD（RTSS/Afterburner）会在同一屏上画两遍文字（用户判据）。
+    // 没有 blit 就没有本帧内容要显示：直接返回，让上一张已 blit 的帧继续留在屏幕上。
+    // 这也避免对非当前 back buffer 做任何操作（P68 教训：写非当前 buffer 触发
+    // D3D12 ERROR #907 → RemoveDevice(0x887A0005) 崩溃）。
+    if (!s->blittedThisFrame || s->currentImageIndex < 0) {
+        static unsigned long long skippedNoBlit = 0;
+        ++skippedNoBlit;
+        // 前 5 次与之后每 60 次记一行：这是"本帧没有内容可显示"的唯一直接证据。
+        if (skippedNoBlit <= 5 || skippedNoBlit % 60 == 0) {
+            dbgLogInfo("presentSurface: skipped (nothing blitted this frame) count=%llu idx=%d suboptimal=%d",
+                       skippedNoBlit, s->currentImageIndex, static_cast<int>(s->suboptimal));
+        }
         return;
     }
     // IMMEDIATE=0 -> Present(0, ALLOW_TEARING)；FIFO_RELAXED=3 -> Present(1, 0)；
@@ -1103,6 +1330,11 @@ void presentSurface(Dx12Surface* s) {
     // 前提：swapchain 创建时带 ALLOW_TEARING（s->allowTearing），且 syncInterval==0。
     UINT syncInterval = (s->presentMode == 0) ? 0 : 1;
     UINT flags = (s->presentMode == 0 && s->allowTearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    // P95：打印门从 `(currentImageIndex + 1) % 30 == 0` 改为"真实 present 计数"。
+    // 旧门在 idx==-1 时恒真（每帧都打）、在健康的 3-buffer 链上恒假（从不打），语义正好
+    // 反了：它只记录"没有 back buffer"的异常帧，正常帧一次也不记录。
+    static unsigned long long presentLogCounter = 0;
+    const bool logThisPresent = (++presentLogCounter % 30) == 0;
     // P15 诊断：每 30 帧打印 present 摘要（含 back buffer index + 结果）
     // P3.2 诊断：每帧检查 Backbuffer 格式和尺寸是否与窗口匹配
     if (!s->backBuffers.empty()) {
@@ -1110,7 +1342,7 @@ void presentSurface(Dx12Surface* s) {
             s->backBuffers[static_cast<size_t>(s->currentImageIndex >= 0 ? s->currentImageIndex : 0)].Get();
         if (bb) {
             D3D12_RESOURCE_DESC bbDesc = bb->GetDesc();
-            if ((s->currentImageIndex + 1) % 30 == 0) {
+            if (logThisPresent) {
                 dbgLogInfo(
                     "presentSurface: idx=%d sync=%u suboptimal=%d bbFmt=%d bbW=%llu bbH=%llu winW=%u winH=%u",
                     s->currentImageIndex, syncInterval, static_cast<int>(s->suboptimal),
@@ -1120,23 +1352,38 @@ void presentSurface(Dx12Surface* s) {
             }
         }
     }
-    if ((s->currentImageIndex + 1) % 30 == 0) {
+    if (logThisPresent) {
         dbgLogInfo("presentSurface: idx=%d sync=%u flags=%u tearing=%d suboptimal=%d", s->currentImageIndex,
                    syncInterval, flags, static_cast<int>(s->allowTearing), static_cast<int>(s->suboptimal));
+    }
+    // P100：逐帧追踪（MCDR_FRAME_LOG=1）——本帧 present 前的清屏计数（blit 行是同一帧的配对行）。
+    if (frameTraceEnabled()) {
+        static unsigned long long p100PresentFrames = 0;
+        ++p100PresentFrames;
+        DeviceContext& dc = deviceContext();
+        dbgLogInfo("P100 present: presentFrame=%llu idx=%d clearColor=%llu clearDepth=%llu lastClearColor=%p",
+                   p100PresentFrames, s->currentImageIndex,
+                   static_cast<unsigned long long>(dc.clearColorCalls),
+                   static_cast<unsigned long long>(dc.clearDepthCalls), dc.lastClearColorTexture);
     }
     HRESULT hr = s->swapChain->Present(syncInterval, flags);
     // present 后 backbuffer 所有权已释放（vanilla 每帧 acquire->blit->present，
     // 若此处不重置，configureSurface 的 ResizeBuffers 会误以为仍有 acquired
     // backbuffer 而返回 DXGI_ERROR_NOT_CURRENTLY_AVAILABLE -> 画面冻结）。
     s->currentImageIndex = -1;
+    // P95：本帧内容已随 Present 交给显示器；下一次 blit 之前都不应再 Present。
+    s->blittedThisFrame.store(false, std::memory_order_release);
+    // P95b：back buffer 已随 Present 交还 DXGI，本 surface 不再持有"未 present 的
+    // back buffer"。configureSurface 只在这个标志为 true 时才做释放用的 Present(0,0)。
+    s->bufferHeld.store(false, std::memory_order_release);
     if (hr == DXGI_STATUS_OCCLUDED) {
-        dbgLog("presentSurface: OCCLUDED (window fully occluded) -> suboptimal");
+        dbgLogInfo("presentSurface: OCCLUDED (window fully occluded) -> suboptimal");
         s->suboptimal = true;
     } else if (hr == DXGI_STATUS_MODE_CHANGED) {
-        dbgLog("presentSurface: MODE_CHANGED -> suboptimal");
+        dbgLogInfo("presentSurface: MODE_CHANGED -> suboptimal");
         s->suboptimal = true;
     } else if (FAILED(hr)) {
-        dbgLog("presentSurface: FAILED %s", hrText(hr).c_str());
+        dbgLogError("presentSurface: FAILED %s", hrText(hr).c_str());
         // P68：设备移除/重置时把真正的原因（GetDeviceRemovedReason + InfoQueue 最近消息）
         // 打进日志。未开调试层时，日志里只有一个 0x887A0005，看不出是「写了非当前
         // back buffer」（DXGI_ERROR_ACCESS_DENIED）还是真正的 GPU hang/TDR。
@@ -1153,13 +1400,12 @@ void presentSurface(Dx12Surface* s) {
 
 void destroySurface(Dx12Surface* s) {
     if (!s) return;
-    dbgLog("destroySurface: enter surface=%p", reinterpret_cast<void*>(s));
+    dbgLogDebug("destroySurface: enter surface=%p", reinterpret_cast<void*>(s));
     // P33 修复：async render thread 可能在 destroySurface 期间仍在操作同一 swapchain。
     // 先等待渲染线程完成当前帧（仅同步，不销毁线程），再等 GPU 空闲，
     // 避免 deviceWaitIdle → queue->Signal 与渲染线程的 Present 并发访问 swapchain 导致崩溃。
     waitForRenderThreadSubmit();
-    std::string err;
-    deviceWaitIdle(err);
+    (void)deviceWaitIdle();
     // P33 fix：等待 per-surface present fence，确保 Display Controller 已完成
     // flip 并释放 backbuffer 引用。IMMEDIATE 模式 + FLIP_DISCARD 下，deviceWaitIdle
     // 不等待 display controller，backbuffer 仍可能被 DWM 异步读取。
@@ -1191,8 +1437,14 @@ void destroySurface(Dx12Surface* s) {
     HWND presentChild = s->presentWindow;
     s->presentWindow = nullptr;
     delete s;
+    // P96：子窗口销毁后父窗口（GLFW）客户区会暴露出来，而它从未被绘制过（白色）——
+    // 先把父窗口刷黑，退出过程看到的是黑幕而不是"画幅尺寸为启动时窗口尺寸的白幕"。
+    logWindowState("destroySurface child(before)", presentChild);
+    logWindowState("destroySurface parent(before)", presentChild ? GetParent(presentChild) : nullptr);
+    paintParentBlackBeforeDestroy(presentChild);
     if (presentChild != nullptr) DestroyWindow(presentChild);
-    dbgLog("destroySurface: done surface=%p", reinterpret_cast<void*>(s));
+    logWindowState("destroySurface parent(after)", presentChild ? GetParent(presentChild) : nullptr);
+    dbgLogDebug("destroySurface: done surface=%p", reinterpret_cast<void*>(s));
 }
 
 // 仅清理表面，不调用 deviceWaitIdle（供 C++ 内部使用：render thread 已自行退出后调用）
@@ -1202,6 +1454,8 @@ void destroySurfaceNoWaitIdle(Dx12Surface* s) {
     HWND presentChild = s->presentWindow;
     s->presentWindow = nullptr;
     delete s;
+    // P96：同 destroySurface —— 先刷黑父窗口再销毁子窗口（见该处说明）。
+    paintParentBlackBeforeDestroy(presentChild);
     if (presentChild != nullptr) DestroyWindow(presentChild);
 }
 
@@ -1210,19 +1464,20 @@ void destroySurfaceNoWaitIdle(Dx12Surface* s) {
 // 每 ~60 帧调用一次，同步开销可忽略。结论判读：
 //   纯红/纯黑/纯灰 = 画面只有 clear 色（绘制内容不可见/未生效）
 //   多色且中心有内容 = 渲染正常，问题在别处（blit 区域/尺寸等）。
-bool readbackSurfacePixels(Dx12Surface* s, std::string& err) {
+mcdr::Result<void> readbackSurfacePixels(Dx12Surface* s) {
     DeviceContext& ctx = deviceContext();
     if (!ctx.device || !ctx.queue) {
-        err = "device not initialized";
-        return false;
+        return mcdr::err("readbackSurfacePixels", "device not initialized");
     }
     if (!s || s->backBuffers.empty()) {
-        err = "surface has no back buffers";
-        return false;
+        return mcdr::err("readbackSurfacePixels", "surface has no back buffers");
     }
-    if (!deviceWaitIdle(err)) {
-        err = "deviceWaitIdle failed: " + err;
-        return false;
+    {
+        auto idleRes = deviceWaitIdle();
+        if (!idleRes) {
+            return mcdr::err("readbackSurfacePixels",
+                             "deviceWaitIdle failed: " + idleRes.error().message);
+        }
     }
 
     // 选择要读回的 back buffer：
@@ -1241,8 +1496,8 @@ bool readbackSurfacePixels(Dx12Surface* s, std::string& err) {
         }
     }
     if (idx < 0 || idx >= static_cast<int>(s->backBuffers.size())) {
-        err = "no valid back buffer for readback (idx=" + std::to_string(idx) + ")";
-        return false;
+        return mcdr::err("readbackSurfacePixels",
+                         "no valid back buffer for readback (idx=" + std::to_string(idx) + ")");
     }
     ID3D12Resource* bb = s->backBuffers[static_cast<size_t>(idx)].Get();
     D3D12_RESOURCE_DESC bd = bb->GetDesc();
@@ -1272,8 +1527,7 @@ bool readbackSurfacePixels(Dx12Surface* s, std::string& err) {
         if (FAILED(ctx.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &desc,
                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                        IID_PPV_ARGS(&staging)))) {
-            err = "CreateCommittedResource(readback staging) failed";
-            return false;
+            return mcdr::err("readbackSurfacePixels", "CreateCommittedResource(readback staging) failed");
         }
     }
 
@@ -1282,15 +1536,13 @@ bool readbackSurfacePixels(Dx12Surface* s, std::string& err) {
     if (!alloc) {
         if (FAILED(
                 ctx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)))) {
-            err = "CreateCommandAllocator failed";
-            return false;
+            return mcdr::err("readbackSurfacePixels", "CreateCommandAllocator failed");
         }
     }
     if (!cl) {
         if (FAILED(ctx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr,
                                                  IID_PPV_ARGS(&cl)))) {
-            err = "CreateCommandList failed";
-            return false;
+            return mcdr::err("readbackSurfacePixels", "CreateCommandList failed");
         }
     } else {
         alloc->Reset();
@@ -1329,18 +1581,19 @@ bool readbackSurfacePixels(Dx12Surface* s, std::string& err) {
     ctx.queue->ExecuteCommandLists(1, lists);
     UINT64 fv = ++ctx.queueFenceValue;
     if (FAILED(ctx.queue->Signal(ctx.queueFence.Get(), fv))) {
-        err = "Signal(readback) failed";
-        return false;
+        return mcdr::err("readbackSurfacePixels", "Signal(readback) failed");
     }
-    if (!waitForQueueFenceValue(fv, 5'000'000'000ULL, err)) {
-        err = "readback wait timeout: " + err;
-        return false;
+    {
+        auto fenceRes = waitForQueueFenceValue(fv, 5'000'000'000ULL);
+        if (!fenceRes) {
+            return mcdr::err("readbackSurfacePixels",
+                             "readback wait timeout: " + fenceRes.error().message);
+        }
     }
 
     void* ptr = nullptr;
     if (FAILED(staging->Map(0, nullptr, &ptr))) {
-        err = "staging Map failed";
-        return false;
+        return mcdr::err("readbackSurfacePixels", "staging Map failed");
     }
     const uint8_t* base = static_cast<const uint8_t*>(ptr);
     int xs[3] = {0, static_cast<int>(w) / 2, static_cast<int>(w) - 1};
@@ -1348,14 +1601,14 @@ bool readbackSurfacePixels(Dx12Surface* s, std::string& err) {
     for (int yi = 0; yi < 3; ++yi) {
         for (int xi = 0; xi < 3; ++xi) {
             const uint8_t* p = base + static_cast<UINT64>(ys[yi]) * pitch + static_cast<UINT64>(xs[xi]) * 4;
-            dbgLog("readback[%ux%u] (%d,%d) = RGBA(%3d,%3d,%3d,%3d)", w, h, xs[xi], ys[yi], p[0], p[1], p[2],
+            dbgLogDebug("readback[%ux%u] (%d,%d) = RGBA(%3d,%3d,%3d,%3d)", w, h, xs[xi], ys[yi], p[0], p[1], p[2],
                    p[3]);
         }
     }
     // P6 可视化：整帧 dump 成 BMP + ASCII 缩略图，直接看 backbuffer 实际画面。
     dbgDumpPixelsToFile(base, w, h, pitch, "backbuf");
     staging->Unmap(0, nullptr);
-    return true;
+    return {};
 }
 
 }  // namespace d3d12_mc

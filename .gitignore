@@ -41,3 +41,7 @@
 /build
 /target
 /vcpkg_installed
+/external/xess
+/external/fidelityfx
+/external/dlss
+/external/nrd

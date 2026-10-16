@@ -1,11 +1,13 @@
-
-
 // abi_pipeline.cpp — graphics pipeline creation/destruction
 //
 // Group: graphics pipelines (originally abi_bridge_p4.cpp).
 // 合并自：abi_bridge_p4.cpp
 //
+module;
+
 #include "_d3d12_module_prelude.h"
+
+module mcdr.abi.common;
 
 #include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
@@ -15,7 +17,6 @@ import mcdr.d3d12.async_bundle;
 import mcdr.d3d12.async_descriptor;
 import mcdr.d3d12.async_executor;
 import mcdr.d3d12.async_fence;
-import mcdr.abi.common;
 
 using namespace d3d12_mc;
 
@@ -28,8 +29,6 @@ using namespace d3d12_mc;
 // ---------------------------------------------------------------------------
 // 来源单元：abi_bridge_p4.cpp
 // ---------------------------------------------------------------------------
-
-
 
 // abi_pipeline.cpp — graphics pipeline creation/destruction.（合并自 abi_bridge_p4.cpp）
 //
@@ -167,14 +166,13 @@ PipelinePtr* MCDR_CALL mcdr_dx12CreateGraphicsPipeline(const mcdr_pipeline_desc*
         d.bindings[static_cast<size_t>(i)].reg = desc->bindings[i].reg;
     }
 
-    std::string err;
-    PipelinePtr* pipeline = d3d12_mc::createGraphicsPipeline(d, err);
-    if (pipeline == nullptr) {
+    const auto r = d3d12_mc::createGraphicsPipeline(d);
+    if (!r) {
         // The old bridge printed err to stderr and returned 0, so Java only ever
         // saw "pipeline handle is 0". The message now survives the boundary.
-        return failWithPtr<PipelinePtr>(kCreate, err);
+        return failWithPtr<PipelinePtr>(kCreate, r.error().message);
     }
-    return pipeline;
+    return static_cast<PipelinePtr*>(*r);
 }
 
 void MCDR_CALL mcdr_dx12DestroyPipeline(PipelinePtr* pipeline) { d3d12_mc::destroyPipeline(pipeline); }

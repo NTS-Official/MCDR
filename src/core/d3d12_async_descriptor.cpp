@@ -4,19 +4,33 @@ module;
 
 module mcdr.d3d12.async_descriptor;
 
+import mcdr.error;
+
 namespace d3d12_mc {
 
-bool PartitionedDescriptorAllocator::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT heapSize,
-                                          UINT workerCount, UINT reservedPerSection) {
-    if (!device || !heap || heapSize == 0) return false;
-    if (workerCount == 0 || workerCount > kMaxAsyncWorkers) return false;
+mcdr::Result<void> PartitionedDescriptorAllocator::init(ID3D12Device* device, ID3D12DescriptorHeap* heap,
+                                                        UINT heapSize, UINT workerCount,
+                                                        UINT reservedPerSection) {
+    if (!device || !heap || heapSize == 0)
+        return mcdr::err("PartitionedDescriptorAllocator::init", "device/heap is null or heapSize == 0");
+    if (workerCount == 0 || workerCount > kMaxAsyncWorkers)
+        return mcdr::err("PartitionedDescriptorAllocator::init",
+                         "workerCount out of range (1.." + std::to_string(kMaxAsyncWorkers) +
+                             "): " + std::to_string(workerCount));
 
     // 帧槽与同步路径的 ring 段一一对应（均为 fenceValue % kAsyncFrameSlots）。
     const UINT sectionSize = heapSize / kAsyncFrameSlots;
-    if (sectionSize == 0 || reservedPerSection >= sectionSize) return false;
+    if (sectionSize == 0 || reservedPerSection >= sectionSize)
+        return mcdr::err("PartitionedDescriptorAllocator::init",
+                         "reservedPerSection >= sectionSize (heapSize=" + std::to_string(heapSize) +
+                             " reservedPerSection=" + std::to_string(reservedPerSection) + ")");
 
     const UINT slotsPerRegion = (sectionSize - reservedPerSection) / workerCount;
-    if (slotsPerRegion == 0) return false;  // 堆太小，无法给每个 (frameSlot,worker) 划分区域
+    // 堆太小，无法给每个 (frameSlot,worker) 划分区域
+    if (slotsPerRegion == 0)
+        return mcdr::err("PartitionedDescriptorAllocator::init",
+                         "slotsPerRegion == 0 (descriptor heap too small for " + std::to_string(workerCount) +
+                             " workers)");
 
     m_device = device;
     m_heap = heap;
@@ -29,7 +43,7 @@ bool PartitionedDescriptorAllocator::init(ID3D12Device* device, ID3D12Descriptor
 
     for (auto& c : m_cursors)
         c.store(0, std::memory_order_relaxed);
-    return true;
+    return {};
 }
 
 UINT PartitionedDescriptorAllocator::regionBaseSlot(UINT frameSlot, UINT worker) const {

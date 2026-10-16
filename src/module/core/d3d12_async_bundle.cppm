@@ -24,6 +24,19 @@ module;
 
 export module mcdr.d3d12.async_bundle;
 
+import mcdr.error;  // mcdr::Result<T> / mcdr::Error / mcdr::err()：失败上报改走 std::expected
+
+namespace {
+
+// HRESULT -> "0x%08X"（模块单元不得 import 设备模块，实现单元各自持有一份）。
+std::string hrText(HRESULT hr) {
+    char buf[16]{};
+    std::snprintf(buf, sizeof(buf), "0x%08X", static_cast<unsigned>(hr));
+    return std::string(buf);
+}
+
+}  // namespace
+
 export namespace d3d12_mc {
 
 using Microsoft::WRL::ComPtr;
@@ -63,8 +76,9 @@ public:
     // heap 为 DeviceContext::drawHeap（shader-visible CBV_SRV_UAV，非拥有）；
     // bundle 内若要编辑描述符表（SetGraphicsRootDescriptorTable），必须自行
     // SetDescriptorHeaps 一次，否则运行时解析 GPU 句柄时空堆指针解引用崩溃。
-    bool init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT workerId,
-              ID3D12CommandSignature* cmdSigIndexed, ID3D12CommandSignature* cmdSigNonIndexed);
+    // 任一步失败返回 mcdr::Error（含 HRESULT）。
+    mcdr::Result<void> init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT workerId,
+                            ID3D12CommandSignature* cmdSigIndexed, ID3D12CommandSignature* cmdSigNonIndexed);
 
     bool valid() const { return m_bundle != nullptr; }
     UINT workerId() const { return m_workerId; }
@@ -155,8 +169,9 @@ public:
     BundleRecorderPool(const BundleRecorderPool&) = delete;
     BundleRecorderPool& operator=(const BundleRecorderPool&) = delete;
 
-    bool init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT workerCount,
-              ID3D12CommandSignature* cmdSigIndexed, ID3D12CommandSignature* cmdSigNonIndexed);
+    // 为每个 worker 建一个 BundleRecorder（各自 allocator/list）；失败返回 mcdr::Error。
+    mcdr::Result<void> init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT workerCount,
+                            ID3D12CommandSignature* cmdSigIndexed, ID3D12CommandSignature* cmdSigNonIndexed);
     void shutdown();
 
     bool valid() const { return !m_recorders.empty(); }
@@ -190,9 +205,10 @@ D3D12_PRIMITIVE_TOPOLOGY bundlePrimitiveTopology(int ordinal) {
     }
 }
 
-bool BundleRecorder::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT workerId,
-                          ID3D12CommandSignature* cmdSigIndexed, ID3D12CommandSignature* cmdSigNonIndexed) {
-    if (!device) return false;
+mcdr::Result<void> BundleRecorder::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT workerId,
+                                       ID3D12CommandSignature* cmdSigIndexed,
+                                       ID3D12CommandSignature* cmdSigNonIndexed) {
+    if (!device) return mcdr::err("BundleRecorder::init", "device is null");
 
     m_device = device;
     m_workerId = workerId;
@@ -201,11 +217,13 @@ bool BundleRecorder::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT
     for (UINT i = 0; i < kBundleSlotCount; ++i) {
         HRESULT hr =
             device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&m_allocators[i]));
-        if (FAILED(hr)) return false;
+        if (FAILED(hr))
+            return mcdr::err("BundleRecorder::init", "CreateCommandAllocator failed: " + hrText(hr));
 
         hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, m_allocators[i].Get(), nullptr,
                                        IID_PPV_ARGS(&m_lists[i]));
-        if (FAILED(hr)) return false;
+        if (FAILED(hr))
+            return mcdr::err("BundleRecorder::init", "CreateCommandList failed: " + hrText(hr));
 
         // 创建即为 open，先 Close 到初始状态，之后 begin() 再 Reset。
         m_lists[i]->Close();
@@ -220,7 +238,7 @@ bool BundleRecorder::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT
     // 复用现有 ExecuteIndirect 的 command signature（drawIndexed 用 indexed）。
     m_cmdSigIndexed = cmdSigIndexed;
     m_cmdSigNonIndexed = cmdSigNonIndexed;
-    return true;
+    return {};
 }
 
 bool BundleRecorder::begin(UINT frameSlot, UINT64 frameValue) {
@@ -353,20 +371,24 @@ bool BundleRecorder::drawIndirect(ID3D12Resource* commands, UINT64 offset, UINT 
     return true;
 }
 
-bool BundleRecorderPool::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT workerCount,
-                            ID3D12CommandSignature* cmdSigIndexed, ID3D12CommandSignature* cmdSigNonIndexed) {
-    if (!device || workerCount == 0) return false;
+mcdr::Result<void> BundleRecorderPool::init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT workerCount,
+                                            ID3D12CommandSignature* cmdSigIndexed,
+                                            ID3D12CommandSignature* cmdSigNonIndexed) {
+    if (!device || workerCount == 0)
+        return mcdr::err("BundleRecorderPool::init", "device is null or workerCount == 0");
     shutdown();
     m_recorders.reserve(workerCount);
     for (UINT i = 0; i < workerCount; ++i) {
         std::unique_ptr<BundleRecorder> rec(new BundleRecorder());
-        if (!rec->init(device, heap, i, cmdSigIndexed, cmdSigNonIndexed)) {
+        const mcdr::Result<void> r = rec->init(device, heap, i, cmdSigIndexed, cmdSigNonIndexed);
+        if (!r) {
             shutdown();
-            return false;
+            return mcdr::err("BundleRecorderPool::init", "BundleRecorder::init failed for worker " +
+                                                             std::to_string(i) + ": " + r.error().message);
         }
         m_recorders.push_back(std::move(rec));
     }
-    return true;
+    return {};
 }
 
 void BundleRecorderPool::shutdown() { m_recorders.clear(); }

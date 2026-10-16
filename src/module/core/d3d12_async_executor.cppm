@@ -18,6 +18,19 @@ module;
 
 export module mcdr.d3d12.async_executor;
 
+import mcdr.error;  // mcdr::Result<T> / mcdr::Error / mcdr::err()：失败上报改走 std::expected
+
+namespace {
+
+// HRESULT -> "0x%08X"（模块单元不得 import 设备模块，实现单元各自持有一份）。
+std::string hrText(HRESULT hr) {
+    char buf[16]{};
+    std::snprintf(buf, sizeof(buf), "0x%08X", static_cast<unsigned>(hr));
+    return std::string(buf);
+}
+
+}  // namespace
+
 export namespace d3d12_mc {
 
 using Microsoft::WRL::ComPtr;
@@ -33,8 +46,9 @@ public:
     MainCommandExecutor& operator=(const MainCommandExecutor&) = delete;
 
     // heaps 传入父列表使用的 shader-visible 描述符堆（bundle 内禁止 SetDescriptorHeaps，
-    // 故必须在父列表 Reset 后立刻绑定）；可为 nullptr。
-    bool init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12DescriptorHeap* heaps = nullptr);
+    // 故必须在父列表 Reset 后立刻绑定）；可为 nullptr。失败返回 mcdr::Error。
+    mcdr::Result<void> init(ID3D12Device* device, ID3D12CommandQueue* queue,
+                            ID3D12DescriptorHeap* heaps = nullptr);
     bool valid() const { return m_slots[0].commandList != nullptr; }
 
     // 非阻塞开始一帧；失败（上一帧未完成 / 已在帧中 / Reset 失败）返回 false。
@@ -98,26 +112,30 @@ private:
 // 实现（原 dx12_async_executor.cpp，随头文件一并并入模块接口单元）
 // ===========================================================================
 
-bool MainCommandExecutor::init(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12DescriptorHeap* heaps) {
-    if (!device || !queue) return false;
+mcdr::Result<void> MainCommandExecutor::init(ID3D12Device* device, ID3D12CommandQueue* queue,
+                                            ID3D12DescriptorHeap* heaps) {
+    if (!device || !queue)
+        return mcdr::err("MainCommandExecutor::init", "device/queue is null");
 
     m_device = device;
     m_queue = queue;
     m_heap = heaps;
 
-    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
-        return false;
+    HRESULT hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence));
+    if (FAILED(hr)) {
+        return mcdr::err("MainCommandExecutor::init", "CreateFence failed: " + hrText(hr));
     }
 
     for (UINT i = 0; i < kFramesInFlight; ++i) {
         FrameSlot& slot = m_slots[i];
-        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                  IID_PPV_ARGS(&slot.allocator)))) {
-            return false;
+        hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.allocator));
+        if (FAILED(hr)) {
+            return mcdr::err("MainCommandExecutor::init", "CreateCommandAllocator failed: " + hrText(hr));
         }
-        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator.Get(), nullptr,
-                                             IID_PPV_ARGS(&slot.commandList)))) {
-            return false;
+        hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator.Get(), nullptr,
+                                       IID_PPV_ARGS(&slot.commandList));
+        if (FAILED(hr)) {
+            return mcdr::err("MainCommandExecutor::init", "CreateCommandList failed: " + hrText(hr));
         }
         slot.commandList->Close();
         slot.submittedFenceValue = 0;
@@ -126,7 +144,7 @@ bool MainCommandExecutor::init(ID3D12Device* device, ID3D12CommandQueue* queue, 
     m_fenceValue = 0;
     m_lastFenceValue = 0;
     m_frameInProgress = false;
-    return true;
+    return {};
 }
 
 void MainCommandExecutor::clearFrameState() {

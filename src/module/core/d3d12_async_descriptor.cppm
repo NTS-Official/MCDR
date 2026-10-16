@@ -26,6 +26,8 @@ module;
 
 export module mcdr.d3d12.async_descriptor;
 
+import mcdr.error;  // mcdr::Result<T> / mcdr::Error / mcdr::err()：失败上报改走 std::expected
+
 export namespace d3d12_mc {
 
 using Microsoft::WRL::ComPtr;
@@ -67,9 +69,9 @@ public:
     // workerCount 为每帧槽内的分区数。
     // reservedPerSection 为每个帧槽（堆的 1/kAsyncFrameSlots）起始处保留给同步
     // 路径 ring 的槽位数——异步模式下仍有少量 draw 走同步直连（小批量 chunk、
-    // surface blit），必须与 worker 分区互不重叠。失败返回 false。
-    bool init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT heapSize, UINT workerCount,
-              UINT reservedPerSection = 0);
+    // surface blit），必须与 worker 分区互不重叠。失败返回 mcdr::Error。
+    mcdr::Result<void> init(ID3D12Device* device, ID3D12DescriptorHeap* heap, UINT heapSize, UINT workerCount,
+                            UINT reservedPerSection = 0);
 
     bool valid() const { return m_heap != nullptr && m_slotsPerRegion > 0; }
     UINT workerCount() const { return m_workerCount; }

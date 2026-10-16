@@ -1,11 +1,13 @@
-
-
 // abi_async.cpp — async rendering infrastructure: partitioned descriptor allocator, bundle recorder pool, fence manager, main-list executor, barrier pre-passes
 //
 // Group: async infrastructure (originally abi_bridge_p33.cpp).
 // 合并自：abi_bridge_p33.cpp
 //
+module;
+
 #include "_d3d12_module_prelude.h"
+
+module mcdr.abi.common;
 
 #include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
@@ -15,7 +17,9 @@ import mcdr.d3d12.async_bundle;
 import mcdr.d3d12.async_descriptor;
 import mcdr.d3d12.async_executor;
 import mcdr.d3d12.async_fence;
-import mcdr.abi.common;
+// mcdr.error 是叶子模块；这里要用 mcdr::describe() 组装 init 失败原因，
+// 而 import 不会被传递（mcdr.abi.common 的 import 不会顺带带进来）。
+import mcdr.error;
 
 using namespace d3d12_mc;
 
@@ -28,8 +32,6 @@ using namespace d3d12_mc;
 // ---------------------------------------------------------------------------
 // 来源单元：abi_bridge_p33.cpp
 // ---------------------------------------------------------------------------
-
-
 
 // abi_async.cpp — async rendering infrastructure: partitioned descriptor（合并自 abi_bridge_p33.cpp）
 // allocator, bundle recorder pool, fence manager, main-list executor, and the
@@ -62,11 +64,20 @@ using namespace d3d12_mc;
 //     variants, because the Java side only reaches the bundle path once it has
 //     proved every draw in the batch shares the same SRV set (`srvUniform`).
 
-
-
 namespace {
 
-void logFail(const char* what) { std::fprintf(stderr, "[dx12] %s failed\n", what); }
+// 统一走 native 日志前缀（与 JVM 侧 log4j 同形），与 dbgLog* 的行外观一致。
+void logFail(const char* what) {
+    char line[1024];
+    const int n = d3d12_mc::formatLogPrefix(line, sizeof(line), "ERROR", "dx12");
+    if (n > 0 && static_cast<size_t>(n) < sizeof(line)) {
+        std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n), "%s failed", what);
+        std::fprintf(stderr, "%s\n", line);
+    } else {
+        std::fprintf(stderr, "[dx12] %s failed\n", what);
+    }
+    std::fflush(stderr);
+}
 
 // Shared body of mcdr_dx12AsyncBundleRecordPartition for both indexing modes.
 int32_t recordPartition(PartitionedDescriptorAllocator* a, BundleRecorder* r, int32_t baseSlot,
@@ -291,10 +302,15 @@ mcdr_desc_alloc* MCDR_CALL mcdr_dx12AsyncDescriptorCreate(int32_t workerCount) {
     }
     const D3D12_DESCRIPTOR_HEAP_DESC desc = dc.drawHeap->GetDesc();
     auto* alloc = new PartitionedDescriptorAllocator();
-    if (!alloc->init(dc.device.Get(), dc.drawHeap.Get(), desc.NumDescriptors, static_cast<UINT>(workerCount),
-                     kAsyncSyncRingReserve)) {
+    // 全限定 mcdr::abi:: 见 abi_mesh.cpp 同处的说明：ADL 不会把 mcdr::abi 拉进来。
+    if (const auto r = alloc->init(dc.device.Get(), dc.drawHeap.Get(), desc.NumDescriptors,
+                                   static_cast<UINT>(workerCount), kAsyncSyncRingReserve);
+        !r) {
+        // describe(e) == "<where>: <message>"，所以前缀仍是原来的
+        // "PartitionedDescriptorAllocator::init failed"，后面多了真实失败原因。
         mcdr::abi::setLastError("mcdr_dx12AsyncDescriptorCreate",
-                                "PartitionedDescriptorAllocator::init failed");
+                                "PartitionedDescriptorAllocator::init failed: " +
+                                    mcdr::describe(r.error()));
         logFail("dx12AsyncDescriptorCreate: init");
         delete alloc;
         return nullptr;
@@ -387,9 +403,11 @@ mcdr_bundle_pool* MCDR_CALL mcdr_dx12AsyncBundlePoolCreate(int32_t workerCount) 
     // A bundle records SetGraphicsRootDescriptorTable, so it has to bind a
     // shader-visible descriptor heap itself: pass the same (non-owned) drawHeap
     // the parent command list uses.
-    if (!pool->init(dc.device.Get(), dc.drawHeap.Get(), static_cast<UINT>(workerCount), dc.cmdSigIndexed.Get(),
-                     dc.cmdSigNonIndexed.Get())) {
-        mcdr::abi::setLastError("mcdr_dx12AsyncBundlePoolCreate", "BundleRecorderPool::init failed");
+    if (const auto r = pool->init(dc.device.Get(), dc.drawHeap.Get(), static_cast<UINT>(workerCount),
+                                  dc.cmdSigIndexed.Get(), dc.cmdSigNonIndexed.Get());
+        !r) {
+        mcdr::abi::setLastError("mcdr_dx12AsyncBundlePoolCreate",
+                                "BundleRecorderPool::init failed: " + mcdr::describe(r.error()));
         logFail("dx12AsyncBundlePoolCreate: init");
         delete pool;
         return nullptr;
@@ -568,8 +586,9 @@ mcdr_fence_mgr* MCDR_CALL mcdr_dx12AsyncFenceCreate(void) {
         return nullptr;
     }
     auto* mgr = new AsyncFenceManager();
-    if (!mgr->init(dc.device.Get(), dc.queue.Get())) {
-        mcdr::abi::setLastError("mcdr_dx12AsyncFenceCreate", "AsyncFenceManager::init failed");
+    if (const auto r = mgr->init(dc.device.Get(), dc.queue.Get()); !r) {
+        mcdr::abi::setLastError("mcdr_dx12AsyncFenceCreate",
+                                "AsyncFenceManager::init failed: " + mcdr::describe(r.error()));
         logFail("dx12AsyncFenceCreate: init");
         delete mgr;
         return nullptr;
@@ -703,8 +722,9 @@ mcdr_executor* MCDR_CALL mcdr_dx12AsyncExecutorCreate(void) {
         return nullptr;
     }
     auto* exec = new MainCommandExecutor();
-    if (!exec->init(dc.device.Get(), dc.queue.Get(), dc.drawHeap.Get())) {
-        mcdr::abi::setLastError("mcdr_dx12AsyncExecutorCreate", "MainCommandExecutor::init failed");
+    if (const auto r = exec->init(dc.device.Get(), dc.queue.Get(), dc.drawHeap.Get()); !r) {
+        mcdr::abi::setLastError("mcdr_dx12AsyncExecutorCreate",
+                                "MainCommandExecutor::init failed: " + mcdr::describe(r.error()));
         logFail("dx12AsyncExecutorCreate: init");
         delete exec;
         return nullptr;

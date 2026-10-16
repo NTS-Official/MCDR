@@ -19,6 +19,7 @@
 
 import mcdr.d3d12.device;
 import mcdr.d3d12.mesh;
+import mcdr.error;   // Result<T> / err()：失败上报改走 std::expected
 
 namespace {
 
@@ -155,20 +156,19 @@ bool meshPipelineSupported(std::string* why) {
 // ---------------------------------------------------------------------------
 // createMeshPipeline
 // ---------------------------------------------------------------------------
-void* createMeshPipeline(const MeshPipelineDesc& desc, std::string& err) {
-    if (!ensureDevice(err)) return nullptr;
+mcdr::Result<void*> createMeshPipeline(const MeshPipelineDesc& desc) {
+    if (const auto r = ensureDevice(); !r)
+        return mcdr::err("createMeshPipeline", r.error().message);
 
     if (desc.msDxil.empty()) {
-        err = "createMeshPipeline: msDxil is empty (mesh shader bytecode is required)";
-        return nullptr;
+        return mcdr::err("createMeshPipeline", "msDxil is empty (mesh shader bytecode is required)");
     }
 
     // mesh 管线必须走 ID3D12Device2::CreatePipelineState（流描述）。
     ComPtr<ID3D12Device2> device2;
     HRESULT hr = deviceContext().device.As(&device2);
     if (FAILED(hr) || !device2) {
-        err = "createMeshPipeline: ID3D12Device2 unavailable hr=" + hrHex(hr);
-        return nullptr;
+        return mcdr::err("createMeshPipeline", "ID3D12Device2 unavailable hr=" + hrHex(hr));
     }
 
     // 1) root signature：与图形管线同构。CBV -> root descriptor（按 binding 顺序
@@ -228,19 +228,18 @@ void* createMeshPipeline(const MeshPipelineDesc& desc, std::string& err) {
     ComPtr<ID3DBlob> rsBlob, rsErr;
     hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_1, &rsBlob, &rsErr);
     if (FAILED(hr)) {
-        err = "createMeshPipeline: D3D12SerializeRootSignature hr=" + hrHex(hr);
+        std::string msg = "D3D12SerializeRootSignature hr=" + hrHex(hr);
         if (rsErr && rsErr->GetBufferSize() > 0) {
-            err += " ";
-            err.append(static_cast<const char*>(rsErr->GetBufferPointer()), rsErr->GetBufferSize());
+            msg += " ";
+            msg.append(static_cast<const char*>(rsErr->GetBufferPointer()), rsErr->GetBufferSize());
         }
-        return nullptr;
+        return mcdr::err("createMeshPipeline", std::move(msg));
     }
     ComPtr<ID3D12RootSignature> rootSig;
     hr = deviceContext().device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
                                                      IID_PPV_ARGS(&rootSig));
     if (FAILED(hr)) {
-        err = "createMeshPipeline: CreateRootSignature hr=" + hrHex(hr);
-        return nullptr;
+        return mcdr::err("createMeshPipeline", "CreateRootSignature hr=" + hrHex(hr));
     }
 
     // 2) 共享状态：不透明写入 + 光栅化。P72 忽略 blend（Java 侧的 blendEnabled
@@ -354,8 +353,7 @@ void* createMeshPipeline(const MeshPipelineDesc& desc, std::string& err) {
     pipeline->rootSignature = rootSig;
     pipeline->isMesh = true;  // setPipeline 据此跳过 IASetPrimitiveTopology
 
-    auto buildPso = [&](bool withAs, bool withPs, ComPtr<ID3D12PipelineState>& out,
-                        std::string& e) -> bool {
+    auto buildPso = [&](bool withAs, bool withPs, ComPtr<ID3D12PipelineState>& out) -> mcdr::Result<void> {
         std::vector<unsigned char> stream;
         stream.reserve(512);
         appendSubobjects(stream, sRoot, sMs);
@@ -367,21 +365,21 @@ void* createMeshPipeline(const MeshPipelineDesc& desc, std::string& err) {
         sd.SizeInBytes = static_cast<SIZE_T>(stream.size());
         sd.pPipelineStateSubobjectStream = stream.data();
 
-        dbgLog("createMeshPipeline: stream=%zuB as=%d ps=%d rt=%d dsv=%d cull=%d wire=%d\n",
+        dbgLogInfo("createMeshPipeline: stream=%zuB as=%d ps=%d rt=%d dsv=%d cull=%d wire=%d\n",
                static_cast<size_t>(sd.SizeInBytes), withAs ? 1 : 0, withPs ? 1 : 0, numRT,
                static_cast<int>(sDsv.payload), desc.cullEnabled ? 1 : 0, desc.polygonMode == 1 ? 1 : 0);
 
         const HRESULT h = device2->CreatePipelineState(&sd, IID_PPV_ARGS(&out));
         if (FAILED(h)) {
-            e = "createMeshPipeline: CreatePipelineState hr=" + hrHex(h);
-            return false;
+            return mcdr::err("createMeshPipeline", "CreatePipelineState hr=" + hrHex(h));
         }
-        return true;
+        return {};
     };
 
     // 4) 与图形管线同构地建两个 PSO：withDepth 总是建（DSV=D32_FLOAT），
     //    仅当管线无深度状态时再建 withoutDepth（DSV=UNKNOWN）。
-    if (!buildPso(!desc.asDxil.empty(), !desc.psDxil.empty(), pipeline->withDepth, err)) return nullptr;
+    if (auto r = buildPso(!desc.asDxil.empty(), !desc.psDxil.empty(), pipeline->withDepth); !r)
+        return std::unexpected(r.error());
     if (!desc.hasDepth) {
         const DXGI_FORMAT saved = sDsv.payload;
         sDsv.payload = DXGI_FORMAT_UNKNOWN;
@@ -389,38 +387,35 @@ void* createMeshPipeline(const MeshPipelineDesc& desc, std::string& err) {
         ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
         ds.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
         sDepth.payload = ds;
-        const bool ok = buildPso(!desc.asDxil.empty(), !desc.psDxil.empty(), pipeline->withoutDepth, err);
+        auto r = buildPso(!desc.asDxil.empty(), !desc.psDxil.empty(), pipeline->withoutDepth);
         sDsv.payload = saved;
-        if (!ok) return nullptr;
+        if (!r) return std::unexpected(r.error());
     }
 
-    return pipeline.release();
+    return static_cast<void*>(pipeline.release());
 }
 
 // ---------------------------------------------------------------------------
 // dispatchMesh
 // ---------------------------------------------------------------------------
-bool dispatchMesh(void* ctxHandle, int x, int y, int z, std::string& err) {
+mcdr::Result<void> dispatchMesh(void* ctxHandle, int x, int y, int z) {
     auto* ctx = static_cast<CommandContext*>(ctxHandle);
     if (ctx == nullptr) {
-        err = "dispatchMesh: command context is null";
-        return false;
+        return mcdr::err("dispatchMesh", "command context is null");
     }
     if (ctx->commandList == nullptr) {
-        err = "dispatchMesh: command list is not open";
-        return false;
+        return mcdr::err("dispatchMesh", "command list is not open");
     }
 
     // DispatchMesh 只在 ID3D12GraphicsCommandList6 上（SM 6.6+ / 12_2）。
     ComPtr<ID3D12GraphicsCommandList6> list6;
     HRESULT hr = ctx->commandList->QueryInterface(IID_PPV_ARGS(&list6));
     if (FAILED(hr) || !list6) {
-        err = "dispatchMesh: ID3D12GraphicsCommandList6 unavailable hr=" + hrHex(hr);
-        return false;
+        return mcdr::err("dispatchMesh", "ID3D12GraphicsCommandList6 unavailable hr=" + hrHex(hr));
     }
 
     list6->DispatchMesh(static_cast<UINT>(x), static_cast<UINT>(y), static_cast<UINT>(z));
-    return true;
+    return {};
 }
 
 }  // namespace d3d12_mc

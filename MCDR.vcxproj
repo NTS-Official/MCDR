@@ -77,7 +77,31 @@
            hard build failure in D3D12 template code. Defining it globally is
            idempotent for the existing guards. -->
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;NOMINMAX;MCDR_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- The upscaler/denoiser SDKs are 64-bit only (DLSS ships no x86 import
+           library, NRD is prebuilt as an x64 static library, and the XeSS /
+           FidelityFX runtimes are x64 DLLs), so the capability macros are
+           defined for x64 exclusively. Anything guarded by them must also be
+           guarded in the C ABI surface, so that a Win32 build neither links the
+           SDKs nor advertises them to the JVM side. -->
+      <PreprocessorDefinitions Condition="'$(Platform)'=='x64'">MCDR_HAS_DLSS=1;MCDR_HAS_NRD=1;MCDR_HAS_XESS=1;MCDR_HAS_FFX=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- external\ manages the four upscaler/denoiser SDKs. They are vendored
+           under MCDR\external\ (see external\README.md) rather than fetched per
+           build, because none of them is available from a package manager:
+             external\dlss       — DLSS / NGX SDK 310.9.1  (nvsdk_ngx*.h +
+                                   prebuilt nvsdk_ngx_{s,d}.lib; x64 ONLY)
+             external\nrd        — NRD 4.18.0 (public headers + prebuilt NRD.lib)
+             external\xess       — Intel XeSS 3.0.2 runtime 2.0.2.68 (xess\*.h,
+                                   libxess*.lib and the runtime DLLs)
+             external\fidelityfx — AMD FidelityFX SDK 2.3.0 (ffx_api*.h and the
+                                   signed runtime DLLs; upstream ships NO import
+                                   library, everything is GetProcAddress)
+           All four are only reachable on x64; MCDR_HAS_{DLSS,NRD,XESS,FFX} gate
+           every use so the Win32 configuration still compiles from the same
+           sources. Note that only DLSS and NRD are actually linked (see the Link
+           blocks below); XeSS and FidelityFX are loaded at runtime, so their
+           headers are on the include path but their .lib files are deliberately
+           NOT in AdditionalDependencies. -->
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\fidelityfx\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <!-- These sources have Chinese comments; without /utf-8 the compiler
            reads them under the active code page and mangles them. -->
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -92,8 +116,10 @@
       <!-- d3d12/dxgi: the API and the swapchain. d3dcompiler: D3DCompile, the
            HLSL SM5.1 -> DXBC path the pipeline builder still uses (the SM6.x/DXC
            toolchain is a later stage). dcomp: the DirectComposition fallback for
-           CreateSwapChainForHwnd returning E_ACCESSDENIED. -->
-      <AdditionalDependencies>d3d12.lib;dxgi.lib;d3dcompiler.lib;dcomp.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+           CreateSwapChainForHwnd returning E_ACCESSDENIED. version: the
+           GetFileVersionInfoW family, used by the SDK probe to report the
+           FidelityFX / XeSS runtime versions from their file resources. -->
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;d3dcompiler.lib;dcomp.lib;user32.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -103,6 +129,22 @@
     <ClCompile>
       <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <BuildStlModules Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</BuildStlModules>
+      <UndefineAllPreprocessorDefinitions Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</UndefineAllPreprocessorDefinitions>
+      <!-- /Zi instead of the MSVC props default /ZI (Edit-and-Continue).
+           With no DebugInformationFormat set anywhere, Debug inherits /ZI from
+           Microsoft.Cpp.props, and /ZI + /FS + /std:c++latest makes this
+           toolchain (cl 19.51.36231, v145) fail every PDB write:
+             error C2471: 无法更新程序数据库 "...\build\x64_Debug\vc145.pdb"
+           measured on a two-line TU (`#include <string>`) with no project
+           involved, so it is a compiler-level interaction, not a project one:
+             /std:c++latest /permissive- /FS /ZI  -> 92x C2471
+             /std:c++latest /permissive- /FS /Zi  -> clean
+             /std:c++latest /permissive- /ZI (no /FS) -> clean
+           Release already uses /Zi and links fine; Debug also cannot use
+           Edit-and-Continue regardless because its module units (.cppm) and
+           std.ixx are compiled as module interfaces.
+           Do not "simplify" this back to the default without re-testing Debug. -->
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
@@ -118,11 +160,50 @@
       <OptimizeReferences>true</OptimizeReferences>
     </Link>
   </ItemDefinitionGroup>
+  <!-- ==========================================================================
+       NVIDIA RTX SDK link inputs (x64 only).
+
+       DLSS/NGX ships one import library per (CRT, debug-info) combination; the
+       CRT family must match the consuming module or the link fails with
+       LNK2038 "_ITERATOR_DEBUG_LEVEL mismatch" / "RuntimeLibrary mismatch":
+         nvsdk_ngx_d.lib      -> /MD   (Release; msvcprt + MSVCRT)
+         nvsdk_ngx_d_dbg.lib  -> /MDd  (Debug;   msvcprtd + MSVCRTD)
+       The "_s" pair is the static-CRT (/MT, LIBCMT) build, unused here because
+       this project links the DLL CRT. Verified with dumpbin /directives.
+
+       NRD is prebuilt as a static library by external\nrd\build-nrd.ps1 and
+       already carries the DXIL shaders, so no NRD runtime DLL is deployed.
+
+       ShaderMakeBlob.lib must be linked NEXT TO NRD.lib, not instead of it.
+       NRD.lib(InstanceImpl|Relax|Reblur|Sigma|Reference).obj all call
+       ShaderMake::FindPermutationInBlob(), whose definition upstream lives in
+       ShaderMake's separate ShaderBlob target. Linking NRD.lib alone fails with
+       exactly five LNK2001 for that one symbol. The script copies it into
+       Lib\x64\<cfg>\ so one AdditionalLibraryDirectories covers both.
+
+       uuid.lib is required by the DLSS import libraries themselves.
+       ========================================================================== -->
+  <ItemDefinitionGroup Condition="'$(Platform)'=='x64' And '$(Configuration)'!='Debug'">
+    <Link>
+      <AdditionalLibraryDirectories>$(ProjectDir)external\dlss\lib\x64;$(ProjectDir)external\nrd\Lib\x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>nvsdk_ngx_d.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Platform)'=='x64' And '$(Configuration)'=='Debug'">
+    <Link>
+      <AdditionalLibraryDirectories>$(ProjectDir)external\dlss\lib\x64;$(ProjectDir)external\nrd\Lib\x64\Debug;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <!-- _dbg variants: same API, built against the debug CRT (/MDd). -->
+      <AdditionalDependencies>nvsdk_ngx_d_dbg.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <!-- Public C c_abi. This is the only header the JVM side mirrors, and it stays a
          plain C header on purpose: language-linkage (extern "C") entities cannot be
          exported from a C++ module, and the Kotlin side must keep including it. -->
     <ClInclude Include="include\mcdr_abi.h" />
+    <ClInclude Include="include\mcdr_dlss_impl.h" />
+    <ClInclude Include="include\mcdr_rtx_support.h" />
+    <ClInclude Include="include\mcdr_smaa_luts.h" />
     <ClInclude Include="include\_d3d12_module_prelude.h" />
     <!-- Shared prelude for the module interface units below. Every .cppm #includes
          this in its global module fragment (NOMINMAX + windows/d3d12/dxgi/dcomp +
@@ -130,8 +211,14 @@
   </ItemGroup>
   <ItemGroup>
     <!-- Module interface units. A .cppm under /std:c++latest is picked up as
-         CompileAsCppModule automatically, so no CompileAs metadata is needed. -->
+         CompileAsCppModule automatically, so no CompileAs metadata is needed.
+         (ScanSourceForModuleDependencies is on, so the src\c_abi\*.cpp below
+         are likewise detected as implementation units of mcdr.abi.common even
+         though they keep the .cpp extension.) -->
+    <ClCompile Include="src\advanced\smaa_luts.cpp" />
     <ClCompile Include="src\module\c_abi\mcdr_abi_common.cppm" />
+    <!-- 叶子模块：Error / Result<T>，不 import 任何 mcdr.* 模块 -->
+    <ClCompile Include="src\module\core\mcdr_error.cppm" />
     <ClCompile Include="src\module\core\d3d12_descriptor_allocator.cppm" />
     <ClCompile Include="src\module\core\d3d12_async_descriptor.cppm" />
     <ClCompile Include="src\module\core\d3d12_async_fence.cppm" />
@@ -162,10 +249,21 @@
     <ClCompile Include="src\core\d3d12_surface.cpp" />
     <ClCompile Include="src\core\d3d12_async_descriptor.cpp" />
     <ClCompile Include="src\core\d3d12_async_fence.cpp" />
+    <ClCompile Include="src\advanced\d3d12_rtx_probe.cpp" />
+    <!-- P108：DLSS 超分实现单元。普通 TU（与 rtx_probe 同理）：只有它 #include
+         nvsdk_ngx*.h，设备模块永远不碰 NGX 类型，许可面因此收在一个文件里。 -->
+    <ClCompile Include="src\advanced\d3d12_dlss.cpp" />
     <ClCompile Include="src\advanced\d3d12_mesh_base.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include=".clang-format" />
+    <None Include=".gitattributes" />
+    <None Include=".gitignore" />
+    <None Include="AGENTS.MD" />
     <None Include="cpp.hint" />
+    <None Include="LICENSE" />
+    <None Include="MCDR.slnx" />
+    <None Include="README.md" />
     <None Include="vcpkg.json" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

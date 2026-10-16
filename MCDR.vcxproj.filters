@@ -42,6 +42,13 @@
   <ItemGroup>
     <None Include="cpp.hint" />
     <None Include="vcpkg.json" />
+    <None Include=".clang-format" />
+    <None Include=".gitattributes" />
+    <None Include=".gitignore" />
+    <None Include="AGENTS.MD" />
+    <None Include="LICENSE" />
+    <None Include="MCDR.slnx" />
+    <None Include="README.md" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\mcdr_abi.h">
@@ -50,10 +57,22 @@
     <ClInclude Include="include\_d3d12_module_prelude.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="include\mcdr_rtx_support.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="include\mcdr_smaa_luts.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="include\mcdr_dlss_impl.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\module\c_abi\mcdr_abi_common.cppm">
       <Filter>模块接口\C ABI</Filter>
+    </ClCompile>
+    <ClCompile Include="src\module\core\mcdr_error.cppm">
+      <Filter>模块接口\Core</Filter>
     </ClCompile>
     <ClCompile Include="src\module\core\d3d12_descriptor_allocator.cppm">
       <Filter>模块接口\Core</Filter>
@@ -121,8 +140,17 @@
     <ClCompile Include="src\core\d3d12_async_fence.cpp">
       <Filter>源文件\Core</Filter>
     </ClCompile>
+    <ClCompile Include="src\advanced\d3d12_rtx_probe.cpp">
+      <Filter>源文件\Core</Filter>
+    </ClCompile>
     <ClCompile Include="src\advanced\d3d12_mesh_base.cpp">
       <Filter>源文件\Advanced</Filter>
+    </ClCompile>
+    <ClCompile Include="src\advanced\smaa_luts.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\advanced\d3d12_dlss.cpp">
+      <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

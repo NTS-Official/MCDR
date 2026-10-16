@@ -11,9 +11,16 @@
 //   * 多个模块单元各自 #include 本文件不会产生 ODR 冲突（头文件有 include guard，
 //     且全局模块实体在所有 TU 中是同一实体）。
 //
-// 注意：这里必须保持为「头文件 + #include」，不要改成 import std;——项目内其余
-// 尚未迁移的 TU 仍在使用 #include <...>，同一个 TU 里混用 #include <vector> 与
-// import std; 是非法的。
+// 注意：这里必须保持为「头文件 + #include」，不要改成 import std;。
+// 原因有两条，第二条是硬约束：
+//   1. 项目内其余尚未迁移的 .cpp TU 仍在使用 #include <...>，同一个 TU 里混用
+//      #include <vector> 与 import std; 是非法组合（C2011 重定义 / C2953 /
+//      致命错误 C1116），所以必须整体迁移，不能逐个文件切。
+//   2. import std; 只能出现在「全局模块片段」之外的模块 purview 里。本文件的
+//      全部内容都在全局模块片段中（module; 之后、export module 之前），在那里
+//      写 import std; 会被判为「全局模块片段仅可包含预处理器指令」（C5202）。
+// 也就是说：本前置头与 import std; 在结构上互斥，与是否开启 ISO C++23 标准库
+// 模块无关。详见 known_bugs.md 的 B2/B3 两节（含实测边界与迁移清单）。
 
 // 禁用 Windows min/max 宏。必须位于任何 windows.h/d3d12.h 之前。
 // 项目已在 MCDR.vcxproj 全局定义 NOMINMAX，此处再守一道，使本文件脱离项目
@@ -47,6 +54,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <expected>  // mcdr::Result<T>（mcdr_error.cppm）；<string>/<utility> 见下方标准库段
 
 // ---------------------------------------------------------------------------
 // C++ 标准库

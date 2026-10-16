@@ -1,11 +1,13 @@
-
-
 // abi_device.cpp — device, resource and hidden-window entry points
 //
 // Group: device surface (originally abi_bridge.cpp).
 // 合并自：abi_bridge.cpp
 //
+module;
+
 #include "_d3d12_module_prelude.h"
+
+module mcdr.abi.common;
 
 #include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
@@ -15,7 +17,6 @@ import mcdr.d3d12.async_bundle;
 import mcdr.d3d12.async_descriptor;
 import mcdr.d3d12.async_executor;
 import mcdr.d3d12.async_fence;
-import mcdr.abi.common;
 
 using namespace d3d12_mc;
 
@@ -28,8 +29,6 @@ using namespace d3d12_mc;
 // ---------------------------------------------------------------------------
 // 来源单元：abi_bridge.cpp
 // ---------------------------------------------------------------------------
-
-
 
 // abi_device.cpp — device, resource and hidden-window entry points.（合并自 abi_bridge.cpp）
 //
@@ -53,9 +52,9 @@ extern "C" {
 int32_t MCDR_CALL mcdr_dx12CreateDevice(char* buf, int32_t cap) {
     using mcdr::abi::writeString;
 
-    std::string err;
-    if (!d3d12_mc::ensureDevice(err)) {
-        return writeString("ERROR: " + err, buf, cap);
+    const auto r = d3d12_mc::ensureDevice();
+    if (!r) {
+        return writeString("ERROR: " + r.error().message, buf, cap);
     }
 
     // P15: the log level used to be read here, inside dx12CreateDevice, via
@@ -80,43 +79,37 @@ int32_t MCDR_CALL mcdr_dx12CreateDevice(char* buf, int32_t cap) {
 
 mcdr_object* MCDR_CALL mcdr_dx12CreateTexture(int32_t usage, int32_t format, int32_t width, int32_t height,
                                               int32_t depthOrLayers, int32_t mipLevels) {
-    std::string err;
-    d3d12_mc::Dx12Object* obj =
-        d3d12_mc::createTexture(usage, format, width, height, depthOrLayers, mipLevels, err);
-    if (!obj) {
-        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateTexture", err);
+    const auto r = d3d12_mc::createTexture(usage, format, width, height, depthOrLayers, mipLevels);
+    if (!r) {
+        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateTexture", r.error().message);
     }
-    return obj;
+    return static_cast<d3d12_mc::Dx12Object*>(*r);
 }
 
 mcdr_object* MCDR_CALL mcdr_dx12CreateBuffer(int32_t usage, int64_t size) {
-    std::string err;
-    d3d12_mc::Dx12Object* obj = d3d12_mc::createBuffer(usage, size, err);
-    if (!obj) {
-        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateBuffer", err);
+    const auto r = d3d12_mc::createBuffer(usage, size);
+    if (!r) {
+        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateBuffer", r.error().message);
     }
-    return obj;
+    return static_cast<d3d12_mc::Dx12Object*>(*r);
 }
 
 mcdr_object* MCDR_CALL mcdr_dx12CreateSampler(int32_t addressU, int32_t addressV, int32_t minFilter,
                                               int32_t magFilter, int32_t maxAnisotropy, float maxLod) {
-    std::string err;
-    d3d12_mc::Dx12Object* obj =
-        d3d12_mc::createSampler(addressU, addressV, minFilter, magFilter, maxAnisotropy, maxLod, err);
-    if (!obj) {
-        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateSampler", err);
+    const auto r = d3d12_mc::createSampler(addressU, addressV, minFilter, magFilter, maxAnisotropy, maxLod);
+    if (!r) {
+        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateSampler", r.error().message);
     }
-    return obj;
+    return static_cast<d3d12_mc::Dx12Object*>(*r);
 }
 
 mcdr_object* MCDR_CALL mcdr_dx12CreateTextureView(mcdr_object* texture, int32_t baseMipLevel,
                                                   int32_t mipLevels) {
-    std::string err;
-    d3d12_mc::Dx12Object* obj = d3d12_mc::createTextureView(texture, baseMipLevel, mipLevels, err);
-    if (!obj) {
-        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateTextureView", err);
+    const auto r = d3d12_mc::createTextureView(texture, baseMipLevel, mipLevels);
+    if (!r) {
+        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateTextureView", r.error().message);
     }
-    return obj;
+    return static_cast<d3d12_mc::Dx12Object*>(*r);
 }
 
 void MCDR_CALL mcdr_dx12DestroyResource(mcdr_object* object) { d3d12_mc::destroyObject(object); }
@@ -128,16 +121,15 @@ void* MCDR_CALL mcdr_dx12MapBuffer(mcdr_object* buffer, int64_t offset, int64_t 
     if (outLength) {
         *outLength = 0;
     }
-    std::string err;
-    void* ptr = d3d12_mc::mapBuffer(buffer, offset, length, read != 0, write != 0, err);
-    if (!ptr) {
-        mcdr::abi::failVoid("mcdr_dx12MapBuffer", err);
+    const auto r = d3d12_mc::mapBuffer(buffer, offset, length, read != 0, write != 0);
+    if (!r) {
+        mcdr::abi::failVoid("mcdr_dx12MapBuffer", r.error().message);
         return nullptr;
     }
     if (outLength) {
         *outLength = length;
     }
-    return ptr;
+    return *r;
 }
 
 void MCDR_CALL mcdr_dx12UnmapBuffer(mcdr_object* buffer) { d3d12_mc::unmapBuffer(buffer); }

@@ -1,11 +1,13 @@
-
-
 // abi_surface.cpp — DXGI swapchain surface: create/configure/acquire/blit/present, back-buffer handles, pixel readback
 //
 // Group: DXGI surface (originally abi_bridge_p5.cpp).
 // 合并自：abi_bridge_p5.cpp
 //
+module;
+
 #include "_d3d12_module_prelude.h"
+
+module mcdr.abi.common;
 
 #include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
@@ -15,7 +17,8 @@ import mcdr.d3d12.async_bundle;
 import mcdr.d3d12.async_descriptor;
 import mcdr.d3d12.async_executor;
 import mcdr.d3d12.async_fence;
-import mcdr.abi.common;
+// mcdr.error 是叶子模块，不 import 就取不到 mcdr::Error（import 不传递）。
+import mcdr.error;
 
 using namespace d3d12_mc;
 
@@ -28,8 +31,6 @@ using namespace d3d12_mc;
 // ---------------------------------------------------------------------------
 // 来源单元：abi_bridge_p5.cpp
 // ---------------------------------------------------------------------------
-
-
 
 // abi_surface.cpp — DXGI swapchain surface entry points.（合并自 abi_bridge_p5.cpp）
 //
@@ -47,9 +48,18 @@ using namespace d3d12_mc;
 //     array; the diagnostic stderr lines the source project relied on are kept
 //     verbatim so existing log captures still work.
 
-
-
 namespace {
+
+// 把被调方的 Result 失败原因折进本函数的纯文本诊断串（不带 "where: " 前缀，
+// 下游 failWith 自己补前缀），成功则原样继续。readbackSamples36 的 err 出参
+// 保持纯文本，是为了不改变这些既有诊断字符串的内容。
+int32_t bindErr(const mcdr::Result<void>& r, std::string& err) {
+    if (!r) {
+        err = r.error().message;
+        return 0;
+    }
+    return 1;
+}
 
 // Reads a 3x3 sample grid out of `res` and writes 9 pixels x RGBA as 36 ints.
 // Values are the raw bytes (0-255), not normalised — matching the original.
@@ -64,7 +74,7 @@ int32_t readbackSamples36(ID3D12Resource* res, UINT w, UINT h, UINT bpp, DXGI_FO
         err = "bad dimensions";
         return 0;
     }
-    if (!deviceWaitIdle(err)) {
+    if (const auto r = deviceWaitIdle(); !bindErr(r, err)) {
         return 0;
     }
 
@@ -138,7 +148,7 @@ int32_t readbackSamples36(ID3D12Resource* res, UINT w, UINT h, UINT bpp, DXGI_FO
     ctx.queue->ExecuteCommandLists(1, lists);
     const UINT64 fv = ++ctx.queueFenceValue;
     ctx.queue->Signal(ctx.queueFence.Get(), fv);
-    if (!waitForQueueFenceValue(fv, 5'000'000'000ULL, err)) {
+    if (const auto r = waitForQueueFenceValue(fv, 5'000'000'000ULL); !bindErr(r, err)) {
         return 0;
     }
 
@@ -169,14 +179,13 @@ int32_t readbackSamples36(ID3D12Resource* res, UINT w, UINT h, UINT bpp, DXGI_FO
 extern "C" {
 
 mcdr_surface* MCDR_CALL mcdr_dx12CreateSurface(uint64_t hwnd) {
-    std::fprintf(stderr, "[dx12] dx12CreateSurface: hwnd=0x%llx (long=%lld)\n",
-                 static_cast<unsigned long long>(hwnd), static_cast<long long>(hwnd));
-    std::string err;
-    Dx12Surface* s = createSurface(static_cast<uintptr_t>(hwnd), err);
-    if (!s) {
-        return mcdr::abi::failWithPtr<Dx12Surface>("mcdr_dx12CreateSurface", err);
+    dbgLogDebug("dx12CreateSurface: hwnd=0x%llx (long=%lld)", static_cast<unsigned long long>(hwnd),
+                static_cast<long long>(hwnd));
+    const auto r = createSurface(static_cast<uintptr_t>(hwnd));
+    if (!r) {
+        return mcdr::abi::failWithPtr<Dx12Surface>("mcdr_dx12CreateSurface", r.error().message);
     }
-    return s;
+    return static_cast<Dx12Surface*>(*r);
 }
 
 int32_t MCDR_CALL mcdr_dx12SurfacePresentModes(int32_t* out, int32_t cap) {
@@ -195,22 +204,20 @@ int32_t MCDR_CALL mcdr_dx12SurfacePresentModes(int32_t* out, int32_t cap) {
 
 int32_t MCDR_CALL mcdr_dx12ConfigureSurface(mcdr_surface* surface, int32_t width, int32_t height,
                                             int32_t presentMode) {
-    std::string err;
-    if (!configureSurface(surface, width, height, presentMode, err)) {
+    if (const auto r = configureSurface(surface, width, height, presentMode); !r) {
         // A failed configure is exactly the surfaceIsInvalid -> frozen-picture
         // root cause, so it must reach dx12-native.log rather than only stderr.
-        d3d12_mc::dbgLog("dx12ConfigureSurface FAILED %dx%d mode=%d: %s", width, height, presentMode,
-                         err.c_str());
-        return mcdr::abi::failWith("mcdr_dx12ConfigureSurface", err);
+        d3d12_mc::dbgLogError("dx12ConfigureSurface FAILED %dx%d mode=%d: %s", width, height, presentMode,
+                         r.error().message.c_str());
+        return mcdr::abi::failWith("mcdr_dx12ConfigureSurface", r.error().message);
     }
     d3d12_mc::dbgLogInfo("dx12ConfigureSurface: ok %dx%d mode=%d", width, height, presentMode);
     return 1;
 }
 
 int32_t MCDR_CALL mcdr_dx12AcquireSurface(mcdr_surface* surface) {
-    std::string err;
-    if (!acquireSurface(surface, err)) {
-        return mcdr::abi::failWith("mcdr_dx12AcquireSurface", err);
+    if (const auto r = acquireSurface(surface); !r) {
+        return mcdr::abi::failWith("mcdr_dx12AcquireSurface", r.error().message);
     }
     // Once per frame: an unconditional stderr + file flush here was a real cost,
     // so it is DEBUG level (needs DX12_LOG_VERBOSE=1).
@@ -219,12 +226,23 @@ int32_t MCDR_CALL mcdr_dx12AcquireSurface(mcdr_surface* surface) {
 }
 
 void MCDR_CALL mcdr_dx12BlitSurface(mcdr_command_ctx* ctx, mcdr_surface* surface, mcdr_object* texture) {
-    std::string err;
-    if (!blitSurface(ctx, surface, texture, err)) {
-        mcdr::abi::failVoid("mcdr_dx12BlitSurface", err);
+    if (const auto r = blitSurface(ctx, surface, texture); !r) {
+        // P95 可观测性：blit 失败时 surface->blittedThisFrame 仍为 false，presentSurface()
+        // 会跳过这一帧的 Present（不会 flip 到未写入的 back buffer）。failVoid 只把原因写进
+        // lastError / [mcdr] sink，这里额外按次数在 [dx12] sink 打点，便于把"跳帧"与
+        // "blit 失败"在日志里对上（两个 sink 分开写，只 grep 一个会得到"没有错误"的假象）。
+        static unsigned long long blitFailures = 0;
+        ++blitFailures;
+        mcdr::abi::failVoid("mcdr_dx12BlitSurface", r.error().message);
+        if (blitFailures <= 5 || blitFailures % 60 == 0) {
+            d3d12_mc::dbgLogWarn(
+                "dx12BlitSurface: failure #%llu — present will be skipped for this frame",
+                blitFailures);
+        }
         return;
     }
-    d3d12_mc::dbgLogInfo("blitSurface: ok ctx=%p surface=%p texture=%p", static_cast<void*>(ctx),
+    // 每帧成功路径：级别降到 debug（INFO 下曾占 16k 行/45s）。
+    d3d12_mc::dbgLogDebug("blitSurface: ok ctx=%p surface=%p texture=%p", static_cast<void*>(ctx),
                          static_cast<void*>(surface), static_cast<void*>(texture));
 }
 
@@ -311,10 +329,10 @@ int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixels(mcdr_object* texture, int32_t* 
     }
     // Grid index of the centre sample is (yi=1, xi=1) -> element offset (1*3+1)*4 = 16.
     constexpr int kCenter = (1 * 3 + 1) * 4;
-    std::fprintf(stderr, "[dx12-java] rbTex %ux%u center=(%d,%d) RGBA=(%d,%d,%d,%d) black=%d\n", w, h,
-                 static_cast<int>(w) / 2, static_cast<int>(h) / 2, out[kCenter + 0], out[kCenter + 1],
-                 out[kCenter + 2], out[kCenter + 3],
-                 (out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0) ? 1 : 0);
+    dbgLogInfo("[dx12-java] rbTex %ux%u center=(%d,%d) RGBA=(%d,%d,%d,%d) black=%d", w, h,
+               static_cast<int>(w) / 2, static_cast<int>(h) / 2, out[kCenter + 0], out[kCenter + 1],
+               out[kCenter + 2], out[kCenter + 3],
+               (out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0) ? 1 : 0);
     return 1;
 }
 
@@ -364,18 +382,18 @@ int32_t MCDR_CALL mcdr_dx12ReadbackSurfacePixels(mcdr_surface* surface, int32_t*
     const D3D12_RESOURCE_DESC bd = bb->GetDesc();
     const UINT w = static_cast<UINT>(bd.Width);
     const UINT h = bd.Height;
-    std::fprintf(stderr, "[dx12] readback surf=0x%p idx=%d w=%u h=%u\n", static_cast<void*>(s), idx, w, h);
+    dbgLogDebug("readback surf=0x%p idx=%d w=%u h=%u", static_cast<void*>(s), idx, w, h);
     std::string err;
     // The back buffer is always R8G8B8A8_UNORM, and after the copy it must go back
     // to PRESENT (not COMMON) or the next Present fails.
     if (!readbackSamples36(bb, w, h, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, out, err)) {
         return mcdr::abi::failWith("mcdr_dx12ReadbackSurfacePixels", err);
     }
-    std::fprintf(stderr, "[dx12-java] readback %ux%u center=(%d,%d)=(%d,%d,%d,%d) corners=%d black=%d\n", w,
-                 h, static_cast<int>(w) / 2, static_cast<int>(h) / 2, out[(4 * 3 + 4) + 0],
-                 out[(4 * 3 + 4) + 1], out[(4 * 3 + 4) + 2], out[(4 * 3 + 4) + 3],
-                 (out[0] != 0 || out[1] != 0 || out[2] != 0) ? 1 : 0,
-                 (out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0) ? 1 : 0);
+    dbgLogInfo("[dx12-java] readback %ux%u center=(%d,%d)=(%d,%d,%d,%d) corners=%d black=%d", w,
+               h, static_cast<int>(w) / 2, static_cast<int>(h) / 2, out[(4 * 3 + 4) + 0],
+               out[(4 * 3 + 4) + 1], out[(4 * 3 + 4) + 2], out[(4 * 3 + 4) + 3],
+               (out[0] != 0 || out[1] != 0 || out[2] != 0) ? 1 : 0,
+               (out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0) ? 1 : 0);
     return 1;
 }
 

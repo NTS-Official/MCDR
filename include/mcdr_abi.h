@@ -47,7 +47,15 @@ extern "C" {
 
 // Bumped whenever ANY struct layout or signature below changes. The Java side
 // asserts equality at load time and aborts backend creation on mismatch.
-#define MCDR_ABI_VERSION 1u
+//
+// P108 待办（这一版**故意仍为 1**，因为下面这组改动全是「只增不改」的追加项，而
+// Kotlin 侧当前正被包重构重写，此刻把这里改成 2 会让 MCDR_ABI.kt 的
+// `version != MCDR_ABI_VERSION` 断言在设备创建时硬失败）：
+//   1. MCDR_ABI.kt 补上 mcdr_dx12CreateDlssFeature / mcdr_dx12EvaluateDlss /
+//      mcdr_dx12QueryDlss 三个 FFM 绑定（签名见 mcdr_abi.h 与 P108 报告）；
+//   2. MCDR_Layout.kt 登记 MCDR_DLSS_INPUT 并加 EXPECTED_C_SIZES 行（C sizeof = 112）；
+//   3. 完成 1、2 之后把这里改成 2u，并同步 MCDR_ABI.kt 的 MCDR_ABI_VERSION = 2。
+#define MCDR_ABI_VERSION 2u
 
 // The same value at runtime, so a stale Java-side constant cannot be optimised
 // away and a mismatched pair fails at load time rather than at first draw.
@@ -260,6 +268,226 @@ MCDR_API int32_t MCDR_CALL mcdrLastError(char* buf, int32_t cap);
 // Verbosity for the native log, mirroring DX12_LOG_VERBOSE.
 MCDR_API void MCDR_CALL mcdrSetLogVerbose(int32_t enabled);
 
+// Native log level: 0=error, 1=warning, 2=info, 3=debug.
+MCDR_API void MCDR_CALL mcdrSetLogLevel(int32_t level);
+
+// PIX GPU capture: load Microsoft PIX's capture layer (WinPixGpuCapturer.dll) into
+// this process. The layer hooks D3D12, so it has to be in place BEFORE the first
+// device is created — the mod calls this as soon as its config is read, and the
+// device-creation paths retry lazily. Irreversible for the life of the process.
+// Returns 1 when the layer is loaded, 0 when capture was not requested, and -1 when
+// it was requested but the DLL could not be found or loaded (an ERROR line lists the
+// paths that were searched). Idempotent.
+MCDR_API int32_t MCDR_CALL mcdrSetPixCapture(int32_t enabled);
+
+// Variable-rate shading: the shading-rate control point. `rate` is a raw
+// D3D12_SHADING_RATE value (1X1=0x0, 1X2=0x1, 2X1=0x4, 2X2=0x5, 2X4=0x6, 4X2=0x9,
+// 4X4=0xA) and applies to every graphics command list the renderer starts from then
+// on; -1 turns the control off, which means no RSSetShadingRate call is made at all
+// and the device keeps its default 1X1 rate. Only the per-draw rate exists so far —
+// a shading-rate image (tier 2) and per-pass policies hang off this same point later.
+// Returns 1 when accepted, 0 when the device cannot honour it (no variable-rate
+// shading at all, or 2X4/4X2/4X4 without AdditionalShadingRatesSupported — only
+// answerable once the device exists), and -1 for an unknown rate value. A request
+// that arrives before the device is created (the usual case: the mod pushes it as
+// soon as it reads its config) is accepted and gated later, on the first command
+// list, with a WARN naming the reason.
+MCDR_API int32_t MCDR_CALL mcdrSetShadingRate(int32_t rate);
+
+// Anti-aliasing mode, same numbering as the Java-side option
+// (**0=OFF, 1=SMAA, 2=TAA, 3=DLAA**). SMAA runs as three full-screen passes
+// (edge detection, blend weights, neighbourhood blending) over the world layer, right
+// after the world has rendered and before the GUI is drawn — see
+// mcdr_dx12ApplySmaaToTexture, which the Java side calls at exactly that point. Applying
+// it to the composed frame instead (at the final blit) also softened the GUI.
+// TAA/DLAA are accepted but treated as OFF (a WARN names them).
+//
+// P108 (user m10920): DLSS is **no longer** a value of this option. Upscaling and
+// anti-aliasing are separate concerns, so DLSS got its own switch — see
+// mcdr_dx12SetDlssEnabled and mcdr_dx12EvaluateDlss. The two are now INDEPENDENT: with both
+// on, SMAA's three passes run first on the low-resolution world layer and DLSS then
+// upscales that result into the window-sized target.
+//
+// No restart is needed — a mode change takes effect on the next frame. Returns 1 when the
+// mode is in effect, 0 when it was accepted but not implemented (TAA/DLAA), and -1 for an
+// unknown mode.
+MCDR_API int32_t MCDR_CALL mcdrSetAntiAliasing(int32_t mode);
+
+// P108 (user m10920): DLSS upscaling on/off, independent of the anti-aliasing mode and of
+// mcdr_dx12SetDlssVendorDir. The Java side owns this as its own option (`dxrMcDlss`, a
+// button under the "Illusion settings" section), NOT as a value of `dxrMcAaMode`.
+//
+// Semantics: 1 enables, 0 disables. Idempotent and callable before the device exists (the
+// state is only recorded; the NGX runtime is not touched here). Returns 1 when DLSS is
+// enabled afterwards and 0 when it is disabled afterwards, so the caller can echo the
+// resulting state. The availability of the feature itself is reported separately by
+// mcdr_dx12QueryDlss, and a missing / older DLL simply keeps this switch inert.
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssEnabled(int32_t enabled);
+
+// P108: snapshot the world depth into a private D32 texture for DLSS. The Java side calls this
+// from exactly the point in the frame where the depth buffer still holds this frame's world
+// depth — alongside the motion-vector capture, BEFORE vanilla's `clearDepthTexture`
+// (GameRenderer.render) wipes it to 0.0 (reverse-Z "far").
+//
+// Why: DLSS is evaluated after the world is drawn but before the GUI, and by then the live depth
+// is already cleared. Handing that cleared depth to NGX makes the depth term a constant, so
+// DLSS's depth-aware upscaling degenerates into a colour-only one. With a snapshot present,
+// mcdr_dx12EvaluateDlss feeds the snapshot to NGX instead of the caller's depth.
+//
+// The state of `depth` is restored to whatever it was on entry (the device module tracks
+// per-resource state), so the caller's world-render state machine is not disturbed.
+//
+// Returns 1 = snapshot taken/reused, 0 = unusable arguments (evaluation keeps working with the
+// caller-supplied depth), -1 = creation/copy failed (one WARN, caller's depth used instead).
+// Never fails the frame.
+MCDR_API int32_t MCDR_CALL mcdr_dx12SnapshotDlssDepth(mcdr_command_ctx* ctx, mcdr_object* depth);
+
+// P108 (user m11147): the DLSS quality tier, as its own button instead of something MCDR derives
+// from the render:target ratio.
+//   tier: 0 = Performance, 1 = Balanced, 2 = Quality (same order as the Java enum).
+// Out-of-range is rejected with -1 and changes nothing; otherwise the normalised tier is
+// returned. Idempotent, and callable before the device exists (like the other DLSS options, only
+// the state is recorded).
+//
+// A change REBUILDS the DLSS feature even when the render/target sizes are unchanged, because
+// NVSDK_NGX_PerfQuality_Value is an input to CreateFeature, not an Evaluate parameter. The default
+// is 2 (Quality), which is what the previous ratio-based selection picked on the 640x360 -> 854x480
+// configuration, so behaviour is unchanged until the Java side sets a tier.
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssQuality(int32_t tier);
+
+// ---------------------------------------------------------------------------
+// P108: DLSS super-resolution (NVSDK_NGX). Data plane + the real NGX evaluate call.
+//
+// Everything the per-frame Evaluate needs arrives in ONE struct so that the Java side
+// has a single "per-frame parameter package" to fill in and one call to make. Only two
+// entry points cross the boundary: mcdr_dx12CreateDlssFeature (once per render/target
+// size) and mcdr_dx12EvaluateDlss (once per frame). Both are no-ops when the
+// anti-aliasing mode is not 4.
+//
+// What MCDR does NOT have, and therefore what is deliberately left at 0 here:
+//   * a transparency / reactive mask (Minecraft has no per-pixel "this is a moving
+//     transparent object" pass) — pInTransparencyMask stays NULL;
+//   * a GPU auto-exposure texture (vanilla tone-maps in the shader and never writes an
+//     exposure buffer) — exposureMode stays MCDR_DLSS_EXPOSURE_NONE, so DLSS is told to
+//     use the constant exposureScale below instead of sampling one;
+//   * per-object motion vectors. The velocity pass reprojects the camera only, so moving
+//     entities get no velocity and ghost slightly. That is a known, accepted limitation
+//     of the current data plane (see planned_implementations.md), not a bug in this call.
+//
+// Depth convention (verified against the live code, see the P108 report):
+// Minecraft 26.x is REVERSE-Z — net.minecraft.client.renderer.Projection.java:70-74 swaps
+// near/far before building the matrix, CompareOp.GREATER_THAN_OR_EQUAL is the depth func
+// everywhere (RenderPipelines.java), and the depth buffer is cleared to 0.0 (far) in
+// GameRenderer.java:443/578. So depthInverted must be true.
+// ---------------------------------------------------------------------------
+
+// How the constant exposure value below is interpreted.
+#define MCDR_DLSS_EXPOSURE_NONE 0u   // pure constant: exposureScale is the pre-exposure
+#define MCDR_DLSS_EXPOSURE_AUTO 1u   // reserved: a GPU exposure texture (not available yet)
+
+// Everything one DLSS Evaluate needs. Field names that start with pIn* are opaque
+// mcdr_object* texture handles; every other field is a plain value. All comments live to
+// the right of their field so the struct body stays one clean "type name;" per line.
+//
+// LAYOUT — verified with the real toolchain (cl 19.51 / v145, x64, /std:c++latest):
+//   sizeof = 112, alignment = 8, offsets: renderWidth 0, renderHeight 4, targetWidth 8,
+//   targetHeight 12, jitterOffsetX 16, jitterOffsetY 20, mvScaleX 24, mvScaleY 28,
+//   preExposure 32, exposureScale 36, exposureMode 40, alphaUpscaling 44, nearZ 48,
+//   farZ 52, depthInverted 56, reset 60, depthFormatOrdinal 64, _pad0 68, pInColor 72,
+//   pInDepth 80, pInMotionVectors 88, pInOutput 96, _pad1 104, _pad2 108.
+// _pad0 covers the four bytes the compiler would otherwise insert silently between
+// depthFormatOrdinal and the first pointer; _pad1 keeps the total a multiple of 8. Both
+// are named fields on purpose: MCDR_Layout.kt mirrors them, and abi_check.py only sees
+// named fields (MemoryLayout.structLayout inserts no padding of its own).
+typedef struct mcdr_dlss_input {
+    // --- identity / geometry of this frame ---
+    int32_t renderWidth;   // INPUT size, px = window * dxrMcRenderScale (the DLSS render size)
+    int32_t renderHeight;  // INPUT size, px
+    int32_t targetWidth;   // OUTPUT size, px = window size = GUI target = swapchain (DLSS target size)
+    int32_t targetHeight;  // OUTPUT size, px
+    // Jitter in pixels, RENDER space, not normalised and NOT negated. Source: the
+    // Halton(2,3) sequence in D3D12Temporal.kt (jitter() returns [-0.5,+0.5) pixels).
+    float jitterOffsetX;
+    float jitterOffsetY;
+    // Motion-vector scale: multiplies the raw MV texture to get pixel-space motion.
+    // D3D12Velocity.kt already writes (uv - prevUv) * ScreenSize, i.e. pixels -> 1.0/1.0.
+    float mvScaleX;
+    float mvScaleY;
+    // Pre-exposure: scales the rendering before it reaches DLSS. With a constant exposure
+    // the convention is 1.0 = "already in display units", so keep 1.0.
+    float preExposure;
+    // Constant exposure scale, only read when exposureMode == MCDR_DLSS_EXPOSURE_NONE.
+    // 1.0 means "the colour buffer is already exposed correctly".
+    float exposureScale;
+    uint32_t exposureMode;     // MCDR_DLSS_EXPOSURE_NONE (0) or _AUTO (1, reserved)
+    uint32_t alphaUpscaling;   // 1 = upscale alpha too. False for the Minecraft world layer.
+    // Markers (diagnostics only — the native side decides the real numbers, but the JVM
+    // has the authoritative values, so they are reported back and cross-checked).
+    float nearZ;               // camera near plane, from Projection.zNear()
+    float farZ;                // camera far plane, from Projection.zFar()
+    uint32_t depthInverted;    // 1 = reverse-Z (this renderer). Must stay 1.
+    uint32_t reset;            // 1 = drop history this frame (first frame, resize, world switch)
+    int32_t depthFormatOrdinal;  // GpuFormat ordinal of the depth attachment (diagnostics)
+    int32_t _pad0;
+    // --- the textures ---
+    mcdr_object* pInColor;          // world layer, render size, colour (SRGB or UNORM)
+    mcdr_object* pInDepth;          // main render target depth, render size, D32_FLOAT
+    mcdr_object* pInMotionVectors;  // D3D12Velocity.kt output, render size, RG16_FLOAT
+    mcdr_object* pInOutput;         // target-size colour target (the GUI's own target)
+    int32_t _pad1;
+    int32_t _pad2;   // trailing padding: keeps sizeof a multiple of the 8-byte alignment
+} mcdr_dlss_input;
+
+// Creates (or recreates, after a size change) the DLSS feature on the currently open
+// command list. Call it once per (renderWidth, renderHeight, targetWidth, targetHeight)
+// tuple, before the first mcdr_dx12EvaluateDlss for that tuple; the Java side can simply
+// call it every frame and let the native side decide whether the descriptor really
+// changed. On any failure this logs ONE warning naming the stage and the NGX result, and
+// then returns 0 for the rest of the process — the caller keeps the existing path (linear
+// blit) and must not retry. Returns 1 when a feature handle is ready.
+MCDR_API int32_t MCDR_CALL mcdr_dx12CreateDlssFeature(mcdr_command_ctx* ctx,
+                                                      const mcdr_dlss_input* in);
+
+// Runs one DLSS Evaluate. Requires an open command list; the Java side calls it after the
+// world has rendered and before the GUI, exactly where mcdr_dx12ApplySmaaToTexture used to
+// be called (the two are mutually exclusive — see the anti-aliasing mode note above).
+// Returns 1 when the evaluate really ran, 0 when it was skipped (mode != DLSS, a size
+// changed without a successful create, or a previous failure disabled DLSS), -1 on
+// invalid arguments. Never blocks, never fails the frame: a failure disables DLSS for the
+// rest of the process after one WARN.
+MCDR_API int32_t MCDR_CALL mcdr_dx12EvaluateDlss(mcdr_command_ctx* ctx,
+                                                 const mcdr_dlss_input* in);
+
+// One-line DLSS availability/state query for the UI and the log. `note` receives a
+// NUL-terminated human-readable status (the reason when DLSS cannot run); NULL is fine.
+// Return value:
+//    1  DLSS can run: the NGX runtime is present, the adapter supports super sampling,
+//       NGX is initialised and an optimal-setting query succeeded
+//    0  not available (or no device yet); `note` says why
+//   -1  invalid arguments
+// Side-effect free apart from a one-time NGX init on first use; safe to call before the
+// device exists (returns 0 with "device not created").
+MCDR_API int32_t MCDR_CALL mcdr_dx12QueryDlss(char* note, int32_t noteCap);
+
+// P108: tell the native layer WHERE the vendor runtime DLLs live, as a UTF-8 absolute
+// directory. The Java side calls this once, early, with `<user.dir>\dxrmc\` — the very
+// directory it extracted MCDR.dll and the vendor DLLs into — because that directory is
+// NOT on the default DLL search path: the process working directory is the game directory
+// while the executable is the JDK's java.exe, so neither the bare-name lookup nor the
+// "next to the executable" lookup can find nvngx_dlss.dll. The native side then widens the
+// process DLL search path (SetDefaultDllDirectories + SetDllDirectoryW + AddDllDirectory)
+// before it loads the NGX runtime, and logs each of those results as a P108 line.
+//
+// This is the fix for the observed `ngx=no` / `ERROR_MOD_NOT_FOUND` report: the runtime
+// DLL is shipped (external\dlss\bin\x64\nvngx_dlss.dll, staged into run\dxrmc\ by
+// gradlew copyVendorDlls) and imports only system DLLs, so the failure was the search
+// path, not a missing file or a missing redistribution dependency (NGX's core nvngx.dll
+// is a driver component and is deliberately NOT shipped).
+//
+// Idempotent; safe before the device exists. Returns 1 when the directory was accepted and
+// the search path widened, 0 when the input was rejected or empty.
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssVendorDir(const char* utf8Dir);
+
 // ---------------------------------------------------------------------------
 // Device and resources  (was jni_bridge.cpp — 13 exports)
 // ---------------------------------------------------------------------------
@@ -378,6 +606,24 @@ MCDR_API void MCDR_CALL mcdr_dx12ClearDepthTextureRegion(mcdr_command_ctx* ctx, 
 // Clears only the stencil plane to `value`; the depth plane is untouched.
 MCDR_API int32_t MCDR_CALL mcdr_dx12ClearStencilTexture(mcdr_command_ctx* ctx, mcdr_object* texture,
                                                         int32_t value);
+
+// P104b: apply SMAA to `texture` in place, on the open command list. Three full-screen
+// passes (edge detection, blend weights, neighbourhood blending) run over the texture,
+// then the result is copied back into it and the texture is left in RENDER_TARGET so a
+// render pass can still use it as an attachment. Call it once the world has finished
+// rendering and before the GUI is drawn — that keeps the anti-aliasing on the world layer
+// and leaves UI text and panels sharp (running it on the final blit softened the GUI too).
+// No-op when the anti-aliasing mode is not SMAA; a failure disables SMAA and logs an ERROR.
+// Returns 1 when the three passes really ran this frame, 0 when they were skipped (mode is not
+// SMAA, the texture is not a single-sampled 2D texture, or an earlier failure disabled SMAA).
+MCDR_API int32_t MCDR_CALL mcdr_dx12ApplySmaaToTexture(mcdr_command_ctx* ctx, mcdr_object* texture);
+
+// P106: draw `src` onto `dst` (a full-screen triangle with a linear sampler, so the two may
+// differ in size) and leave `dst` in RENDER_TARGET. The GUI's own window-sized target uses
+// this to take over the world layer, which lives in a scaled main render target whenever
+// renderScale is not 100%. A 1:1 copyTextureToTexture cannot do it: the scale factor is not 1.
+MCDR_API int32_t MCDR_CALL mcdr_dx12BlitTextureToTexture(mcdr_command_ctx* ctx, mcdr_object* src,
+                                                         mcdr_object* dst);
 
 // `colorTextures` may contain NULL entries (unused attachments); they are
 // skipped. `colorMips` is the per-attachment RTV mip slice. `colorClearFlags`
