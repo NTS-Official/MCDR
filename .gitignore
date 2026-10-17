@@ -41,7 +41,15 @@
 /build
 /target
 /vcpkg_installed
-/external/xess
-/external/fidelityfx
-/external/dlss
-/external/nrd
+
+# 运行时 DLL 统一放 lib\（用户指定：运行时 dll 单独放 lib，git 不记录 lib\）
+/lib/
+
+# 子模块里的生成物：NRD 的静态库由 build-nrd.ps1 现场编译，Lib/_Bin/_build 都是产物
+/external/nrd/Lib/
+/external/nrd/_Bin/
+/external/nrd/_build/
+
+# FidelityFX 的 include/lib 由 scripts\sync-external.ps1 从子模块 Kits/FidelityFX/ 同步而来（派生目录）
+/external/fidelityfx/include/
+/external/fidelityfx/lib/

@@ -101,7 +101,7 @@
            blocks below); XeSS and FidelityFX are loaded at runtime, so their
            headers are on the include path but their .lib files are deliberately
            NOT in AdditionalDependencies. -->
-      <AdditionalIncludeDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\fidelityfx\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\fidelityfx\include;$(ProjectDir)external\streamline\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <!-- These sources have Chinese comments; without /utf-8 the compiler
            reads them under the active code page and mangles them. -->
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -185,15 +185,15 @@
        ========================================================================== -->
   <ItemDefinitionGroup Condition="'$(Platform)'=='x64' And '$(Configuration)'!='Debug'">
     <Link>
-      <AdditionalLibraryDirectories>$(ProjectDir)external\dlss\lib\x64;$(ProjectDir)external\nrd\Lib\x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>nvsdk_ngx_d.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)lib\streamline\lib\x64;$(ProjectDir)external\dlss\lib\Windows_x86_64\x64;$(ProjectDir)external\nrd\Lib\x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>sl.interposer.lib;nvsdk_ngx_d.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Platform)'=='x64' And '$(Configuration)'=='Debug'">
     <Link>
-      <AdditionalLibraryDirectories>$(ProjectDir)external\dlss\lib\x64;$(ProjectDir)external\nrd\Lib\x64\Debug;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(ProjectDir)lib\streamline\lib\x64;$(ProjectDir)external\dlss\lib\Windows_x86_64\x64;$(ProjectDir)external\nrd\Lib\x64\Debug;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- _dbg variants: same API, built against the debug CRT (/MDd). -->
-      <AdditionalDependencies>nvsdk_ngx_d_dbg.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>sl.interposer.lib;nvsdk_ngx_d_dbg.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

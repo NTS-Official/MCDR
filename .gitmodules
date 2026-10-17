@@ -1,0 +1,15 @@
+[submodule "external/nrd"]
+	path = external/nrd
+	url = https://github.com/NVIDIA-RTX/NRD.git
+[submodule "external/xess"]
+	path = external/xess
+	url = https://github.com/intel/xess.git
+[submodule "external/dlss"]
+	path = external/dlss
+	url = https://github.com/NVIDIA/DLSS.git
+[submodule "external/fidelityfx"]
+	path = external/fidelityfx
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+[submodule "external/streamline"]
+	path = external/streamline
+	url = https://github.com/NVIDIA-RTX/Streamline.git
