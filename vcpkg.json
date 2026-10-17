@@ -1,3 +1,24 @@
-﻿{
-  "dependencies": []
+{
+  "dependencies": [
+    "directx-headers",
+    "directx12-agility",
+    {
+      "name": "directxtk12",
+      "default-features": false
+    },
+    "directx-dxc",
+    {
+      "name": "directxtex",
+      "default-features": false
+    },
+    "directxmesh",
+    "directxmath",
+    "shaderwriter",
+
+    "minizip",
+    "tinyexpr",
+    "llfio",
+    "nlohmann-json",
+    "zoe"
+  ]
 }
