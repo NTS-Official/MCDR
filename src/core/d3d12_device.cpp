@@ -29,6 +29,13 @@ module;
 // 再 include 一次（include guard 保证幂等）。
 #include "mcdr_dlss_impl.h"
 
+// JSON 一律用 vcpkg 里的 nlohmann/json（vcpkg.json 已声明 nlohmann-json）。手工拼字符串
+// 只要漏一处转义、少一个逗号或多一个引号就是非法 JSON，而解析方
+// （D3D12AdapterInfo.parseFlatObject）是宽松的平坦扫描器 —— 非法文本会被当合法值读走，
+// 错误完全不报。enumerateAdaptersJson 的 "vid":"0x… 就少了开引号，实测一年多没人发现。
+// 头必须留在全局模块片段里（模块 purview 内文本包含头文件 → C5244）。
+#include <nlohmann/json.hpp>
+
 module mcdr.d3d12.device;
 
 import mcdr.error;
@@ -129,6 +136,17 @@ UINT gNextSrv = 0;
 UINT gNextRtv = 0;
 UINT gNextFrameRtv = 0;
 UINT gNextDsv = 0;
+// P109（#538 根因修复）：帧级 RTV/DSV 描述符堆的游标是**设备级**的（一次只有一个），而
+// (资源, mip) -> 句柄缓存是**每个 CommandContext** 一份。任何 ctx 的 beginCommandList 都会把
+// 游标倒回 0，于是它之后创建的描述符会覆盖别的 ctx 缓存里仍然指向旧槽位的句柄 —— 缓存命中
+// 拿到的句柄已经指向**另一张资源**，pass 就把那张资源当成 RTV 绑上去。实机（p76btest，
+// DX12_DEBUG_LAYER=1）抓到的正是这一步：
+//   .850 passBind color0Res=0000029CA3141060 rtvHandle=000002BACECFE0E0（.839 为它 slot=0 创建）
+//   .859 passBind color0Res=0000029460399BF0 rtvHandle=000002BACECFE0E0（同一个句柄，另一张资源）
+// ⇒ #538「resource state 0xC0 invalid for use as a render target」。
+// 修法：给描述符堆一个**代**（generation）。游标每被倒回一次就 ++，缓存按代失效，
+// 句柄绝不会跨代复用。
+UINT gFrameViewGeneration = 1;
 UINT gNextSampler = 0;
 
 constexpr UINT kSrvHeapSize = 262144;
@@ -980,6 +998,19 @@ std::wstring sdkDxcDirectory() {
 
 // 搜索顺序：MCDR_DXC_DIR 环境变量 → MCDR.dll 同目录 → SDK 最新版本。
 std::wstring findDxcDirectory() {
+    // 实机验收开关：`MCDR_DXC_DISABLE=1` 时**三站全不查**，直接返回空目录。
+    //
+    // 为什么需要它：`MCDR_DXC_DIR` 只是**追加一个候选**，不是权威覆盖 —— 即便把它指向空目录，
+    // 模块目录与 Windows SDK 那两站照样能把 dxcompiler.dll 供上（实测：把 `run\dxrmc\` 里两个
+    // DLL 改名后，客户端仍从 `C:\Program Files (x86)\Windows Kits\10\bin\…\dxcompiler.dll`
+    // 拿到，`dxc=yes` 依旧）。系统目录不能改，所以"找不到 DXC ⇒ 回退 D3DCompile(SM5.1) 且不变砖"
+    // 这条路径只能靠一个显式开关来验证：把它整体短路掉，才谈得上"确实找不到"。
+    //
+    // 只认完全等于 "1" 的值；未设置、空串、其它值一律照旧 —— 验收专用，不是产品行为开关。
+    if (const wchar_t* off = _wgetenv(L"MCDR_DXC_DISABLE");
+        off != nullptr && off[0] == L'1' && off[1] == L'\0') {
+        return std::wstring();
+    }
     std::vector<std::wstring> candidates;
     if (const wchar_t* env = _wgetenv(L"MCDR_DXC_DIR")) {
         if (env[0] != L'\0') {
@@ -1163,6 +1194,13 @@ bool gDlssAvailabilityLogged = false;
 // 日志注入是不是已经做过（设备创建时做一次）。
 bool gDlssWired = false;
 
+// B4：DLSS 私有纹理的创建/销毁入口（参数见 mcdr_dlss_impl.h 的 DlssTextureDesc）。定义在
+// 本文件靠后的 DLSS 接线区（那里紧挨着读回路径），这里先声明是因为 wireDlssImpl() 现在就要
+// 把它们的地址注入实现单元。
+int32_t createDlssTexture(CommandContext* ctx, const DlssTextureDesc* desc, void** outObject,
+                          void** outResource);
+void destroyDlssTexture(CommandContext* ctx, void* object);
+
 void wireDlssImpl() {
     if (gDlssWired) {
         return;
@@ -1173,6 +1211,10 @@ void wireDlssImpl() {
     mcdr_dlss_install_log(reinterpret_cast<void*>(&d3d12_mc::dbgLogInfo),
                           reinterpret_cast<void*>(&d3d12_mc::dbgLogWarn),
                           reinterpret_cast<void*>(&d3d12_mc::dbgLogError));
+    // B4：私有纹理的创建/销毁也走注入 —— 实现单元不再自己 `CreateCommittedResource`，
+    // 于是它的资源从出生起就在本模块的跟踪表里（详见 mcdr_dlss_impl.h 那一段）。
+    mcdr_dlss_install_texture_ops(reinterpret_cast<void*>(&d3d12_mc::createDlssTexture),
+                                  reinterpret_cast<void*>(&d3d12_mc::destroyDlssTexture));
 }
 
 // 设备就绪后调用一次：注入日志、把厂商运行库目录登记进 DLL 搜索路径（见下）、把探测到的
@@ -1259,7 +1301,16 @@ void probeDxc(DeviceContext::Capabilities& caps) {
 #else
     const std::wstring dir = findDxcDirectory();
     if (dir.empty()) {
+        // 保留既有文案（其它调用方/工具会 grep 它），只在验收开关生效时额外说明**原因**：
+        // 正常机器上"找不到 dxcompiler.dll"与"我们主动短路了搜索链"是两件事，日志必须能区分，
+        // 否则这条回退路径的验收结论就成了空话。
         caps.dxcNote = "dxcompiler.dll not found (MCDR_DXC_DIR / MCDR.dll dir / Windows SDK)";
+        if (const wchar_t* off = _wgetenv(L"MCDR_DXC_DISABLE");
+            off != nullptr && off[0] == L'1' && off[1] == L'\0') {
+            dbgLogInfo("P66: DXC discovery was short-circuited by MCDR_DXC_DISABLE=1 — this is the "
+                       "acceptance switch for the \"no DXC, fall back to D3DCompile (SM5.1)\" path, "
+                       "not a missing-SDK condition");
+        }
         return;
     }
     const std::wstring dllPath = dir + L"\\dxcompiler.dll";
@@ -1348,6 +1399,13 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
         const std::wstring dir = findDxcDirectory();
         if (dir.empty()) {
             cached.note = "dxcompiler.dll not found (MCDR_DXC_DIR / MCDR.dll dir / Windows SDK)";
+            // 同 capa 探测那一处：验收开关生效时说明**原因**，否则"主动短路"与"真缺 SDK"
+            // 在日志里长得一样，回退路径就无法取证。
+            if (const wchar_t* off = _wgetenv(L"MCDR_DXC_DISABLE");
+                off != nullptr && off[0] == L'1' && off[1] == L'\0') {
+                dbgLogInfo("P66: DXC discovery was short-circuited by MCDR_DXC_DISABLE=1 (acceptance "
+                           "switch for the D3DCompile fallback path)");
+            }
         } else {
             const std::wstring dllPath = dir + L"\\dxcompiler.dll";
             // P99：记录 dxcompiler.dll 的大小+写入时间，作为 DXIL 缓存键的一部分。
@@ -1518,43 +1576,203 @@ std::string capabilitiesText(const DeviceContext::Capabilities& caps) {
     return text;
 }
 
-// 定义在文件后段（见 jsonEscape）：能力 JSON 里要带 DXC 的 Windows 路径，反斜杠必须转义。
-static std::string jsonEscape(const std::string& in);
+// 把 nlohmann 对象序列化成「字段串」：`{"a":1,"b":2}` → `"a":1,"b":2`。
+// 少数导出（能力字段、RTX 探测字段）要把自己的键并进调用方的大对象里，而不是再多一层
+// 嵌套对象 —— JVM 侧的平坦扫描器读不了嵌套。空对象返回空串，调用方据此跳过分隔逗号。
+static std::string jsonFieldsOf(const nlohmann::json& obj) {
+    std::string text = obj.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    if (text.size() < 2 || text.front() != '{' || text.back() != '}') {
+        return std::string();
+    }
+    text.erase(text.size() - 1);
+    text.erase(0, 1);
+    return text;
+}
+
+// 把一段字段串并到已经 dump 好的对象体末尾（`{...}` 的 `}` 之前）。字段串为空时什么都不做，
+// 避免拼出 `{,}` 这种非法 JSON。
+static void appendJsonFields(std::string& body, const std::string& fields) {
+    if (fields.empty() || body.size() < 2 || body.back() != '}') {
+        return;
+    }
+    body.insert(body.size() - 1, "," + fields);
+}
 
 // 注意：不含 feature_level / feature_level_value —— 适配器信息 JSON 里已经有这两个键了
 // （见 adapterInfoJson），同名键会让解析方拿到后者，所以这里只用 caps_* 语义的新键。
 std::string capabilitiesJson(const DeviceContext::Capabilities& caps) {
-    char buf[512] = {};
-    std::snprintf(buf, sizeof(buf),
-                  "\"shader_model\":\"%s\",\"shader_model_value\":%d,\"shader_model_effective\":\"%s\","
-                  "\"mesh_shader_tier\":%d,\"sampler_feedback_tier\":%d,"
-                  "\"raytracing_tier\":%d,\"shading_rate_tier\":%d,"
-                  "\"shading_rate_image_tile_size\":%u,\"additional_shading_rates\":%s,"
-                  "\"resource_binding_tier\":%d,"
-                  "\"enhanced_barriers\":%s,\"caps_queried\":%s",
-                  shaderModelName(caps.shaderModel), static_cast<int>(caps.shaderModel),
-                  shaderModelProfileSuffix(effectiveShaderModel(caps)),
-                  static_cast<int>(caps.meshShaderTier), static_cast<int>(caps.samplerFeedbackTier),
-                  static_cast<int>(caps.raytracingTier), static_cast<int>(caps.shadingRateTier),
-                  caps.shadingRateImageTileSize, caps.additionalShadingRates ? "true" : "false",
-                  static_cast<int>(caps.resourceBindingTier),
-                  caps.enhancedBarriers ? "true" : "false", caps.queried ? "true" : "false");
-    std::string json(buf);
+    nlohmann::json j;
+    j["shader_model"] = shaderModelName(caps.shaderModel);
+    j["shader_model_value"] = static_cast<int>(caps.shaderModel);
+    j["shader_model_effective"] = shaderModelProfileSuffix(effectiveShaderModel(caps));
+    j["mesh_shader_tier"] = static_cast<int>(caps.meshShaderTier);
+    j["sampler_feedback_tier"] = static_cast<int>(caps.samplerFeedbackTier);
+    j["raytracing_tier"] = static_cast<int>(caps.raytracingTier);
+    j["shading_rate_tier"] = static_cast<int>(caps.shadingRateTier);
+    j["shading_rate_image_tile_size"] = caps.shadingRateImageTileSize;
+    j["additional_shading_rates"] = caps.additionalShadingRates;
+    j["resource_binding_tier"] = static_cast<int>(caps.resourceBindingTier);
+    j["enhanced_barriers"] = caps.enhancedBarriers;
+    j["caps_queried"] = caps.queried;
     // P67：DXC/mesh shader 自检结果（dxc_note 里带失败原因或冒烟编译产物大小）。
-    json += ",\"dxc_available\":";
-    json += caps.dxcAvailable ? "true" : "false";
-    json += ",\"dxc_mesh_shader_compile_ok\":";
-    json += caps.meshShaderCompileOk ? "true" : "false";
-    json += ",\"dxc_profile\":\"" + jsonEscape(caps.dxcProfile) + "\"";
-    json += ",\"dxc_path\":\"" + jsonEscape(caps.dxcPath) + "\"";
-    json += ",\"dxc_note\":\"" + jsonEscape(caps.dxcNote) + "\"";
-    // 可用性探测（DLSS/NGX + NRD）。与 caps 分开：caps 是 D3D12 基线，
-    // rtx 是「第三方 SDK 在这台机器上能不能用」。
-    json += gCtx.rtx.jsonFragment();
-    return json;
+    j["dxc_available"] = caps.dxcAvailable;
+    j["dxc_mesh_shader_compile_ok"] = caps.meshShaderCompileOk;
+    j["dxc_profile"] = caps.dxcProfile;
+    j["dxc_path"] = caps.dxcPath;
+    j["dxc_note"] = caps.dxcNote;
+    // 可用性探测（DLSS/NGX + NRD + XeSS + FFX）。与 caps 分开：caps 是 D3D12 基线，
+    // rtx 是「第三方 SDK 在这台机器上能不能用」。它同样是一段字段串，接在后面即可。
+    std::string fields = jsonFieldsOf(j);
+    const std::string rtx = gCtx.rtx.jsonFragment();
+    if (!rtx.empty()) {
+        fields += ",";
+        fields += rtx;
+    }
+    return fields;
+}
+
+// ---------------------------------------------------------------------------
+// P110：Agility SDK（D3D12Core.dll 1.619）opt-in —— 只为自检，默认关闭
+// ---------------------------------------------------------------------------
+// 机制（2026-10 核实，出处见 known_bugs.md §D.12）：
+//   * 官方推荐的两符号（D3D12SDKVersion / D3D12SDKPath）只对**进程主 exe** 生效：
+//     d3d12.dll 用 GetModuleHandle(NULL) 取 exe 模块再 GetProcAddress，被注入的
+//     MCDR.dll 导出了也不会被看到（实测：注入 DLL 里导出 619，设备仍是 616）。
+//   * 改不了 javaw.exe 的替代路径：D3D12GetInterface(CLSID_D3D12SDKConfiguration)
+//     → ID3D12SDKConfiguration1::CreateDeviceFactory(版本, 绝对路径) 就地加载
+//     side-by-side D3D12Core.dll（不需要开发者模式、路径不必相对 exe）→
+//     ID3D12DeviceFactory::ApplyToGlobalState() 把全局 core 换成它，之后所有
+//     d3d12.dll 导出（D3D12CreateDevice 等）都走新 core。
+//   * 生效判据不是函数返回 S_OK，而是设备上 QI ID3D12DeviceConfiguration 的
+//     GetDesc().SDKVersion：616 = 系统 inbox，619 = 我们带的那份。
+// 约束：D3D12Core.dll 必须与 MCDR.dll 同目录（Illusion\run\dxrmc\）；1.619 的
+// D3D12SDKLayers.dll 不在 vcpkg 包内，所以 agility 生效时调试层必须关掉（版本不匹配
+// 会让 D3D12CreateDevice 直接失败），见 ensureDevice 里的 debugEnabled 分支。
+constexpr UINT kAgilitySdkVersion = 619;
+
+struct AgilityAttempt {
+    bool requested = false;
+    bool applied = false;
+    HRESULT factoryHr = E_FAIL;
+    HRESULT applyHr = E_FAIL;
+    std::wstring dir;  // D3D12Core.dll 所在目录（带结尾反斜杠）
+};
+
+AgilityAttempt gAgility;
+
+bool envIsOne(const char* name) {
+    const char* v = std::getenv(name);
+    return v && v[0] == '1' && v[1] == '\0';
+}
+
+std::wstring ownModuleDir() {
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&ownModuleDir), &mod)
+        || !mod)
+        return {};
+    wchar_t path[1024] = {};
+    const DWORD n = GetModuleFileNameW(mod, path, static_cast<DWORD>(sizeof(path) / sizeof(path[0])));
+    if (n == 0 || n >= sizeof(path) / sizeof(path[0])) return {};
+    const std::wstring full(path, n);
+    const size_t slash = full.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : full.substr(0, slash + 1);
+}
+
+// 必须在任何 D3D12 设备创建之前调用（ApplyToGlobalState 会改进程全局 core）。
+// ensureDevice() 在设备就绪后仍会被逐帧调用，所以这里必须幂等：只在第一次进入时
+// 真正执行（否则每次调用都会重新 CreateDeviceFactory + ApplyToGlobalState，
+// 实测刷出 32k 行日志，也让全局 core 被反复"改配置"）。
+void applyAgilitySdk() {
+    if (gAgility.requested) return;
+    if (!envIsOne("MCDR_AGILITY")) return;
+    gAgility.requested = true;
+    const std::wstring dir = ownModuleDir();
+    if (dir.empty()) {
+        dbgLogWarn("P110 agility: cannot resolve MCDR.dll directory - skipped");
+        return;
+    }
+    const std::wstring core = dir + L"D3D12Core.dll";
+    if (GetFileAttributesW(core.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        dbgLogWarn("P110 agility: %s not found next to MCDR.dll - skipped",
+                   toUtf8(core).c_str());
+        return;
+    }
+    const std::string utf8Dir = toUtf8(dir);
+    HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+    if (!d3d12) d3d12 = LoadLibraryW(L"d3d12.dll");
+    if (!d3d12) {
+        dbgLogWarn("P110 agility: d3d12.dll unavailable (err=%lu) - skipped", GetLastError());
+        return;
+    }
+    const auto getInterface =
+        reinterpret_cast<PFN_D3D12_GET_INTERFACE>(GetProcAddress(d3d12, "D3D12GetInterface"));
+    if (!getInterface) {
+        dbgLogWarn("P110 agility: D3D12GetInterface missing from d3d12.dll - skipped");
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12SDKConfiguration> config;
+    HRESULT hr = getInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&config));
+    if (FAILED(hr) || !config) {
+        dbgLogWarn("P110 agility: D3D12GetInterface(CLSID_D3D12SDKConfiguration) hr=0x%08lX - skipped",
+                   static_cast<unsigned long>(hr));
+        return;
+    }
+    Microsoft::WRL::ComPtr<ID3D12SDKConfiguration1> config1;
+    hr = config.As(&config1);
+    if (FAILED(hr) || !config1) {
+        dbgLogWarn("P110 agility: QI ID3D12SDKConfiguration1 hr=0x%08lX - skipped",
+                   static_cast<unsigned long>(hr));
+        return;
+    }
+    Microsoft::WRL::ComPtr<ID3D12DeviceFactory> factory;
+    gAgility.factoryHr = config1->CreateDeviceFactory(kAgilitySdkVersion, utf8Dir.c_str(),
+                                                      IID_PPV_ARGS(&factory));
+    if (FAILED(gAgility.factoryHr) || !factory) {
+        dbgLogWarn("P110 agility: CreateDeviceFactory(sdk=%u, \"%s\") hr=0x%08lX - skipped",
+                   kAgilitySdkVersion, utf8Dir.c_str(),
+                   static_cast<unsigned long>(gAgility.factoryHr));
+        return;
+    }
+    gAgility.applyHr = factory->ApplyToGlobalState();
+    if (FAILED(gAgility.applyHr)) {
+        dbgLogWarn("P110 agility: ApplyToGlobalState hr=0x%08lX - skipped",
+                   static_cast<unsigned long>(gAgility.applyHr));
+        return;
+    }
+    gAgility.dir = dir;
+    gAgility.applied = true;
+    dbgLogInfo("P110 agility: opt-in ok sdk=%u core=%s factory=ok apply=ok",
+               kAgilitySdkVersion, utf8Dir.c_str());
+}
+
+// 设备建好之后才知道真正生效的是哪份 core：SDKVersion 是唯一权威判据。
+void logAgilityRuntime(ID3D12Device* device) {
+    UINT sdkVersion = 0;
+    bool haveConfig = false;
+    Microsoft::WRL::ComPtr<ID3D12DeviceConfiguration> config;
+    if (device && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&config))) && config) {
+        sdkVersion = config->GetDesc().SDKVersion;
+        haveConfig = true;
+    }
+    const bool agility = haveConfig && sdkVersion >= kAgilitySdkVersion;
+    // 注意：这里不要用 GetModuleHandleW(L"D3D12Core.dll") 的路径当"生效 core"——d3d12.dll
+    // 在返回 SDKConfiguration 之前就已经把 inbox 那份载入了，同名的 app-local 模块是
+    // 第二个模块，按基名查只会拿到先加载的 System32 那份。真正判据是上面的 SDKVersion。
+    dbgLogInfo("P110 agility: agility=%s sdk=%u%s requested=%d requestedCoreDir=%s "
+               "factory=0x%08lX apply=0x%08lX",
+               agility ? "on" : "off", sdkVersion, haveConfig ? "" : "(n/a)",
+               gAgility.requested ? 1 : 0,
+               gAgility.dir.empty() ? "<none>" : toUtf8(gAgility.dir).c_str(),
+               static_cast<unsigned long>(gAgility.factoryHr),
+               static_cast<unsigned long>(gAgility.applyHr));
 }
 
 mcdr::Result<void> ensureDevice() {
+    // P110 自检：MCDR_AGILITY=1 时在任何设备创建之前把全局 core 换成 619；默认空操作。
+    applyAgilitySdk();
     // PIX 捕获层必须在任何 D3D12CreateDevice（含适配器探测）之前载入；未请求时空操作。
     ensurePixCapturerLoaded();
     installCrashHandlerOnce();
@@ -1565,10 +1783,18 @@ mcdr::Result<void> ensureDevice() {
     bool debugEnabled = false;
     const char* dbgLayerEnv = std::getenv("DX12_DEBUG_LAYER");
     if (dbgLayerEnv && dbgLayerEnv[0] == '1') {
-        ComPtr<ID3D12Debug> debug;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
-            debug->EnableDebugLayer();
-            debugEnabled = true;
+        if (gAgility.applied) {
+            // 1.619 的 D3D12SDKLayers.dll 不在 vcpkg 包里（只有 D3D12Core.dll）。拿 inbox 的
+            // layers 配 agility 的 core 会让 D3D12CreateDevice 直接失败（层与 core 版本不匹配），
+            // 所以在 agility 生效时宁可不启用调试层，也不冒这个风险。
+            dbgLogWarn("P110 agility: DX12_DEBUG_LAYER ignored - inbox D3D12SDKLayers would not "
+                       "match the 1.619 core");
+        } else {
+            ComPtr<ID3D12Debug> debug;
+            if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+                debug->EnableDebugLayer();
+                debugEnabled = true;
+            }
         }
     }
 
@@ -1612,6 +1838,7 @@ mcdr::Result<void> ensureDevice() {
     queryDeviceCapabilities(device.Get(), gCtx.caps);
     dbgLogInfo("device ready: %s FL=%s %s", gCtx.adapterName.c_str(),
                featureLevelName(gCtx.featureLevel), capabilitiesText(gCtx.caps).c_str());
+    logAgilityRuntime(device.Get());
     {
         LUID luid = device->GetAdapterLuid();
         ComPtr<IDXGIFactory4> tmpFactory;
@@ -1873,11 +2100,46 @@ D3D12_RESOURCE_STATES initialStateFor(D3D12_HEAP_TYPE heap) {
     }
 }
 
+// P76f（用户 m08609「拖影产生了就不会消失」的根因）：深度纹理必须建在**无类型（TYPELESS）**
+// 格式上，否则它根本不能被采样。
+//
+// D3D12 规定：给一个**有类型**（typed）资源建另一种格式的 SRV 是非法的 ——
+// `CreateShaderResourceView(D32_FLOAT 资源, R32_FLOAT 描述)` 会被拒绝（无调试层时静默），
+// 描述符里留着垃圾，于是着色器 `SampleLevel`/`Load` **一律返回 0**。速度 pass 的开头是
+// `if (depth <= 0.0) return 0`，所以运动矢量整张 0 —— 而全 0 的 mv 会让 DLSS 认为画面
+// 从未移动过，拖影一旦产生就永不衰减（这正是用户看到的现象）。深度快照的**拷贝**一直
+// 正常（拷贝不要求可采样），所以 `input-depth-after-evaluate` 一直有真实数据，把这个
+// 问题掩盖了很久。
+//
+// 建在 R32_TYPELESS 上之后：DSV 仍用 `dxgiFormat`（D32_FLOAT，见 makeDsvDesc），
+// SRV 用 R32_FLOAT（见 createTextureView），两边都合法。
+DXGI_FORMAT typelessDepthFormat(DXGI_FORMAT format) {
+    switch (format) {
+        case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_TYPELESS;
+        case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_TYPELESS;
+        case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24G8_TYPELESS;
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32G8X24_TYPELESS;
+        default: return format;
+    }
+}
+
 D3D12_RESOURCE_FLAGS textureFlags(int usage, int format) {
     D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE;
     if (usage & 8) {  // RENDER_ATTACHMENT
         flags |= hasDepthAspect(format) ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
                                         : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    }
+    // P108（用户 m11147 之后的设计收口，(B) 方案的第一步）：storage / UAV 位。
+    // 为什么需要：NGX 只肯写进带 ALLOW_UNORDERED_ACCESS 的资源，否则直接
+    // `FAIL_RWFlagMissing`（0xBAD00009）。此前我们自己用
+    // CreateCommittedResource 建的私有 UAV 中间纹理**连一次普通拷贝都存不住**
+    // （写侧二分：拷贝引擎填进去，立刻读与下一帧读都是全 0；见 d3d12_dlss.cpp
+    // 里 createDlssOutput 的注释），而由模块这条 createTexture 路径建出来的纹理
+    // 一直读写正常。所以改由 JVM 侧建中间纹理、走本路径创建。
+    // 位值 32 = USAGE_STORAGE（vulkan 语义的 storage image），与 JVM 侧约定；
+    // 纯追加：没有这张位时行为与以前完全一致。
+    if (usage & 32) {  // STORAGE / UAV
+        flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     }
     return flags;
 }
@@ -1906,7 +2168,7 @@ mcdr::Result<void*> createTexture(int usage, int format, int width, int height, 
     // 故显式 static_cast<UINT16>。
     desc.DepthOrArraySize = static_cast<UINT16>(std::max(1u, static_cast<UINT>(depthOrLayers)));
     desc.MipLevels = static_cast<UINT16>(std::max(1u, static_cast<UINT>(mipLevels)));
-    desc.Format = dxgi;
+    desc.Format = typelessDepthFormat(dxgi);
     desc.SampleDesc.Count = 1;
     desc.Flags = textureFlags(usage, format);
 
@@ -2065,7 +2327,10 @@ mcdr::Result<void*> createTextureView(Dx12Object* texture, int baseMipLevel, int
     // 不能直接作为 SRV 格式（调试层：'The format cannot be used with a
     // ShaderResource view'）——需换成同格式族内的只读视图格式（读深度为
     // float/uint），纹理本体仍保持深度格式用于 DSV。
-    DXGI_FORMAT viewFormat = texture->resource->GetDesc().Format;
+    // P76f：格式取 `dxgiFormat`（具体的有类型格式），不取资源描述 —— 深度纹理现在建在
+    // TYPELESS 上（见 typelessDepthFormat），按资源格式走会得到 TYPELESS，那种格式不能
+    // 直接做 SRV 格式，必须映射到同族的只读格式。
+    DXGI_FORMAT viewFormat = texture->dxgiFormat;
     switch (viewFormat) {
         case DXGI_FORMAT_D32_FLOAT: viewFormat = DXGI_FORMAT_R32_FLOAT; break;
         case DXGI_FORMAT_D16_UNORM: viewFormat = DXGI_FORMAT_R16_UNORM; break;
@@ -2256,6 +2521,7 @@ bool needTransition(D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
     if (from == to) return false;
     return true;
 }
+
 
 // 将 D3D12_RESOURCE_STATES 转为可读名称，用于诊断日志。
 // 注意：D3D12_RESOURCE_STATE_PRESENT 和 D3D12_RESOURCE_STATE_COMMON 在此 SDK
@@ -2768,6 +3034,9 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
         return mcdr::err("beginCommandListWithWait", "beginCommandListWithWait: list Reset " + hrText(hr));
     }
     dbgLogDebug("beginCommandListWithWait: list reset ok");
+    if (p109TraceEnabled()) {
+        dbgLogInfo("P109 op beginList ctx=%p slot=%d", reinterpret_cast<void*>(ctx), ctx->currentListSlot);
+    }
     // P97：Reset 清掉列表状态，着色粒度必须在这里重放（关闭时零调用）。
     applyShadingRate(ctx->commandList);
     dbgLogDebug("beginCommandListWithWait: pre-increment ctx=%p", reinterpret_cast<void*>(ctx));
@@ -2791,6 +3060,8 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
     // 颜色纹理当 RT 绑定 → 黑屏）。
     gNextFrameRtv = 0;
     gNextDsv = 0;
+    // 游标倒回 ⇒ 所有 ctx 的 (资源,mip) -> 句柄缓存失效（见 gFrameViewGeneration 的说明）。
+    ++gFrameViewGeneration;
     // P64：帧级 RTV/DSV 句柄随堆槽位清零而失效；setPipeline 快速路径同理（新 list 无
     // 已绑定的 PSO/根签名）。必须与本 list 的生命周期严格一致。
     ctx->rtvCache.clear();
@@ -3193,6 +3464,13 @@ static D3D12_DEPTH_STENCIL_VIEW_DESC makeDsvDesc(Dx12Object* tex, int mip) {
 // gNextFrameRtv 清零 + rtvCache.clear() 同步保证（两者必须同点发生）。
 static mcdr::Result<D3D12_CPU_DESCRIPTOR_HANDLE> frameRtvFor(CommandContext* ctx, Dx12Object* tex,
                                                              int mip) {
+    // P109（#538 根因修复）：描述符堆游标被倒回过（任何 ctx 的 beginCommandList 都会），
+    // 本 ctx 缓存里的句柄可能已被覆盖成另一张资源的视图 —— 按代整体失效，绝不跨代复用。
+    if (ctx->frameViewGeneration != gFrameViewGeneration) {
+        ctx->rtvCache.clear();
+        ctx->dsvCache.clear();
+        ctx->frameViewGeneration = gFrameViewGeneration;
+    }
     RtvDsvKey key{tex->resource.Get(), static_cast<UINT>(mip)};
     auto it = ctx->rtvCache.find(key);
     if (it != ctx->rtvCache.end()) {
@@ -3222,6 +3500,13 @@ mcdr::Result<D3D12_CPU_DESCRIPTOR_HANDLE> acquireTextureRtv(CommandContext* ctx,
 // P64：DSV 版（语义同上，句柄来自 dsvHeap）。
 static mcdr::Result<D3D12_CPU_DESCRIPTOR_HANDLE> frameDsvFor(CommandContext* ctx, Dx12Object* tex,
                                                              int mip) {
+    // P109（#538 根因修复）：描述符堆游标被倒回过（任何 ctx 的 beginCommandList 都会），
+    // 本 ctx 缓存里的句柄可能已被覆盖成另一张资源的视图 —— 按代整体失效，绝不跨代复用。
+    if (ctx->frameViewGeneration != gFrameViewGeneration) {
+        ctx->rtvCache.clear();
+        ctx->dsvCache.clear();
+        ctx->frameViewGeneration = gFrameViewGeneration;
+    }
     RtvDsvKey key{tex->resource.Get(), static_cast<UINT>(mip)};
     auto it = ctx->dsvCache.find(key);
     if (it != ctx->dsvCache.end()) {
@@ -3501,6 +3786,181 @@ mcdr::Result<void> copyTextureToBuffer(CommandContext* ctx, Dx12Object* srcTex, 
     return {};
 }
 
+// ---------------------------------------------------------------------------
+// B2（P108 dump 迁移的基础）：**模块内部**的纹理读回统计。
+//
+// 为什么必须在这里而不在 DLSS 实现单元里：那边自建 command list/queue/fence/staging，
+// 并把纹理用裸 barrier 切到 COPY_SOURCE，绕开了 ctx->resourceState（D.9 铁律 1/2）——
+// #525/#527/#838 与 RemoveDevice 都是这么来的。这里改走**当前 ctx 的 command list**：
+// 过渡全部经 copyTextureToBuffer 内的 transitionTextureTo（跟踪型），读回缓冲由模块持有。
+//
+// 时序（关键，别当成 bug）：调用时 list 还开着，本帧录制的 CopyTextureRegion 尚未提交，
+// 所以**这一次**返回的是**上一次调用**记录的那份拷贝 —— 等待的是那次提交之后的 fence 值
+// （pendingFence = 记录时的 ctx->fenceValue + 1）。诊断读数延迟一帧是设计选择。
+// 返回 1 = *out 已填（上一帧的读数）；0 = 还没有可用读数（首次）；-1 = 失败。
+//
+// B3：状态从"一个全局 pending 槽"改成**按源资源一个槽**。DLSS 的 7 项 dump 是在**同一帧、
+// 同一条还开着的命令列表**上依次请求读回的：共享一个槽时，第 2 项起等的是本帧自己尚未提交
+// 的那次提交（fence 值 = ctx->fenceValue + 1），只会等满 5 秒超时，而且缓冲区会被前一项
+// 顶替、读数与标签错位。按资源分槽后，每个槽只等自己在上一帧记录的那次拷贝，读数与标签
+// 一一对应；同一帧重复请求同一资源（没有深度快照时 input-depth 与 jvm-main-depth 就是
+// 同一张纹理）则由 `pendingFence <= ctx->fenceValue` 这一条判成"还没有读数"。
+// ---------------------------------------------------------------------------
+namespace {
+
+// 每个被读回的源资源一个槽（上限 kReadbackSlots，满了按 LRU 淘汰）。
+struct ReadbackSlot {
+    ID3D12Resource* key = nullptr;  // 身份键 = 源纹理裸指针（ctx->resourceState 也用它）
+    Dx12Object* buffer = nullptr;   // READBACK buffer（模块持有；换大小/淘汰时释放）
+    UINT64 bufferBytes = 0;
+    UINT64 pendingFence = 0;  // 记录那次拷贝时的 ctx->fenceValue + 1
+    bool pending = false;
+    UINT64 lastUsed = 0;  // LRU
+    DlssTexStats stats{};
+    // 记录那次拷贝时的几何：下次映射按这份几何解，资源被重建/换大小也不会读错行距。
+    UINT width = 0;
+    UINT height = 0;
+    UINT rowPitch = 0;
+    UINT channels = 0;  // = 每像素字节数（旧 dump 的 bpp，逐通道按字节统计的同一口径）
+};
+
+constexpr int kReadbackSlots = 16;
+ReadbackSlot s_readbackSlots[kReadbackSlots];
+UINT64 s_readbackTick = 0;
+
+}  // namespace
+
+int32_t readbackTextureStats(CommandContext* ctx, Dx12Object* tex, DlssTexStats* out) {
+    if (ctx == nullptr || tex == nullptr || out == nullptr || !ctx->listOpen) return 0;
+    if (tex->kind != Dx12Object::Kind::Texture || !tex->resource) return 0;
+    const D3D12_RESOURCE_DESC d = tex->resource->GetDesc();
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Format == DXGI_FORMAT_UNKNOWN) return 0;
+    const UINT w = static_cast<UINT>(d.Width);
+    const UINT h = d.Height;
+    if (w == 0 || h == 0) return 0;
+    const UINT bpp = std::max<UINT>(1u, blockSizeFor(d.Format));
+    const UINT rowPitch = (w * bpp + 255u) & ~255u;  // CopyTextureRegion 的行距必须 256 对齐
+    const UINT64 bytes = static_cast<UINT64>(rowPitch) * h;
+
+    // 选槽：同资源 → 空槽 → LRU（见上面 ReadbackSlot 的说明）。
+    ReadbackSlot* slot = nullptr;
+    for (auto& cand : s_readbackSlots) {
+        if (cand.key == tex->resource.Get()) {
+            slot = &cand;
+            break;
+        }
+    }
+    if (slot == nullptr) {
+        for (auto& cand : s_readbackSlots) {
+            if (cand.key == nullptr) {
+                slot = &cand;
+                break;
+            }
+        }
+    }
+    if (slot == nullptr) {
+        slot = &s_readbackSlots[0];
+        for (auto& cand : s_readbackSlots) {
+            if (cand.lastUsed < slot->lastUsed) slot = &cand;
+        }
+        // 淘汰前先让它那次提交落定：buffer 被 GPU 还在引用时释放会拉坏设备。
+        if (slot->pending && slot->buffer != nullptr && slot->pendingFence <= ctx->fenceValue) {
+            (void)waitForFenceValue(ctx, slot->pendingFence, 5'000'000'000ULL);
+        }
+        if (slot->buffer != nullptr) destroyObject(slot->buffer);
+        *slot = ReadbackSlot{};
+    }
+    slot->lastUsed = ++s_readbackTick;
+
+    // B4 证据行：**第一次**请求这张纹理时，把跟踪表里的真实状态打出来。found=1 表示该资源
+    // 在 `ctx->resourceState` 里有条目（模块创建的私有纹理创建即登记，因此本列表内必有），
+    // found=0 表示本列表还没碰过它 —— 那张表的锚点是 COMMON，因为上一个列表执行完资源会
+    // decay 回 COMMON，所以这里打到 COMMON 也是**真实**状态而不是兜底猜测。
+    if (slot->key == nullptr) {
+        static int s_newSlotLogged = 0;
+        if (s_newSlotLogged < kReadbackSlots) {
+            ++s_newSlotLogged;
+            const auto it = ctx->resourceState.find(tex->resource.Get());
+            dbgLogInfo("P108x: readback tracking: resource=%p tracked=%d found=%d -> COPY_SOURCE via "
+                       "transitionTextureTo",
+                       static_cast<void*>(tex->resource.Get()),
+                       static_cast<int>(it != ctx->resourceState.end() ? it->second
+                                                                      : D3D12_RESOURCE_STATE_COMMON),
+                       it != ctx->resourceState.end() ? 1 : 0);
+        }
+    }
+
+    bool haveReading = false;
+    // ① 先把**这张纹理上一次**记录的那份拷贝读出来（那次提交此时应已完成）。
+    //    `pendingFence > ctx->fenceValue` 说明那份拷贝录在**本帧尚未提交**的那次提交里
+    //    （同一帧重复请求同一资源时会出现：depthSnapshot 为空时 `input-depth-after-evaluate`
+    //    与 `jvm-main-depth-settled` 就是同一张纹理）。此时等它只会等满超时，直接按
+    //    "还没有读数"返回，下一帧再取。
+    if (slot->pending && slot->buffer != nullptr && slot->pendingFence <= ctx->fenceValue) {
+        if (auto wf = waitForFenceValue(ctx, slot->pendingFence, 5'000'000'000ULL); wf) {
+            if (auto m = mapBuffer(slot->buffer, 0, static_cast<long long>(slot->bufferBytes), true, false);
+                m) {
+                const auto* px = static_cast<const unsigned char*>(*m);
+                double sum[4] = {0.0, 0.0, 0.0, 0.0};
+                uint32_t lo[4] = {255u, 255u, 255u, 255u};
+                uint32_t hi[4] = {0u, 0u, 0u, 0u};
+                // 按**记录那次拷贝时**的几何解，行距/通道数不会被之后的资源重建带偏。
+                const UINT sw = slot->width;
+                const UINT sh = slot->height;
+                const UINT pitch = slot->rowPitch;
+                const UINT channels = slot->channels;
+                const UINT sx = (sw > 64) ? sw / 64 : 1;
+                const UINT sy = (sh > 64) ? sh / 64 : 1;
+                UINT64 n = 0;
+                for (UINT y = 0; y < sh; y += sy) {
+                    for (UINT x = 0; x < sw; x += sx) {
+                        const unsigned char* q = px + static_cast<UINT64>(y) * pitch + x * channels;
+                        for (UINT c = 0; c < channels && c < 4; ++c) {
+                            sum[c] += q[c];
+                            lo[c] = (q[c] < lo[c]) ? q[c] : lo[c];
+                            hi[c] = (q[c] > hi[c]) ? q[c] : hi[c];
+                        }
+                        ++n;
+                    }
+                }
+                for (int c = 0; c < 4; ++c) {
+                    slot->stats.mean[c] = (n > 0) ? (sum[c] / static_cast<double>(n)) : 0.0;
+                    slot->stats.min[c] = lo[c];
+                    slot->stats.max[c] = hi[c];
+                }
+                unmapBuffer(slot->buffer);
+                slot->pending = false;
+                haveReading = true;
+                *out = slot->stats;
+            }
+        }
+    }
+
+    // ② 记录本次的拷贝（缓冲不够大就重建）。createBuffer 的 usage 位 1 = MAP_READ ⇒ READBACK heap。
+    if (slot->buffer == nullptr || slot->bufferBytes < bytes) {
+        if (slot->buffer != nullptr) {
+            destroyObject(slot->buffer);
+            slot->buffer = nullptr;
+            slot->bufferBytes = 0;
+        }
+        auto buf = createBuffer(1, static_cast<long long>(bytes));
+        if (!buf) return haveReading ? 1 : -1;
+        slot->buffer = static_cast<Dx12Object*>(*buf);
+        slot->bufferBytes = bytes;
+    }
+    auto copied =
+        copyTextureToBuffer(ctx, tex, 0, 0, 0, 0, static_cast<int>(w), static_cast<int>(h), slot->buffer, 0);
+    if (!copied) return haveReading ? 1 : -1;
+    // 记下这次拷贝的几何（下次映射按它解），并把"要等的 fence"记成**这一次提交之后**的值。
+    slot->key = tex->resource.Get();
+    slot->width = w;
+    slot->height = h;
+    slot->rowPitch = rowPitch;
+    slot->channels = bpp;
+    slot->pendingFence = ctx->fenceValue + 1;
+    slot->pending = true;
+    return haveReading ? 1 : 0;
+}
 mcdr::Result<void> copyTextureToTexture(CommandContext* ctx, Dx12Object* srcTex, Dx12Object* dstTex, int mip,
                                         int layer, int srcX, int srcY, int dstX, int dstY, int w, int h) {
     if (!ctx || !ctx->listOpen) {
@@ -3629,6 +4089,14 @@ mcdr::Result<void> beginRenderPass(CommandContext* ctx, Dx12Object* const* color
 
     ctx->commandList->OMSetRenderTargets(static_cast<UINT>(rtvs.size()), rtvs.empty() ? nullptr : rtvs.data(),
                                          false, hasDsv ? &dsv : nullptr);
+    // pass' tracked attachments (a #538 whose tracking table is coherent can only come from a
+    // descriptor that names another resource).
+    if (p109TraceEnabled()) {
+        dbgLogInfo("P109 op beginPass ctx=%p colors=%d rtvs=%zu color0=%p depth=%d area=%d,%d %dx%d",
+                   reinterpret_cast<void*>(ctx), colorCount, rtvs.size(),
+                   reinterpret_cast<void*>(colorCount > 0 ? colorViews[0] : nullptr),
+                   static_cast<int>(hasDsv), x, y, w, h);
+    }
     D3D12_VIEWPORT vp{static_cast<FLOAT>(x),
                       static_cast<FLOAT>(y),
                       static_cast<FLOAT>(w),
@@ -3667,6 +4135,10 @@ mcdr::Result<void> endRenderPass(CommandContext* ctx) {
         return mcdr::err("endRenderPass", "endRenderPass: null ctx");
     }
     if (!ctx->inRenderPass) return {};  // 幂等
+    if (p109TraceEnabled()) {
+        dbgLogInfo("P109 op endPass ctx=%p colors=%zu depth=%d", reinterpret_cast<void*>(ctx),
+                   ctx->activeColorTargets.size(), ctx->activeDepthTarget ? 1 : 0);
+    }
     DBG_LOG_DEBUG("endRenderPass: ctx=%p", (void*)ctx);
     // P11 修复：附件必须显式回切 COMMON。D3D12 的 RENDER_TARGET/DEPTH_WRITE 属
     // "非可提升状态"，命令列表执行完成时【不会】隐式 decay 回 COMMON（只有
@@ -4668,6 +5140,37 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                                     reinterpret_cast<void*>(b.view),
                                     reinterpret_cast<void*>(b.view->sourceTexture));
                     }
+                    // P109（#538 取证）：若这条 SRV 的源纹理正是**当前 render pass 的附件**，
+                    // 把它切到 SHADER_RESOURCE 就会让"仍绑定着的 RTV/DSV"处于非附件状态 ⇒
+                    // 之后每一条 draw 都会被调试层判成 #538（把 0xC0 当 RENDER_TARGET /
+                    // DEPTH_WRITE）。这在 D3D12 里是非法自采样（sampling a bound attachment）。
+                    // 这里只记账不改行为：先拿到"是谁在采样自己的附件"，再决定是跳过过渡还是
+                    // 拆 pass —— 盲目跳过会让采样读到未定义内容，比报错更难查。
+                    {
+                        ID3D12Resource* srvRes = b.view->sourceTexture->resource.Get();
+                        bool p109IsAttachment = false;
+                        for (Dx12Object* p109Att : ctx->activeColorTargets) {
+                            if (p109Att && p109Att->resource.Get() == srvRes) {
+                                p109IsAttachment = true;
+                                break;
+                            }
+                        }
+                        if (!p109IsAttachment && ctx->activeDepthTarget
+                            && ctx->activeDepthTarget->resource.Get() == srvRes) {
+                            p109IsAttachment = true;
+                        }
+                        if (p109IsAttachment) {
+                            static int p109SelfSamples = 0;
+                            if (p109SelfSamples < 5) {
+                                ++p109SelfSamples;
+                                dbgLogWarn("P109 SRV self-sample: pushDescriptors is about to move an ACTIVE "
+                                           "pass attachment (res=%p) to SHADER_RESOURCE (ctx=%p inPass=%d) - "
+                                           "this is the state divergence behind #538",
+                                           reinterpret_cast<void*>(srvRes), reinterpret_cast<void*>(ctx),
+                                           static_cast<int>(ctx->inRenderPass));
+                            }
+                        }
+                    }
                     transitionTextureTo(ctx, b.view->sourceTexture,
                                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                                             | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -4837,6 +5340,7 @@ mcdr::Result<void> writeBufferSRVToDrawHeap(UINT slot, Dx12Object* buf, long lon
     return {};
 }
 
+
 mcdr::Result<void> drawIndexedInstanced(CommandContext* ctx, UINT indexCount, UINT instanceCount,
                                         INT startIndexLocation, INT baseVertexLocation,
                                         UINT startInstanceLocation) {
@@ -4898,6 +5402,13 @@ mcdr::Result<void> drawInstanced(CommandContext* ctx, UINT vertexCount, UINT ins
     }
     if (!ctx->inRenderPass) {
         return mcdr::err("drawInstanced", "draw: no open render pass");
+    }
+    if (p109TraceEnabled()) {
+        // #538 现场取证：draw 时本 list 的 render pass 记了哪些颜色附件。
+        dbgLogInfo("P109 op draw ctx=%p n=%u inst=%u inPass=%d colors=%zu color0=%p", reinterpret_cast<void*>(ctx),
+                   vertexCount, instanceCount, static_cast<int>(ctx->inRenderPass),
+                   ctx->activeColorTargets.size(),
+                   ctx->activeColorTargets.empty() ? nullptr : reinterpret_cast<void*>(ctx->activeColorTargets[0]));
     }
     DBG_LOG_DEBUG("draw: vertexCount=%u instance=%u firstVertex=%u", vertexCount, instanceCount, firstVertex);
     ctx->commandList->DrawInstanced(vertexCount, instanceCount, firstVertex, startInstanceLocation);
@@ -5334,101 +5845,6 @@ void dbgReadbackBufferBytes(Dx12Object* buf, long long offset, int len, const ch
     unmapRes->Unmap(0, nullptr);
 }
 
-// 枚举所有 D3D12 支持的适配器，返回 JSON 字符串
-std::string enumerateAdaptersJson() {
-    // 这里会探测性建一次设备，捕获层也得先于它载入（未请求时空操作）。
-    ensurePixCapturerLoaded();
-    std::string result = "[";
-    bool first = true;
-    {
-        ComPtr<IDXGIFactory4> factory;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
-            return "[{\"error\":\"CreateDXGIFactory1 failed\"}]";
-        }
-        for (UINT i = 0;; ++i) {
-            ComPtr<IDXGIAdapter> adapter;
-            if (FAILED(factory->EnumAdapters(i, &adapter))) break;
-            DXGI_ADAPTER_DESC desc{};
-            HRESULT hr = adapter->GetDesc(&desc);
-            if (FAILED(hr)) continue;
-            // 只返回支持 D3D12 的适配器；顺带记下它能建出的最高功能级（探测设备随即释放），
-            // 供 JVM 侧在设备创建之前打印「currently is using DirectX 12 FL …」。
-            const D3D_FEATURE_LEVEL highest = probeHighestFeatureLevel(adapter.Get());
-            if (highest < D3D_FEATURE_LEVEL_12_0) continue;
-            if (!first) result += ",";
-            first = false;
-            char nameBuf[256] = {};
-            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, nameBuf, sizeof(nameBuf), nullptr, nullptr);
-            long long vramGb = static_cast<long long>(desc.DedicatedVideoMemory / (1024LL * 1024 * 1024));
-            result += "{\"name\":\"";
-            result += nameBuf;
-            result += "\",\"luid\":\"";
-            char luidBuf[32];
-            snprintf(luidBuf, sizeof(luidBuf), "%08X%08X", desc.AdapterLuid.LowPart,
-                     desc.AdapterLuid.HighPart);
-            result += luidBuf;
-            result += "\",\"vid\":0x";
-            char vidBuf[16];
-            snprintf(vidBuf, sizeof(vidBuf), "%08X", desc.VendorId);
-            result += vidBuf;
-            result += "\",\"did\":0x";
-            char didBuf[16];
-            snprintf(didBuf, sizeof(didBuf), "%08X", desc.DeviceId);
-            result += didBuf;
-            result += "\",\"feature_level\":\"";
-            result += featureLevelName(highest);
-            result += "\",\"feature_level_value\":";
-            result += std::to_string(static_cast<int>(highest));
-            result += ",\"vram_gb\":";
-            result += std::to_string(vramGb);
-            result += "}";
-        }
-    }
-    result += "]";
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// 活跃适配器完整描述（mcdr_dx12GetAdapterInfo 的后端实现）
-//
-// 与 enumerateAdaptersJson() 同源：CreateDXGIFactory1 + EnumAdapterByLuid 拿到
-// 设备真正绑定的那块适配器。驱动版本 / 驱动描述 / 硬件·集显·可拆卸分类只有
-// DXCore 提供，而 DXCore 在 Win10+ 才存在、又不能给 MCDR.dll 引入 dxcore.lib
-// 硬依赖，因此只在 queryDxCoreInfo() 里用 LoadLibraryW("dxcore.dll") 动态解析。
-// 任何一步失败都退回纯 DXGI 值，并把 "dxcore" 置为 false。
-// ---------------------------------------------------------------------------
-
-// 把 UTF-8 文本转义成 JSON 字符串的内容部分（不含两侧引号）。控制字符写成
-// \u00XX；0x20 及以上的字节原样透传 —— WideCharToMultiByte(CP_UTF8) 的输出
-// 已经是合法 UTF-8，逐字节处理不会破坏多字节序列。
-static std::string jsonEscape(const std::string& in) {
-    static const char kHex[] = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(in.size() + 8);
-    for (char ch : in) {
-        const unsigned char c = static_cast<unsigned char>(ch);
-        switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (c < 0x20) {
-                    out += "\\u00";
-                    out += kHex[c >> 4];
-                    out += kHex[c & 0x0F];
-                } else {
-                    out += static_cast<char>(c);
-                }
-                break;
-        }
-    }
-    return out;
-}
-
 // wide -> UTF-8；空指针 / 空串 / 转换失败都返回空串。
 static std::string wideToUtf8(const wchar_t* w) {
     if (w == nullptr || w[0] == L'\0') {
@@ -5446,6 +5862,57 @@ static std::string wideToUtf8(const wchar_t* w) {
     s.resize(static_cast<size_t>(written - 1));
     return s;
 }
+
+// 枚举所有 D3D12 支持的适配器，返回 JSON 数组字符串。
+std::string enumerateAdaptersJson() {
+    // 这里会探测性建一次设备，捕获层也得先于它载入（未请求时空操作）。
+    ensurePixCapturerLoaded();
+    nlohmann::json list = nlohmann::json::array();
+    {
+        ComPtr<IDXGIFactory4> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+            return "[{\"error\":\"CreateDXGIFactory1 failed\"}]";
+        }
+        for (UINT i = 0;; ++i) {
+            ComPtr<IDXGIAdapter> adapter;
+            if (FAILED(factory->EnumAdapters(i, &adapter))) break;
+            DXGI_ADAPTER_DESC desc{};
+            if (FAILED(adapter->GetDesc(&desc))) continue;
+            // 只返回支持 D3D12 的适配器；顺带记下它能建出的最高功能级（探测设备随即释放），
+            // 供 JVM 侧在设备创建之前打印「currently is using DirectX 12 FL …」。
+            const D3D_FEATURE_LEVEL highest = probeHighestFeatureLevel(adapter.Get());
+            if (highest < D3D_FEATURE_LEVEL_12_0) continue;
+            // 十六进制串一律在 native 侧定好格式：JVM 侧只做展示，不该再关心补零。
+            char luidBuf[32] = {};
+            snprintf(luidBuf, sizeof(luidBuf), "%08X%08X", desc.AdapterLuid.LowPart,
+                     desc.AdapterLuid.HighPart);
+            char vidBuf[16] = {};
+            snprintf(vidBuf, sizeof(vidBuf), "0x%08X", desc.VendorId);
+            char didBuf[16] = {};
+            snprintf(didBuf, sizeof(didBuf), "0x%08X", desc.DeviceId);
+            list.push_back(nlohmann::json{
+                {"name", wideToUtf8(desc.Description)},
+                {"luid", luidBuf},
+                {"vid", vidBuf},
+                {"did", didBuf},
+                {"feature_level", featureLevelName(highest)},
+                {"feature_level_value", static_cast<int>(highest)},
+                {"vram_gb", static_cast<long long>(desc.DedicatedVideoMemory / (1024LL * 1024 * 1024))},
+            });
+        }
+    }
+    return list.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+// ---------------------------------------------------------------------------
+// 活跃适配器完整描述（mcdr_dx12GetAdapterInfo 的后端实现）
+//
+// 与 enumerateAdaptersJson() 同源：CreateDXGIFactory1 + EnumAdapterByLuid 拿到
+// 设备真正绑定的那块适配器。驱动版本 / 驱动描述 / 硬件·集显·可拆卸分类只有
+// DXCore 提供，而 DXCore 在 Win10+ 才存在、又不能给 MCDR.dll 引入 dxcore.lib
+// 硬依赖，因此只在 queryDxCoreInfo() 里用 LoadLibraryW("dxcore.dll") 动态解析。
+// 任何一步失败都退回纯 DXGI 值，并把 "dxcore" 置为 false。
+// ---------------------------------------------------------------------------
 
 namespace {
 
@@ -5645,56 +6112,31 @@ std::string adapterInfoJson() {
     char luidBuf[32] = {};
     snprintf(luidBuf, sizeof(luidBuf), "%08X%08X", luid.LowPart, luid.HighPart);
 
-    std::string json;
-    json.reserve(512);
-    json += "{\"name\":\"";
-    json += jsonEscape(name);
-    json += "\"";
-    json += ",\"vendor\":\"";
-    json += jsonEscape(vendor);
-    json += "\"";
-    json += ",\"vendor_id\":";
-    json += std::to_string(vendorId);
-    json += ",\"device_id\":";
-    json += std::to_string(deviceId);
-    json += ",\"subsys_id\":";
-    json += std::to_string(subsysId);
-    json += ",\"revision\":";
-    json += std::to_string(revision);
-    json += ",\"feature_level\":\"";
-    json += featureLevel;
-    json += "\"";
-    json += ",\"feature_level_value\":";
-    json += std::to_string(static_cast<int>(gCtx.featureLevel));
-    json += ",\"driver_version\":\"";
-    json += jsonEscape(core.driverVersion);
-    json += "\"";
-    json += ",\"driver_description\":\"";
-    json += jsonEscape(core.driverDescription);
-    json += "\"";
-    json += ",\"device_type\":\"";
-    json += deviceType;
-    json += "\"";
-    json += ",\"vram_bytes\":";
-    json += std::to_string(static_cast<unsigned long long>(haveDesc ? desc.DedicatedVideoMemory : 0));
-    json += ",\"shared_bytes\":";
-    json += std::to_string(static_cast<unsigned long long>(haveDesc ? desc.SharedSystemMemory : 0));
-    json += ",\"dedicated_system_bytes\":";
-    json += std::to_string(static_cast<unsigned long long>(haveDesc ? desc.DedicatedSystemMemory : 0));
-    json += ",\"luid\":\"";
-    json += luidBuf;
-    json += "\"";
-    json += ",\"is_hardware\":";
-    json += (core.isHardware ? "true" : "false");
-    json += ",\"is_detachable\":";
-    json += (core.isDetachable ? "true" : "false");
-    json += ",\"dxcore\":";
-    json += (core.ok ? "true" : "false");
-    // P66：12_2 能力基线（mesh shader tier / SM / DXR / VRS / enhanced barriers）。
-    json += ",";
-    json += capabilitiesJson(gCtx.caps);
-    json += "}";
-    return json;
+    nlohmann::json j;
+    j["name"] = name;
+    j["vendor"] = vendor;
+    j["vendor_id"] = vendorId;
+    j["device_id"] = deviceId;
+    j["subsys_id"] = subsysId;
+    j["revision"] = revision;
+    j["feature_level"] = featureLevel;
+    j["feature_level_value"] = static_cast<int>(gCtx.featureLevel);
+    j["driver_version"] = core.driverVersion;
+    j["driver_description"] = core.driverDescription;
+    j["device_type"] = deviceType;
+    j["vram_bytes"] = static_cast<unsigned long long>(haveDesc ? desc.DedicatedVideoMemory : 0);
+    j["shared_bytes"] = static_cast<unsigned long long>(haveDesc ? desc.SharedSystemMemory : 0);
+    j["dedicated_system_bytes"] =
+        static_cast<unsigned long long>(haveDesc ? desc.DedicatedSystemMemory : 0);
+    j["luid"] = luidBuf;
+    j["is_hardware"] = core.isHardware;
+    j["is_detachable"] = core.isDetachable;
+    j["dxcore"] = core.ok;
+    std::string body = j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    // P66：12_2 能力基线（mesh shader tier / SM / DXR / VRS / enhanced barriers）+ RTX 探测。
+    // 它们故意是「字段串」而不是子对象：JVM 侧只认平坦键值对。
+    appendJsonFields(body, capabilitiesJson(gCtx.caps));
+    return body;
 }
 
 // ---------------------------------------------------------------------------
@@ -7075,6 +7517,116 @@ int setDlssEnabled(int enabled) {
 // —— ensureDevice() 在 1520 行附近就要调用后者，定义放这里会"找不到标识符"（C3861）。
 // ---------------------------------------------------------------------------
 
+// B4：实现单元请求的私有纹理创建（参数见 mcdr_dlss_impl.h 的 DlssTextureDesc）。
+//
+// 与"实现单元自己 CreateCommittedResource"的差别不是风格：这里建出来的资源从出生起就登记进
+// `ctx->resourceState`（初始 COMMON），所以本列表内对它做的第一次过渡有真实锚点，`stateOf`
+// 也能答出状态；销毁走 `destroyObject` 的延迟删除路径，不会在有打开的命令列表时裸 Release
+// （那会报 "deleted prior to closing the command list"）。实现单元只拿到两个不透明值：句柄
+// （只能交回 destroyDlssTexture）与裸 `ID3D12Resource*`。
+// 注意：这两个名字在 wireDlssImpl（本文件靠前，匿名 namespace 里）已经声明过，而 TU 里所有
+// 匿名 namespace 是同一个，所以定义必须放在匿名 namespace 内 —— 否则就是**两个不同链接性**
+// 的同名函数（MSVC 会报 C5046，链接时也取不到定义）。
+namespace {
+int32_t createDlssTexture(CommandContext* ctx, const DlssTextureDesc* desc, void** outObject,
+                          void** outResource) {
+    if (outObject != nullptr) *outObject = nullptr;
+    if (outResource != nullptr) *outResource = nullptr;
+    if (desc == nullptr || outObject == nullptr || outResource == nullptr) {
+        return 0;
+    }
+    if (gCtx.device == nullptr || desc->dxgiFormat == 0 /*DXGI_FORMAT_UNKNOWN*/ || desc->width == 0 ||
+        desc->height == 0) {
+        return 0;  // 参数/设备不可用：不算失败，实现单元会退回"没有私有纹理"
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rdesc{};
+    rdesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rdesc.Width = desc->width;
+    rdesc.Height = desc->height;
+    rdesc.DepthOrArraySize = static_cast<UINT16>((desc->arraySize > 1) ? desc->arraySize : 1);
+    rdesc.MipLevels = static_cast<UINT16>((desc->mipLevels > 1) ? desc->mipLevels : 1);
+    rdesc.Format = static_cast<DXGI_FORMAT>(desc->dxgiFormat);
+    rdesc.SampleDesc.Count = (desc->sampleCount > 0) ? desc->sampleCount : 1;
+    rdesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rdesc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(desc->flags);
+    auto obj = std::make_unique<Dx12Object>();
+    obj->kind = Dx12Object::Kind::Texture;
+    obj->heapType = D3D12_HEAP_TYPE_DEFAULT;
+    obj->dxgiFormat = rdesc.Format;
+    obj->size = static_cast<long long>(desc->width) * desc->height;
+    const HRESULT hr = gCtx.device->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &rdesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&obj->resource));
+    if (FAILED(hr)) {
+        dbgLogWarn("B4: DLSS private texture creation failed (%ux%u fmt=%d flags=0x%X): %s",
+                   desc->width, desc->height, static_cast<int>(rdesc.Format),
+                   static_cast<unsigned>(desc->flags), hrText(hr).c_str());
+        return -1;
+    }
+    Dx12Object* raw = obj.release();
+    // 创建即登记：本列表内第一次过渡就有真实锚点（COMMON），不再"按 COMMON 兜底猜"。
+    if (ctx != nullptr) {
+        ctx->resourceState[raw->resource.Get()] = D3D12_RESOURCE_STATE_COMMON;
+    }
+    *outObject = static_cast<void*>(raw);
+    *outResource = static_cast<void*>(raw->resource.Get());
+    dbgLogInfo("B4: module created a private DLSS texture: %ux%u fmt=%d mips=%u array=%u samples=%u "
+               "flags=0x%X handle=%p resource=%p; registered in the tracked state map (COMMON, ctx=%p)",
+               desc->width, desc->height, static_cast<int>(rdesc.Format),
+               static_cast<unsigned>(rdesc.MipLevels), static_cast<unsigned>(rdesc.DepthOrArraySize),
+               static_cast<unsigned>(rdesc.SampleDesc.Count), static_cast<unsigned>(desc->flags),
+               static_cast<void*>(raw), static_cast<void*>(raw->resource.Get()),
+               static_cast<void*>(ctx));
+    return 1;
+}
+
+void destroyDlssTexture(CommandContext* ctx, void* object) {
+    auto* obj = static_cast<Dx12Object*>(object);
+    if (obj == nullptr) {
+        return;
+    }
+    // 先把键从当前 ctx 的跟踪表里摘掉（键是它自己的裸资源指针），再走延迟删除。
+    if (ctx != nullptr && obj->resource) {
+        ctx->resourceState.erase(obj->resource.Get());
+    }
+    dbgLogInfo("B4: module destroys a private DLSS texture: handle=%p resource=%p", object,
+               obj->resource ? static_cast<void*>(obj->resource.Get()) : nullptr);
+    destroyObject(obj);
+}
+}  // namespace
+
+// B3：DLSS 诊断读回回调（DlssReadbackFn，语义见 mcdr_dlss_impl.h:100-111）。
+//
+// **指针约定（两侧必须一致，改之前先读这一段）**：
+//   * `ctxOpaque`  = 本模块的 `CommandContext*`，就是 evaluate 时的 tlCtx；
+//   * `resourceOpaque` = **裸 `ID3D12Resource*`**，不是 `Dx12Object*` 包装句柄。
+//     方向与入口处相反：JVM 送来的 `pIn*` 是包装句柄，applyDlssToTexture 先
+//     unwrap（见下面的 unwrapResource）再交给实现单元；而读回是从实现单元往本模块走，
+//     它手里只有裸资源 —— 而且被 dump 的纹理里有两张是**它自己** CreateCommittedResource
+//     出来的（私有 UAV、深度快照），本模块根本没有对应包装体，也没有裸指针→包装体的反查
+//     表（Dx12Object 没有全局登记），所以只能按"裸资源"约定。
+//   * 本函数现场包一个**栈上** `Dx12Object` 只为复用 readbackTextureStats 的签名。这个
+//     包装体不参与所有权，也不另开一份状态：资源状态跟踪 `ctx->resourceState` 以裸
+//     `ID3D12Resource*` 为键（mcdr_device.cppm:611），所以过渡照旧是跟踪型、幂等；
+//     `ComPtr` 赋值会 AddRef 一次、栈对象析构时 Release，调用方持有的资源生命周期不受
+//     影响（也可能从 createBuffer 的池里拿到的 READBACK buffer 是同一套规则）。
+// 返回 1 = 上一帧的读数已填好，0 = 还没有读数，-1 = 失败（见 mcdr_dlss_impl.h）。
+int32_t dlssReadbackThunk(void* ctxOpaque, void* resourceOpaque, DlssTexStats* out) {
+    auto* ctx = static_cast<CommandContext*>(ctxOpaque);
+    auto* raw = static_cast<ID3D12Resource*>(resourceOpaque);
+    if (ctx == nullptr || raw == nullptr || out == nullptr) {
+        return 0;
+    }
+    Dx12Object probe;  // 仅作视图，不拥有资源
+    probe.kind = Dx12Object::Kind::Texture;
+    probe.resource = raw;  // AddRef；probe 析构时 Release
+    probe.heapType = D3D12_HEAP_TYPE_DEFAULT;
+    probe.dxgiFormat = raw->GetDesc().Format;
+    return readbackTextureStats(ctx, &probe, out);
+}
+
 bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
     // P108（用户 m10920）：闸门是**独立的 DLSS 开关**，不再看 aaMode。DLSS 与抗锯齿互不
     // 相干，两者都开时先 SMAA 再 DLSS 升采样（SMAA 的三趟在本函数之前跑，作用在同一张
@@ -7157,17 +7709,112 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
     // Quality, which is what the old ratio-based choice picked at 640x360->854x480) actually take
     // effect even when the JVM never calls the setter.
     mcdr_dlss_request_quality(gCtx.dlssQualityTier);
+    // P108ac (user m08033): same re-assert for the DLSS model, and for the same reason — the
+    // implementation unit's state can be reset behind the device module's back, and a silently
+    // reverted preset would look exactly like "the button does nothing" in the user's report.
+    mcdr_dlss_request_preset(gCtx.dlssPreset);
+    // P108 (user m11147 follow-up): re-assert the JVM-supplied output texture EVERY frame, next to
+    // the tier above and for the same reason — the hand-off is one-shot on the JVM side
+    // (`handed … 1`, `dx12SetDlssOutput(0)` never called), while the implementation unit's state can
+    // be reset behind its back. Diagnosed from a joint run where `override accepted` (01:24:44.258)
+    // and the first evaluate (01:24:45.458) were on the SAME thread with no device recreate, yet
+    // the evaluate chose the private fallback: `s.externalOutput` had gone null with no
+    // `override cleared` line, and the only writer that can do that silently is
+    // `mcdr_dlss_shutdown`'s blanket `s = State{}`. Re-asserting here makes the hand-off idempotent
+    // and self-healing rather than depending on nothing in between touching that state.
+    // `mcdr_dlss_set_output_texture` early-returns when the pointer is unchanged.
+    {
+        void* overrideRaw = nullptr;
+        if (gCtx.dlssOutputOverride != nullptr) {
+            auto* oObj = reinterpret_cast<Dx12Object*>(gCtx.dlssOutputOverride);
+            if (oObj->kind == Dx12Object::Kind::Texture && oObj->resource) {
+                overrideRaw = reinterpret_cast<void*>(oObj->resource.Get());
+            }
+        }
+        mcdr_dlss_set_output_texture(overrideRaw);
+    }
     const int32_t created = mcdr_dlss_create(reinterpret_cast<void*>(ctx->commandList), &resolved,
                                              tl, ctx);
     if (created != 1) {
         return false;
     }
+    // P108x: EVIDENCE + FIX for the DXGI_ERROR_INVALID_CALL (0x887A0001) that removes the device
+    // 1 ms after a "successful" evaluate. NGX records a COMPUTE dispatch, and D3D12 forbids that
+    // while render targets are still bound — the classic source of INVALID_CALL. So: report the
+    // preconditions, then unconditionally unbind the RTVs (harmless when none were bound).
+    {
+        static bool s_loggedPre = false;
+        if (!s_loggedPre) {
+            s_loggedPre = true;
+            dbgLogInfo("P108x: evaluate preconditions: inRenderPass=%d listOpen=%d",
+                    static_cast<int>(ctx->inRenderPass), ctx->listOpen ? 1 : 0);
+        }
+    }
+    if (ctx->inRenderPass) {
+        // Whoever left a pass open (the JVM hook sits after the world pass) has to be named in the
+        // log, otherwise this stays invisible: the pass state and the call site disagree.
+        dbgLogWarn("P108x: a render pass was still open at the DLSS evaluate (inRenderPass=1); ending it "
+                "so NGX's compute dispatch is legal. The caller is expected to begin its own pass "
+                "afterwards — nothing is restarted here.");
+        (void)endRenderPass(ctx);
+    }
+    // NOTE: an explicit `OMSetRenderTargets(0, nullptr, ...)` is NOT used here — this TU's command
+    // list handle is not a plain `ID3D12GraphicsCommandList*` for that call. Ending the tracked pass
+    // (above) already returns every attachment to COMMON, which is what makes the compute dispatch
+    // legal; if the device still reports INVALID_CALL we will look at descriptor heaps / list state
+    // next, with the debug layer on.
     const int32_t evaluated =
-        mcdr_dlss_evaluate(reinterpret_cast<void*>(ctx->commandList), &resolved, tl, ctx);
+        mcdr_dlss_evaluate(reinterpret_cast<void*>(ctx->commandList), &resolved, tl, ctx,
+                           // B3：读回回调。7 项诊断 dump 全部走它（模块的 copyTextureToBuffer
+                           // + 跟踪型过渡 + 本模块 fence），实现单元不再自建命令列表/队列/
+                           // 围栏/staging，也不再打裸 ResourceBarrier —— 那正是 #525/#527/
+                           // #838 与 RemoveDevice 的来源。语义见 dlssReadbackThunk 上方。
+                           &dlssReadbackThunk);
+    // P108x: the device is removed ~1 ms after a SUCCESSFUL evaluate (reproducible, and only once
+    // the depth snapshot carries real content), so ask the device for its own verdict right here.
+    // `logDeviceStatus` prints GetDeviceRemovedReason plus the InfoQueue, which is the only thing
+    // that separates "GPU hang" from "an invalid resource/descriptor was handed to NGX".
+    {
+        static bool s_loggedEvalStatus = false;
+        if (!s_loggedEvalStatus) {
+            s_loggedEvalStatus = true;
+            logDeviceStatus("dlss-evaluate");
+        }
+    }
     if (evaluated != 1) {
         return false;
     }
     return true;
+}
+
+// P108（用户 m11147 后续）：登记 JVM 送来的 UAV 输出纹理（(B) 方案）。
+//
+// 本函数做**解包**：`Dx12Object` 的布局只有本模块知道，而 DLSS 实现单元是普通 TU、看不到它
+// （历史教训：那边曾把包装体地址当 ID3D12Resource* 用，`[wrapper+0]` 读到的其实是 Kind 那个
+// int，于是 lpVtbl=0、首次 `mv->GetDesc()` 就 `call 0` 崩溃）。所以这里取出裸资源再往下传。
+//
+// 只登记句柄、不持有引用；资源生命周期由 JVM 侧那个 Dx12Object 保证。
+// 返回 1=已接受 0=已清除 -1=句柄不是纹理资源（调用方应视为无效、保持原状）。
+int setDlssOutput(mcdr_object* tex) {
+    if (tex == nullptr) {
+        gCtx.dlssOutputOverride = nullptr;
+        mcdr_dlss_set_output_texture(nullptr);
+        dbgLogInfo("P108: DLSS output override cleared (back to the private fallback)");
+        return 0;
+    }
+    auto* obj = reinterpret_cast<Dx12Object*>(tex);
+    if (obj->kind != Dx12Object::Kind::Texture || !obj->resource) {
+        dbgLogError("P108: mcdr_dx12SetDlssOutput got a handle that is not a live texture "
+                    "(kind=%d); ignored",
+                    static_cast<int>(obj->kind));
+        return -1;
+    }
+    gCtx.dlssOutputOverride = tex;
+    const int32_t r = mcdr_dlss_set_output_texture(reinterpret_cast<void*>(obj->resource.Get()));
+    dbgLogInfo("P108: DLSS output override accepted (raw resource %p); the evaluate will write "
+               "there instead of the private UAV texture",
+               static_cast<void*>(obj->resource.Get()));
+    return r == 1 ? 1 : 0;
 }
 
 // P108（用户 m11147）：DLSS 挡位显式指定（Java 侧已把"性能/平衡/质量"做成独立按钮）。
@@ -7177,9 +7824,9 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
 // CreateFeature 的输入，不能只在 Evaluate 参数上改。
 // 越界返回 -1 且不改变现状；返回归一化后的档位。
 int setDlssQuality(int tier) {
-    if (tier < 0 || tier > 2) {
+    if (tier < 0 || tier > 3) {
         dbgLogError("P108: invalid DLSS quality tier %d (valid: 0=Performance 1=Balanced "
-                    "2=Quality)",
+                    "2=Quality 3=DLAA)",
                     tier);
         return -1;
     }
@@ -7190,9 +7837,35 @@ int setDlssQuality(int tier) {
         mcdr_dlss_request_quality(tier);
         dbgLogInfo("P108: DLSS quality tier = %d (%s) — the feature will be recreated on the next "
                    "frame",
-                   tier, tier == 0 ? "Performance" : (tier == 1 ? "Balanced" : "Quality"));
+                   tier, tier == 0 ? "Performance"
+                                   : (tier == 1 ? "Balanced" : (tier == 2 ? "Quality" : "DLAA")));
     }
     return tier;
+}
+
+// P108ac（用户 m08033）：DLSS 的**模型**（NGX 的 render preset 提示）。用户反馈"剩下的噪点闪烁
+// 是 DLSS 自身的问题，所有用 DLSS 的游戏都会出现，优化方法是更换 DLSS 的模型"。
+//
+// 语义与 setDlssQuality 完全平行：0=Default（交给 NGX 按挡位自选，也是历史行为），
+// 5=E / 6=F（已弃用的 CNN 预设），10=J / 11=K / 12=L / 13=M（transformer）。预设是
+// CreateFeature 的输入，所以值一变化就让实现单元在下一帧重建特征。
+// 越界返回 -1 且不改变现状；返回实际记录的预设值。
+int setDlssRenderPreset(int preset) {
+    if (preset < 0 || preset > 15) {
+        dbgLogError("P108: invalid DLSS render preset %d (valid: 0=Default 5=E 6=F 10=J 11=K "
+                    "12=L 13=M)",
+                    preset);
+        return -1;
+    }
+    const int prev = gCtx.dlssPreset;
+    gCtx.dlssPreset = preset;
+    if (preset != prev) {
+        mcdr_dlss_request_preset(preset);
+        dbgLogInfo("P108: DLSS render preset = %d — the feature will be recreated on the next "
+                   "frame",
+                   preset);
+    }
+    return preset;
 }
 
 // P108：深度快照（详见 mcdr_dlss_impl.h）。JVM 在**清深度之前**那一处调用它；本函数只做

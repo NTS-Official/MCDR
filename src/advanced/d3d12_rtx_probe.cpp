@@ -26,6 +26,12 @@ void* mcdr_dlss_ngx_feature_info(void);
 int32_t mcdr_dlss_register_vendor_dir(const char* utf8Dir, int32_t cap);
 }
 
+// JSON 一律用 vcpkg 的 nlohmann/json（vcpkg.json 已声明 nlohmann-json）。这里拼的是
+// 「字段串」（不含外侧花括号），由调用方并入更大的对象。
+// 必须放在 import std 之前：该头会 include <string>/<map> 等标准头，
+// 在 import std 之后再 include 会被 MSVC 拒绝。
+#include <nlohmann/json.hpp>
+
 import std;
 // ---------------------------------------------------------------------------
 // NRD：静态库，直接链进 MCDR.dll，没有运行期 DLL
@@ -112,7 +118,7 @@ namespace
     std::string moduleDirectory()
     {
         wchar_t path[MAX_PATH * 2] = {};
-        const DWORD n = ::GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
+        const DWORD n = ::GetModuleFileNameW(nullptr, path, std::size(path));
         if (n == 0 || n >= std::size(path))
         {
             return {};
@@ -431,99 +437,65 @@ namespace mcdr
         return s;
     }
 
+    // nlohmann 对象 -> 「字段串」：`{"a":1,"b":2}` → `"a":1,"b":2`。
+    // 空对象返回空串，调用方据此跳过逗号。
+    static std::string jsonFieldsOf(const nlohmann::json& obj)
+    {
+        std::string text = obj.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+        if (text.size() < 2 || text.front() != '{' || text.back() != '}')
+        {
+            return std::string();
+        }
+        text.erase(text.size() - 1);
+        text.erase(0, 1);
+        return text;
+    }
+
     std::string RtxSupport::jsonFragment() const
     {
-        const auto b = [](bool v) { return v ? "true" : "false"; };
-        std::string j;
-        j += "\"rtx_dlss_probed\":";
-        j += b(dlssProbed);
-        j += ",\"rtx_dlss_runtime\":";
-        j += b(ngxRuntime);
-        j += ",\"rtx_dlss_sr\":";
-        j += b(dlssSuperResolution);
-        j += ",\"rtx_dlss_fg\":";
-        j += b(dlssFrameGeneration);
-        j += ",\"rtx_dlss_rr\":";
-        j += b(dlssRayReconstruction);
+        nlohmann::json j;
+        j["rtx_dlss_probed"] = dlssProbed;
+        j["rtx_dlss_runtime"] = ngxRuntime;
+        j["rtx_dlss_sr"] = dlssSuperResolution;
+        j["rtx_dlss_fg"] = dlssFrameGeneration;
+        j["rtx_dlss_rr"] = dlssRayReconstruction;
+        j["rtx_dlss_runtime_path"] = ngxRuntimePath;
+        j["rtx_dlss_note"] = ngxNote;
+        j["rtx_dlss_sr_why"] = dlssSuperResolutionWhy;
+        j["rtx_dlss_fg_why"] = dlssFrameGenerationWhy;
+        j["rtx_dlss_rr_why"] = dlssRayReconstructionWhy;
 
-        const auto str = [](const std::string& in) {
-            std::string o = "\"";
-            for (const char c : in)
-            {
-                if (c == '"' || c == '\\')
-                {
-                    o += '\\';
-                    o += c;
-                }
-                else if (c == '\n')
-                {
-                    o += "\\n";
-                }
-                else
-                {
-                    o += c;
-                }
-            }
-            o += "\"";
-            return o;
-        };
-        j += ",\"rtx_dlss_runtime_path\":" + str(ngxRuntimePath);
-        j += ",\"rtx_dlss_note\":" + str(ngxNote);
-        j += ",\"rtx_dlss_sr_why\":" + str(dlssSuperResolutionWhy);
-        j += ",\"rtx_dlss_fg_why\":" + str(dlssFrameGenerationWhy);
-        j += ",\"rtx_dlss_rr_why\":" + str(dlssRayReconstructionWhy);
-
-        j += ",\"rtx_nrd_linked\":";
-        j += b(nrdLinked);
-        j += ",\"rtx_nrd_version\":" + str(nrdVersion);
-        j += ",\"rtx_nrd_version_date\":" + str(nrdVersionDate);
-        j += ",\"rtx_nrd_denoisers\":[";
-        for (std::size_t i = 0; i < nrdDenoisers.size(); ++i)
-        {
-            if (i)
-            {
-                j += ",";
-            }
-            j += str(nrdDenoisers[i]);
-        }
-        j += "]";
+        j["rtx_nrd_linked"] = nrdLinked;
+        j["rtx_nrd_version"] = nrdVersion;
+        j["rtx_nrd_version_date"] = nrdVersionDate;
+        j["rtx_nrd_denoisers"] = nrdDenoisers;
 
         // ---- XeSS ----
-        j += ",\"rtx_xess_probed\":";
-        j += b(xessProbed);
-        j += ",\"rtx_xess_runtime\":";
-        j += b(xessRuntime);
-        j += ",\"rtx_xess_version\":" + str(xessVersion);
-        j += ",\"rtx_xess_file_version\":" + str(xessFileVersion);
-        j += ",\"rtx_xess_runtime_path\":" + str(xessRuntimePath);
-        j += ",\"rtx_xess_note\":" + str(xessNote);
+        j["rtx_xess_probed"] = xessProbed;
+        j["rtx_xess_runtime"] = xessRuntime;
+        j["rtx_xess_version"] = xessVersion;
+        j["rtx_xess_file_version"] = xessFileVersion;
+        j["rtx_xess_runtime_path"] = xessRuntimePath;
+        j["rtx_xess_note"] = xessNote;
         // 注意键名是 present：只代表运行时文件在，不代表硬件支持。
-        j += ",\"rtx_xess_fg_present\":";
-        j += b(xessFrameGenPresent);
-        j += ",\"rtx_xess_low_latency_present\":";
-        j += b(xessLowLatencyPresent);
+        j["rtx_xess_fg_present"] = xessFrameGenPresent;
+        j["rtx_xess_low_latency_present"] = xessLowLatencyPresent;
 
         // ---- FidelityFX ----
-        j += ",\"rtx_ffx_probed\":";
-        j += b(ffxProbed);
-        j += ",\"rtx_ffx_loader\":";
-        j += b(ffxLoaderLoaded);
-        j += ",\"rtx_ffx_loader_version\":" + str(ffxLoaderVersion);
-        j += ",\"rtx_ffx_loader_path\":" + str(ffxLoaderPath);
-        j += ",\"rtx_ffx_note\":" + str(ffxNote);
-        j += ",\"rtx_ffx_upscaler_present\":";
-        j += b(ffxUpscalerPresent);
-        j += ",\"rtx_ffx_upscaler_version\":" + str(ffxUpscalerVersion);
-        j += ",\"rtx_ffx_framegen_present\":";
-        j += b(ffxFrameGenPresent);
-        j += ",\"rtx_ffx_framegen_version\":" + str(ffxFrameGenVersion);
-        j += ",\"rtx_ffx_denoiser_present\":";
-        j += b(ffxDenoiserPresent);
-        j += ",\"rtx_ffx_denoiser_version\":" + str(ffxDenoiserVersion);
-        j += ",\"rtx_ffx_radiancecache_present\":";
-        j += b(ffxRadianceCachePresent);
-        j += ",\"rtx_ffx_radiancecache_version\":" + str(ffxRadianceCacheVersion);
-        return j;
+        j["rtx_ffx_probed"] = ffxProbed;
+        j["rtx_ffx_loader"] = ffxLoaderLoaded;
+        j["rtx_ffx_loader_version"] = ffxLoaderVersion;
+        j["rtx_ffx_loader_path"] = ffxLoaderPath;
+        j["rtx_ffx_note"] = ffxNote;
+        j["rtx_ffx_upscaler_present"] = ffxUpscalerPresent;
+        j["rtx_ffx_upscaler_version"] = ffxUpscalerVersion;
+        j["rtx_ffx_framegen_present"] = ffxFrameGenPresent;
+        j["rtx_ffx_framegen_version"] = ffxFrameGenVersion;
+        j["rtx_ffx_denoiser_present"] = ffxDenoiserPresent;
+        j["rtx_ffx_denoiser_version"] = ffxDenoiserVersion;
+        j["rtx_ffx_radiancecache_present"] = ffxRadianceCachePresent;
+        j["rtx_ffx_radiancecache_version"] = ffxRadianceCacheVersion;
+        return jsonFieldsOf(j);
     }
 
     namespace

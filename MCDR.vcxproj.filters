@@ -38,19 +38,62 @@
     <Filter Include="源文件\Core">
       <UniqueIdentifier>{c14e8a72-5d36-4b90-a7f1-8e62d3b40a55}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Git">
+      <UniqueIdentifier>{65e87141-94df-4d6f-bb84-3d6c7ad16cd0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="vcpkg">
+      <UniqueIdentifier>{67ad78c8-1db5-475f-846a-c5c05be7adbe}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="文档">
+      <UniqueIdentifier>{5ee6661a-0203-4fdb-a269-1728a26b5f2e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Clang">
+      <UniqueIdentifier>{290ccbfd-679b-4539-b160-436dd406c8ce}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Git\GitHub Workflow">
+      <UniqueIdentifier>{d1d639b8-87f2-45d0-83ce-a5b66263bf1b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="解决方案">
+      <UniqueIdentifier>{a2e5ce29-54df-41f7-b36e-8c6c7a16533e}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
-    <None Include="cpp.hint" />
-    <None Include="vcpkg.json" />
-    <None Include=".clang-format" />
-    <None Include=".gitattributes" />
-    <None Include=".gitignore" />
-    <None Include="AGENTS.MD" />
-    <None Include="LICENSE" />
-    <None Include="MCDR.slnx" />
-    <None Include="README.md" />
-    <None Include="README_ZH.MD" />
-    <None Include="vcpkg-configuration.json" />
+    <None Include=".gitattributes">
+      <Filter>Git</Filter>
+    </None>
+    <None Include=".gitignore">
+      <Filter>Git</Filter>
+    </None>
+    <None Include="AGENTS.MD">
+      <Filter>文档</Filter>
+    </None>
+    <None Include="README.md">
+      <Filter>文档</Filter>
+    </None>
+    <None Include="README_ZH.MD">
+      <Filter>文档</Filter>
+    </None>
+    <None Include="vcpkg-configuration.json">
+      <Filter>vcpkg</Filter>
+    </None>
+    <None Include="vcpkg.json">
+      <Filter>vcpkg</Filter>
+    </None>
+    <None Include=".clang-format">
+      <Filter>Clang</Filter>
+    </None>
+    <None Include="LICENSE">
+      <Filter>文档</Filter>
+    </None>
+    <None Include=".github\workflows\msbuild.yml">
+      <Filter>Git\GitHub Workflow</Filter>
+    </None>
+    <None Include="MCDR.slnx">
+      <Filter>解决方案</Filter>
+    </None>
+    <None Include="cpp.hint">
+      <Filter>解决方案</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\mcdr_abi.h">
@@ -142,17 +185,17 @@
     <ClCompile Include="src\core\d3d12_async_fence.cpp">
       <Filter>源文件\Core</Filter>
     </ClCompile>
-    <ClCompile Include="src\advanced\d3d12_rtx_probe.cpp">
-      <Filter>源文件\Core</Filter>
-    </ClCompile>
     <ClCompile Include="src\advanced\d3d12_mesh_base.cpp">
       <Filter>源文件\Advanced</Filter>
     </ClCompile>
-    <ClCompile Include="src\advanced\smaa_luts.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
     <ClCompile Include="src\advanced\d3d12_dlss.cpp">
-      <Filter>源文件</Filter>
+      <Filter>源文件\Advanced</Filter>
+    </ClCompile>
+    <ClCompile Include="src\advanced\smaa_luts.cpp">
+      <Filter>源文件\Advanced</Filter>
+    </ClCompile>
+    <ClCompile Include="src\advanced\d3d12_rtx_probe.cpp">
+      <Filter>源文件\Advanced</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

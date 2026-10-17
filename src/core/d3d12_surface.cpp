@@ -954,6 +954,9 @@ mcdr::Result<void> acquireSurface(Dx12Surface* s) {
     // P34 诊断：记录 GetCurrentBackBufferIndex 的原始返回值和 HRESULT
     UINT rawIdx = s->swapChain->GetCurrentBackBufferIndex();
     s->currentImageIndex = static_cast<int>(rawIdx);
+    if (p109TraceEnabled()) {
+        dbgLogInfo("P109 op acquire surface=%p idx=%u", reinterpret_cast<void*>(s), rawIdx);
+    }
     UINT bbCount = static_cast<UINT>(s->backBuffers.size());
     dbgLogDebug("acquireSurface: rawIdx=%u bbCount=%u currentImageIndex=%d", rawIdx, bbCount,
                 s->currentImageIndex);
@@ -1047,6 +1050,35 @@ mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* 
     dbgLogDebug("blitSurface: cmd=%p dst=%p idx=%d w=%u h=%u srcTex=%p", reinterpret_cast<void*>(cmd),
                 reinterpret_cast<void*>(dst), s->currentImageIndex, w, h, reinterpret_cast<void*>(srcTex));
 
+    // P109（#538 修复）：back buffer 必须**显式登记**进 ctx->resourceState，其稳定态是
+    // PRESENT（flip-model 下 Present 之后就是这么个状态；数值 0，调试层打印成
+    // "COMMON|PRESENT"）。三张 back buffer 一起登记，轮转时按索引复用同一份登记，
+    // 绝不依赖"未登记 → COMMON 兜底"（D.9 铁律 2：未登记资源上 stateOf/transitionTo
+    // 拿到的 Before 都是 COMMON，等于没查）。
+    for (UINT i = 0; i < s->backBuffers.size(); ++i) {
+        ID3D12Resource* bb = s->backBuffers[i].Get();
+        if (bb && ctx->resourceState.find(bb) == ctx->resourceState.end()) {
+            ctx->resourceState[bb] = D3D12_RESOURCE_STATE_PRESENT;
+        }
+    }
+    if (p109TraceEnabled()) {
+        dbgLogInfo("P109 op blit ctx=%p idx=%d dst=%p inPass=%d cmd=%p", reinterpret_cast<void*>(ctx),
+                   s->currentImageIndex, reinterpret_cast<void*>(dst), static_cast<int>(ctx->inRenderPass),
+                   reinterpret_cast<void*>(cmd));
+    }
+    if (ctx->inRenderPass) {
+        // 诊断（限 3 次）：blit 被录在一条**仍打开的 render pass** 里。这是 #538 的可疑成因——
+        // blit 会把 back buffer 的 RTV 绑上，而 pass 自己的附件绑定已经被覆盖；pass 结束时
+        // endRenderPass 只回切它自己的附件，不会管 back buffer。
+        static int p109InPassBlits = 0;
+        if (p109InPassBlits < 3) {
+            ++p109InPassBlits;
+            dbgLogWarn("P109 blitSurface recorded INSIDE an open render pass (ctx=%p idx=%d): "
+                       "the pass' attachments were rebound to the back buffer",
+                       reinterpret_cast<void*>(ctx), s->currentImageIndex);
+        }
+    }
+
     // 源纹理可能是本帧渲染 pass 的输出（RENDER_TARGET/DEPTH_WRITE），或刚
     // 上传完的 COMMON；按跟踪状态过渡到 COPY_SOURCE 再拷贝。
     if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1129,9 +1161,11 @@ mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* 
         // 1. PRESENT → RENDER_TARGET
         // 使用 transitionTo 而非裸 barrier：将 dst 纳入 ctx->resourceState 跟踪，
         // 使 endCommandList 的 PRESENT 清理循环能正确回切到 COMMON。
-        // 初始锚点用 COMMON（flip model 下实际为 PRESENT，但 PRESENT→RENDER_TARGET
-        // 与 COMMON→RENDER_TARGET 等价，driver 会忽略冗余 PRESENT→PRESENT barrier）。
-        transitionTo(ctx, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        // P109（#538 修复）：Before 锚点必须是 **PRESENT**，不是 COMMON。flip-model 下
+        // back buffer 在 Present 之后（以及 acquire 之后）的稳定态就是 PRESENT
+        // （= 0，调试层显示 COMMON|PRESENT）；上面已经把它显式登记进 resourceState，
+        // 所以这里 fromInitial 只在"本 list 内还没登记过"时用到。绝不依赖 COMMON 兜底。
+        transitionTo(ctx, dst, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
         // 2. 绑定 RTV 和根签名
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[static_cast<size_t>(s->currentImageIndex)];
@@ -1188,7 +1222,17 @@ mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* 
         }
 
         // 6. RENDER_TARGET → PRESENT
-        transitionTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        // P109（#538 修复）：blit 是本帧对 back buffer 的最后一次 GPU 写入，之后它必须
+        // 回到 PRESENT 才能 Present。这一步的 Before 从跟踪表读（上一步刚写成 RT）。
+        transitionTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                     D3D12_RESOURCE_STATE_PRESENT);
+        // P109（#538 根因修复）：把 back buffer 的 RTV **解绑**。命令列表状态里的
+        // OMSetRenderTargets 会一直留到下一次 OMSetRenderTargets，而 back buffer 这时
+        // 已经切回 PRESENT(0)；只要同一列表里 blit 之后还有 draw（例如某个 pass 在
+        // blit 之前 begin、blit 之后才继续画），调试层就会把每一条 draw 判成
+        // "#538：拿 COMMON|PRESENT 当 RENDER_TARGET"。实测一轮 35 条全挤在 2 ms 内，
+        // 就是这个形状。解绑后这类残留绑定不可能再触发 #538。
+        cmd->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
 
         // 7. 源纹理 → COMMON（为下一帧 beginRenderPass 准备）
         if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
@@ -1299,6 +1343,16 @@ void presentSurface(Dx12Surface* s) {
     if (!s || !s->swapChain) {
         return;
     }
+    if (p109TraceEnabled()) {
+        dbgLogInfo("P109 op present surface=%p idx=%d blitted=%d", reinterpret_cast<void*>(s),
+                   s->currentImageIndex, static_cast<int>(s->blittedThisFrame.load()));
+    }
+    // P109（#538 修复）状态约定：back buffer 的 RT→PRESENT 过渡**不能**在这里做——
+    // 本函数跑在渲染线程上，调用时该帧的命令列表早已 Close+Execute（见
+    // d3d12_device.cpp 的 renderThreadFunc：submitCommandList → presentSurface），
+    // 往已关闭的列表里记 barrier 是非法的。正确的收口点在 blitSurface 尾部：那里在
+    // 最后一次 draw 之后按跟踪状态 transitionTo(..., PRESENT) 并解绑 RTV。
+    // 本函数只负责确认"看起来不合法"的情况并记账，不碰命令列表。
     // P95（叠帧/闪烁根因）：只有本帧真的 blit 过才 Present。vanilla 的 blit/present 门只看
     // 包装层的 hasBlittedTexture / isAcquired（com/mojang/blaze3d/systems/GpuSurface.java），
     // 与我们后端是否真的 acquire + blit 成功脱钩：P48 推迟 acquire 失败时

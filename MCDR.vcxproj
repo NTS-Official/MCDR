@@ -258,6 +258,7 @@
   <ItemGroup>
     <None Include=".clang-format" />
     <None Include=".gitattributes" />
+    <None Include=".github\workflows\msbuild.yml" />
     <None Include=".gitignore" />
     <None Include="AGENTS.MD" />
     <None Include="cpp.hint" />

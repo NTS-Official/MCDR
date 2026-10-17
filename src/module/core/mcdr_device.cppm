@@ -128,11 +128,30 @@ int setDlssEnabled(int enabled);
 // 的世界渲染状态机。返回 1=已建立/复用快照 0=参数不可用 -1=创建或拷贝失败（已 WARN 一次）。
 int snapshotDlssDepth(CommandContext* ctx, mcdr_object* depth);
 
-// P108（用户 m11147）：DLSS 挡位显式指定。档位**变化要触发特征重建**（即使尺寸没变），所以
-// 这里除了改字段还要把实现单元的一次性失败闸门复位，让下一帧重建。
-// tier：0=Performance 1=Balanced 2=Quality；越界返回 -1（不改变现状）。返回归一化后的档位。
+// P108（用户 m11147 / m11796）：DLSS 挡位显式指定。档位**变化要触发特征重建**（即使尺寸没变），
+// 所以这里除了改字段还要把实现单元的一次性失败闸门复位，让下一帧重建。
+// tier：0=Performance 1=Balanced 2=Quality **3=DLAA**；越界返回 -1（不改变现状）。
+// DLAA 复用同一条管线（深度快照 / MV / 输出 handover / 拷回），只是 PerfQuality 不同、且
+// 要求 **render == target**（1:1，不放大）；若请求 3 而 render != target，实现单元会打 ERROR 并退回
+// Quality 档，绝不静默生成"假 DLAA"。
+// 已知限制：DLAA 的质量依赖投影 jitter，而 P75 的 jitter 路径目前冻结为 0（避免米白帧回归），
+// 所以这版是"无 jitter 的时间累积 DLAA"——可用但非标准；P75 修好后自动受益，不要为它解冻 jitter。
+// 返回归一化后的档位。
 // 幂等；设备还没建也能调（只记录状态）。
 int setDlssQuality(int tier);
+
+// P108ac（用户 m08033）：DLSS 的**模型**（NGX render preset）。用户反馈"剩下的噪点闪烁是 DLSS
+// 自身的问题，所有用 DLSS 的游戏都会出现，优化方法是更换 DLSS 的模型"。
+// preset：0=Default（NGX 按挡位自选）、5=E / 6=F（已弃用 CNN）、10=J / 11=K / 12=L / 13=M
+// （transformer）。预设是 CreateFeature 的输入 ⇒ 变化要触发特征重建，机制与挡位完全相同。
+// 越界返回 -1（不改变现状）；返回记录的预设值。幂等；设备还没建也能调（只记录状态）。
+int setDlssRenderPreset(int preset);
+
+// P108（用户 m11147 后续）：登记 JVM 送来的 UAV 输出纹理。本函数负责**解包**（`Dx12Object`
+// 的布局只有本模块知道），再把裸 `ID3D12Resource*` 交给 DLSS 实现单元 —— 实现单元绝不
+// reinterpret JVM 句柄（那是空 vtable 崩溃的成因）。tex 为 nullptr 表示清除、退回实现单元
+// 自建的私有兜底。返回 1=已接受 0=已清除 -1=句柄不是纹理资源。
+int setDlssOutput(mcdr_object* tex);
 
 // 高频调试宏：默认静默，DX12_LOG_VERBOSE=1 或编译时 DX12_DEBUG_VERBOSE 宏开启
 // 注意：宏展开必须写全命名空间（d3d12_mc::）——否则在 namespace 之外使用该宏的 TU
@@ -294,6 +313,14 @@ struct DeviceContext {
     // 按比例就近选到的正是 MaxQuality，所以默认值下行为与加这个字段之前完全一致。
     // -1 = JVM 从未设过 ⇒ 退回 chooseQuality 的比例就近逻辑（旧 DLL/旧 JVM 组合）。
     int dlssQualityTier = 2;
+    // P108ac（用户 m08033）：DLSS 的**模型**（NGX render preset）。语义见 setDlssRenderPreset：
+    // 0 = Default（NGX 按挡位自选，即历史行为），10 = J / 11 = K / 12 = L / 13 = M。
+    int dlssPreset = 0;
+    // P108（用户 m11147 后续）：JVM 送来的 **UAV 输出纹理**（它经模块 createTexture 建的）。
+    // 非空时 DLSS 写它、而不是实现单元自建的私有纹理 —— 后者被控制组证明"承载不了写入"
+    // （同源同调用点：模块建的目标读回 17.8/16.5/11.6/255，自建纹理全 0 且落定后仍 0）。
+    // 只登记句柄、不持有引用；实现单元拿到的是本模块解包后的裸 ID3D12Resource*。
+    mcdr_object* dlssOutputOverride = nullptr;
     // 中间纹理：edges（边检测输出，源分辨率，RG8）→ weights（混合权重，源分辨率，RG8）。
     ComPtr<ID3D12Resource> smaaEdges;
     ComPtr<ID3D12Resource> smaaWeights;
@@ -421,6 +448,22 @@ inline bool frameTraceEnabled() {
     }();
     return enabled;
 }
+
+// P109（诊断，默认关）：按顺序记录 render-op（begin/end render pass、blit、draw、
+// present、acquire、begin list）序列，用于定位"某条 draw 的绑定跟预期不一致"这类
+// 状态错配（#538：把 COMMON|PRESENT 的 back buffer 当 RENDER_TARGET 画）。
+// 只写日志、**不发任何 GPU 调用**，因此不会像 D.9 里的 raw barrier 那样与
+// ctx->resourceState 分叉。环境变量 MCDR_P109_TRACE=1 打开。
+inline bool p109TraceEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("MCDR_P109_TRACE");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
+
+
 // P33 fix：flush 延迟删除对象，在 destroySurface 等 present fence 后调用，
 // 确保 GPU 工作完成后再释放资源。
 // P46：默认只释放 queue fence 已确认完成的条目（不阻塞）；force=true 时
@@ -581,6 +624,12 @@ struct CommandContext {
     // beginCommandList 以 GENERIC_READ 为初始态假设，GPU 实际状态必须匹配。
     std::unordered_set<ID3D12Resource*> stagingCopySourceResources;
 
+    // P109（#538 根因修复）：本 ctx 的帧级 RTV/DSV 句柄缓存属于描述符堆的哪一代（见
+    // d3d12_device.cpp 的 gFrameViewGeneration / UINT gNextFrameRtv 的说明）。代不一致 ⇒
+    // 缓存里的句柄可能已被别的 ctx 覆盖成另一张资源的视图，必须整体重建。
+    unsigned int frameViewGeneration = 0;
+
+    
     // P6：当前绑定的管线，用于 setVertexBuffer 查找修正 stride
     Dx12Pipeline* currentPipeline = nullptr;
 

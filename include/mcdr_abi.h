@@ -355,6 +355,41 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12SnapshotDlssDepth(mcdr_command_ctx* ctx, mcd
 // configuration, so behaviour is unchanged until the Java side sets a tier.
 MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssQuality(int32_t tier);
 
+// P108ac (user m08033): the DLSS *model*, exposed as NGX's "render preset" hint.
+//
+// The user reported that the remaining noise/flicker is inherent to DLSS (every game using DLSS
+// shows it) and that the remedy is to change the model, so this hands the JVM that knob rather
+// than having MCDR silently pick a different default.
+//   preset: a NVSDK_NGX_DLSS_Hint_Render_Preset value —
+//           0  = Default (NGX picks per tier: K for DLAA/Balanced/Quality, M for Performance,
+//                L for Ultra Performance) — this is the historical behaviour,
+//           5  = E, 6 = F   (deprecated CNN presets),
+//           10 = J, 11 = K, 12 = L, 13 = M   (transformer presets).
+// Out-of-range is rejected with -1 and changes nothing; otherwise the recorded value is returned.
+// Idempotent, and callable before the device exists (only the state is recorded).
+//
+// A change REBUILDS the DLSS feature even when the render/target sizes are unchanged, because the
+// preset is an input to CreateFeature, not an Evaluate parameter.
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssRenderPreset(int32_t preset);
+
+// P108 (user m11147 follow-up): hand DLSS the UAV texture the Java side created through the
+// module's own texture path, to be used as NGX's output.
+//
+// Why: this DLL's own `CreateCommittedResource` texture cannot hold a write at all. A control test
+// with an identical source, call site and command list showed the module-created target reading
+// back `mean=17.8/16.5/11.6/255.0` while the privately created texture read `mean=0/0/0/0` — alpha
+// included — both immediately and on the following frame. So the Java side creates a target-sized
+// UAV texture (`USAGE_STORAGE = 32`, which `textureFlags()` maps to ALLOW_UNORDERED_ACCESS) and DLSS
+// writes there.
+//
+// Passing NULL clears the override and restores the private fallback. The device module unwraps the
+// `mcdr_object` handle (only it knows that layout) and hands the raw resource down; the resource is
+// not owned by the native side. A size/format mismatch against the render target is reported as an
+// ERROR and falls back rather than failing silently.
+//
+// Returns 1 = accepted, 0 = cleared, -1 = the handle is not a live texture.
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssOutput(mcdr_object* tex);
+
 // ---------------------------------------------------------------------------
 // P108: DLSS super-resolution (NVSDK_NGX). Data plane + the real NGX evaluate call.
 //

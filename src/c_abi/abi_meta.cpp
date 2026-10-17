@@ -253,6 +253,28 @@ int32_t MCDR_CALL mcdr_dx12SetDlssQuality(int32_t tier) {
     return d3d12_mc::setDlssQuality(tier);
 }
 
+int32_t MCDR_CALL mcdr_dx12SetDlssRenderPreset(int32_t preset) {
+    // P108ac (user m08033). The remaining noise/flicker is DLSS's own behaviour, and the user's
+    // remedy is to swap the model — so the JVM gets a knob instead of us picking a default.
+    // `preset` is a NVSDK_NGX_DLSS_Hint_Render_Preset value (0 = Default, 10 = J, 11 = K, ...);
+    // the device module owns the state and forwards the change so `ensureFeature` rebuilds the
+    // feature (the preset is baked in at CreateFeature time).
+    // Returns the recorded preset, or -1 for an out-of-range value (nothing changes).
+    return d3d12_mc::setDlssRenderPreset(preset);
+}
+
+int32_t MCDR_CALL mcdr_dx12SetDlssOutput(mcdr_object* tex) {
+    // P108 (user m11147 follow-up). The Java side creates a target-sized UAV texture through the
+    // module's own texture path (`USAGE_STORAGE = 32`) and registers it here, because the DLSS
+    // implementation's own `CreateCommittedResource` texture proved unwritable (control test: same
+    // source, site and command list — the module-created target read 17.8/16.5/11.6/255, the private
+    // texture read all zero, alpha included, and still zero in the settled read).
+    // The device module unwraps the handle because only it knows the `Dx12Object` layout; the DLSS
+    // unit must never reinterpret a JVM handle (that caused the null-vtable crash).
+    // Returns 1=accepted, 0=cleared, -1=not a live texture.
+    return d3d12_mc::setDlssOutput(tex);
+}
+
 int32_t MCDR_CALL mcdr_dx12SetDlssVendorDir(const char* utf8Dir) {
     // P108. The Java side announces <user.dir>\dxrmc\ (the directory it extracted MCDR.dll
     // and the vendor DLLs into). The native side widens the process DLL search path with it,

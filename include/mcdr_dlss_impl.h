@@ -59,6 +59,29 @@ void* mcdr_dlss_load_runtime(void);
 // 的老行为（旧 DLL/旧 JVM 组合）。返回归一化后的档位。幂等。
 int32_t mcdr_dlss_request_quality(int32_t tier);
 
+// P108ac（用户 m08033）：DLSS 的**模型**（NGX 的 render preset 提示）。用户反馈"剩下的噪点闪烁
+// 是 DLSS 自身的问题，所有用 DLSS 的游戏都有，优化方法是更换 DLSS 的模型"，所以把这条做成旋钮，
+// 而不是由我们擅自改默认值。
+//
+// preset 取 `NVSDK_NGX_DLSS_Hint_Render_Preset`：0 = Default（交给 NGX 按挡位决定）、5 = E /
+// 6 = F（已弃用的 CNN 预设）、10 = J / 11 = K / 12 = L / 13 = M（transformer）。预设是
+// **CreateFeature 的输入**，所以值一变化，下一次 `ensureFeature` 会重建特征（与挡位同一机制）。
+// 越界（<0 或 >15）返回 -1 且不改变现状；返回实际记录的预设值。幂等。
+int32_t mcdr_dlss_request_preset(int32_t preset);
+
+// P108（用户 m11147 后续）：把 **JVM 经模块 `createTexture` 建的 UAV 输出纹理**交给 DLSS。
+//
+// 为什么需要：本单元自建的私有 UAV 纹理**承载不了写入** —— 控制组实测（同源、同调用点、
+// 同一条命令列表）：把输入色拷进模块建的目标读回 `mean=17.8/16.5/11.6/255.0`，拷进本单元的
+// 私有纹理读回 `mean=0.0/0.0/0.0/0.0`（连 alpha 都是 0），落定后仍为 0。所以改由 JVM 走那条
+// 已被证明可写的创建路径建纹理，本单元只负责用它；私有纹理仅作旧组合的兜底。
+//
+// resource 是**模块侧解包后的裸 `ID3D12Resource*`**（`Dx12Object` 的布局只有模块知道；
+// 绝不要在这里 reinterpret JVM 句柄 —— 那正是 mv->GetDesc() 空 vtable 崩溃的成因）。
+// 传 nullptr 清除覆盖、退回私有兜底。资源**不归本单元所有**，生命周期由模块保证。
+// 返回 1=已接受 0=已清除。
+int32_t mcdr_dlss_set_output_texture(void* resource);
+
 // ---------------------------------------------------------------------------
 // P108：**跟踪型状态过渡**。
 //
@@ -75,6 +98,63 @@ int32_t mcdr_dlss_request_quality(int32_t tier);
 using DlssTransitionFn = void (*)(void* ctx, void* resource, int32_t toState);
 using DlssQueryStateFn = int32_t (*)(void* ctx, void* resource);
 
+// B2：纹理读回的返回值（POD，**不要**在这里放容器 —— 模块与普通 TU 看到的
+// std::string/vector 不是同一个类型）。mean/min/max 都是**原始字节**统计，与
+// dumpManyResources 原来打印的 `mean=… min=… max=…` 同一口径，便于对照旧日志。
+typedef struct DlssTexStats {
+    double mean[4];
+    uint32_t min[4];
+    uint32_t max[4];
+} DlssTexStats;
+
+// B2：模块提供的**读回回调**。实现单元不再自建 command list/queue/fence/staging
+// （那正是 #525/#527/#838 与 RemoveDevice 的来源），而是把"读这张纹理的统计"交给
+// 设备模块：它用**当前这个 ctx 的 command list** 记录一次 tracking 内的
+// CopyTextureRegion 到 readback buffer，并在下一次调用时用模块 fence 等它完成。
+//
+// 语义（必须按此读）：
+//   * 返回 1 = out 已填好（**上一帧**记录的那份拷贝；诊断读数延迟一帧是设计选择，
+//     因为调用时 list 还开着、本帧的 copy 尚未提交）；
+//   * 返回 0 = 还没有可用的读数（第一次调用）或参数不可用；
+//   * 返回 -1 = 失败（创建/映射失败）。
+// resource 是**模块侧解包后的裸 ID3D12Resource***（见 mcdr_dlss_set_output_texture 的说明）。
+using DlssReadbackFn = int32_t (*)(void* ctx, void* resource, DlssTexStats* out);
+
+// ---------------------------------------------------------------------------
+// B4：私有纹理由**模块**创建（实现单元不再自建任何 D3D12 纹理）。
+//
+// 为什么必须这样：实现单元自己 `CreateCommittedResource` 出来的纹理不在模块的
+// `ctx->resourceState` 表里（那张表以裸 `ID3D12Resource*` 为键），过渡只能按 COMMON 兜底，
+// `stateOf` 也就答不出真实状态 —— "谁真正管状态机"于是有了两个答案。P108x 那串
+// #525/#527/#838 与 RemoveDevice 就是这个分叉的产物。现在创建走这里：
+//   * 模块建资源、模块持有 `Dx12Object`，并把资源**创建即登记**进当前 ctx 的跟踪表
+//     （初始 COMMON），所以本列表里的第一次过渡就有真实锚点；
+//   * 销毁走模块的延迟删除路径（`destroyObject`），不会在有打开的命令列表时裸
+//     `Release()`（那会报 "deleted prior to closing the command list"）；
+//   * 实现单元只拿两个不透明值：句柄（只能交回 destroy）与裸资源指针（给 NGX / 拷贝用）。
+//
+// `flags` 是 D3D12_RESOURCE_FLAGS 的位（1=ALLOW_RENDER_TARGET, 2=ALLOW_DEPTH_STENCIL,
+// 4=ALLOW_UNORDERED_ACCESS）；`dxgiFormat` 是 **DXGI_FORMAT 的数值**（不是 JVM 那边的
+// 格式 ordinal，别混）。
+// ---------------------------------------------------------------------------
+typedef struct DlssTextureDesc {
+    uint32_t width;
+    uint32_t height;
+    uint32_t dxgiFormat;
+    uint32_t mipLevels;
+    uint32_t arraySize;
+    uint32_t sampleCount;
+    uint32_t flags;
+} DlssTextureDesc;
+
+// 返回 1 = *outObject / *outResource 都已填好；0 = 参数或设备不可用；-1 = 创建失败。
+using DlssCreateTextureFn = int32_t (*)(void* ctx, const DlssTextureDesc* desc, void** outObject,
+                                       void** outResource);
+// `ctx` 只用于把资源从该 ctx 的跟踪表里摘掉，可以为 nullptr（shutdown 时就是这样）。
+using DlssDestroyTextureFn = void (*)(void* ctx, void* object);
+// 注入创建/销毁入口。模块在 wireDlssImpl() 里调一次；返回 1 = 两个入口都装上了。
+int32_t mcdr_dlss_install_texture_ops(void* createFn, void* destroyFn);
+
 // 在**已打开**的命令列表上创建/重建 DLSS 特征（尺寸变化时自动重建）。
 // `tl`/`tlCtx` 非空时所有资源过渡都通过它请求（见上），为空则不做过过渡。
 int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
@@ -82,7 +162,7 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
 // 每帧一次的真实 NGX 评价。commandList 是 ID3D12GraphicsCommandList*。
 // 返回 1=真的跑了 0=跳过（没特征/参数为空）-1=失败或已关闭。
 int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
-                           void* tlCtx);
+                           void* tlCtx, DlssReadbackFn rb);
 
 // P108：**深度快照**。DLSS 的评估点在世界画完、GUI 之前，而 vanilla 在
 // `GameRenderer.render` 的 clearDepthTexture 已把深度清成 0.0（reverse-Z 的"远"），所以
