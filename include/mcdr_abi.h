@@ -531,33 +531,51 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssVendorDir(const char* utf8Dir);
 // abi_check.py 钉住，加字段会破坏既有 ABI。这里用**新导出 + 新结构**增量扩展：
 // 老 DLL 没有该导出时，JVM 侧按 `hasDx12SetDlssConstants` 特性探测跳过。
 // 矩阵全部 **行主序** 且 **不含 jitter**（jitter 单独给，文档明确要求）。
+// P112/P118/P119/P120：Streamline `sl::Constants` 的数据源（每帧由 JVM 经 `mcdr_dx12SetDlssConstants` 推来）。
+//
+// 矩阵约定（三条都是踩过的坑）：
+//   1. 三张矩阵都是**列主序**（JOML `Matrix4f.get(float[])` 的原生布局）；native 在喂给
+//      `sl::Constants`（其 float4x4 要求行主序）之前必须逐元素转置一次。
+//   2. `viewProjection`/`prevViewProjection` 是 world->clip，且**已经烘进相机平移**
+//      （`V_world = V_rot * T(-camPos)`）。凭这两张派生的 `clipToPrevClip` 才含相机走动。
+//   3. `projection` 是 view->clip 的投影矩阵本身，`sl::Constants::cameraViewToClip` 要的是它，
+//      不是 world->clip 的 VP —— 塞 VP 会让 SL 的反投影多带一层世界平移。
+//
+// `motionVectors3D` 必须是 0：本项目 MV 是屏幕空间像素位移，不是 3D 世界速度。
 typedef struct mcdr_dlss_constants {
-    // 只收两个矩阵：其余（clipToCameraView / clipToPrevClip / prevClipToClip）由 native
-    // 用 4x4 求逆与相乘派生 —— JVM 侧本来就只算 viewProj / prevViewProj（见 D3D12Velocity），
-    // 不必在 Kotlin 里再实现一遍矩阵数学。
-    // P118：这两张是**列主序**（JOML `Matrix4f.get(float[])` 的原生布局），无 jitter。
-    // native 在喂给 `sl::Constants`（其 float4x4 要求行主序）之前必须自己转置一次 ——
-    // 之前这里写成"行主序"并且直接 memcpy，于是整组矩阵是转置着交给 SL 的（静止也拖影）。
-    float viewProjection[16];      // 当前 投影 x 视图（列主序、无 jitter）
-    float prevViewProjection[16];  // 上一帧 投影 x 视图（列主序、无 jitter）
-    float jitterOffsetX;          // 像素、RENDER 空间、未取负
+    float viewProjection[16];
+    float prevViewProjection[16];
+    float jitterOffsetX;
     float jitterOffsetY;
-    float mvecScaleX;             // MV 是像素空间 => 1/renderWidth
-    float mvecScaleY;             //                   1/renderHeight
-    float cameraPosX, cameraPosY, cameraPosZ, _pad0;
-    float cameraUpX, cameraUpY, cameraUpZ, _pad1;
-    float cameraRightX, cameraRightY, cameraRightZ, _pad2;
-    float cameraFwdX, cameraFwdY, cameraFwdZ, _pad3;
+    float mvecScaleX;
+    float mvecScaleY;
+    float cameraPosX;
+    float cameraPosY;
+    float cameraPosZ;
+    float _pad0;
+    float cameraUpX;
+    float cameraUpY;
+    float cameraUpZ;
+    float _pad1;
+    float cameraRightX;
+    float cameraRightY;
+    float cameraRightZ;
+    float _pad2;
+    float cameraFwdX;
+    float cameraFwdY;
+    float cameraFwdZ;
+    float _pad3;
     float cameraNear;
     float cameraFar;
     float cameraFovRadians;
     float cameraAspectRatio;
-    uint32_t depthInverted;         // 1 = 反 Z（本项目）
-    uint32_t cameraMotionIncluded;  // 1 = MV 已含相机运动
-    uint32_t motionVectors3D;       // 1 = 3D MV
-    uint32_t reset;                 // 1 = 丢弃历史（首帧 / resize / 切世界）
-    uint32_t renderingGameFrames;   // 0 = 菜单/暂停
-    uint32_t motionVectorsJittered; // 1 = MV 已含 jitter（本项目）
+    uint32_t depthInverted;
+    uint32_t cameraMotionIncluded;
+    uint32_t motionVectors3D;
+    uint32_t reset;
+    uint32_t renderingGameFrames;
+    uint32_t motionVectorsJittered;
+    float projection[16];
 } mcdr_dlss_constants;
 
 // 每帧一次、DLSS 评价之前调用；返回 1 已缓存，0 参数无效。幂等，设备创建前也可调用。

@@ -2537,9 +2537,24 @@ sl::FrameToken* gLastFrameToken = nullptr;
             const bool invOk = mat4Inverse(curVP, invCurVP);
             const bool invPrevOk = mat4Inverse(prvVP, invPrvVP);
             // 行主序之后可以直接拷进 sl::float4x4（它就是行主序的 16 个 float）。
-            std::memcpy(&cnst.cameraViewToClip, curVP, sizeof(curVP));
+            // P120：`cameraViewToClip` 的语义是 **view->clip**，也就是投影矩阵本身（不是 VP）。
+            // 之前塞 VP，SL 的 depth->view 反投影就多带一层世界平移，深度相关的亚像素修正会随视角
+            // 漂移 —— 用户看到的「静止时随机抖动」。
+            const float* projColMajor = gCameraConstants.projection;
+            float curProj[16] = {};
+            for (int r = 0; r < 4; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    curProj[r * 4 + c] = projColMajor[c * 4 + r];
+                }
+            }
+            std::memcpy(&cnst.cameraViewToClip, curProj, sizeof(curProj));
+            {
+                float invProj[16] = {};
+                if (mat4Inverse(curProj, invProj)) {
+                    std::memcpy(&cnst.clipToCameraView, invProj, sizeof(invProj));
+                }
+            }
             if (invOk) {
-                std::memcpy(&cnst.clipToCameraView, invCurVP, sizeof(invCurVP));
                 // clipToPrevClip = clipToView * viewToViewPrev * viewToClipPrev
                 //                = inverse(curVP) * prevVP
                 float clipToPrev[16] = {};
