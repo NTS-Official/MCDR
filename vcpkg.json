@@ -19,6 +19,7 @@
     "tinyexpr",
     "llfio",
     "nlohmann-json",
-    "zoe"
+    "zoe",
+    "tomlplusplus"
   ]
 }
