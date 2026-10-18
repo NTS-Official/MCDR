@@ -82,6 +82,21 @@ int32_t mcdr_dlss_request_preset(int32_t preset);
 // 返回 1=已接受 0=已清除。
 int32_t mcdr_dlss_set_output_texture(void* resource);
 
+// P113：Reflex —— 在 Present 之前调用（slReflexSleep），内部懒加载 interposer。
+void mcdr_reflex_before_present(void);
+// P115：Present 之后发 PCL 的 ePresentEnd 标记。
+void mcdr_reflex_after_present(void);
+// P117：PCL stats —— 帧开始（建本帧 token + eSimulationStart）与通用标记。
+void mcdr_reflex_frame_begin(void);
+void mcdr_reflex_marker(int32_t marker);
+
+// P115：Reflex 帧率限制器（微秒/帧，0 = 关闭）。
+void mcdr_reflex_set_frame_limit(uint32_t micros);
+
+// P112：缓存每帧相机常量（Streamline 的 sl::Constants 所需；结构见 mcdr_abi.h 的
+// mcdr_dlss_constants）。JVM 每帧在 evaluate 之前调用。返回 1=已缓存，0=参数为空。
+int32_t mcdr_dlss_set_constants(const mcdr_dlss_constants* constants);
+
 // ---------------------------------------------------------------------------
 // P108：**跟踪型状态过渡**。
 //
@@ -190,3 +205,4 @@ void mcdr_dlss_shutdown(void);
 #endif
 
 #endif  // MCDR_DLSS_IMPL_H
+

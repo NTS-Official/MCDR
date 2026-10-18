@@ -94,6 +94,7 @@
     <None Include="cpp.hint">
       <Filter>解决方案</Filter>
     </None>
+    <None Include=".gitmodules" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\mcdr_abi.h">

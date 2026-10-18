@@ -186,14 +186,14 @@
   <ItemDefinitionGroup Condition="'$(Platform)'=='x64' And '$(Configuration)'!='Debug'">
     <Link>
       <AdditionalLibraryDirectories>$(ProjectDir)lib\streamline\lib\x64;$(ProjectDir)external\dlss\lib\Windows_x86_64\x64;$(ProjectDir)external\nrd\Lib\x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>sl.interposer.lib;nvsdk_ngx_d.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>nvsdk_ngx_d.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Platform)'=='x64' And '$(Configuration)'=='Debug'">
     <Link>
       <AdditionalLibraryDirectories>$(ProjectDir)lib\streamline\lib\x64;$(ProjectDir)external\dlss\lib\Windows_x86_64\x64;$(ProjectDir)external\nrd\Lib\x64\Debug;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <!-- _dbg variants: same API, built against the debug CRT (/MDd). -->
-      <AdditionalDependencies>sl.interposer.lib;nvsdk_ngx_d_dbg.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>nvsdk_ngx_d_dbg.lib;NRD.lib;ShaderMakeBlob.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -260,6 +260,7 @@
     <None Include=".gitattributes" />
     <None Include=".github\workflows\msbuild.yml" />
     <None Include=".gitignore" />
+    <None Include=".gitmodules" />
     <None Include="AGENTS.MD" />
     <None Include="cpp.hint" />
     <None Include="LICENSE" />

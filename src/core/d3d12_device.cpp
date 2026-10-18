@@ -28,6 +28,20 @@ module;
 // 注意：**.cppm 的全局模块片段里的声明不会传给 import 方**，所以本实现单元要自己
 // 再 include 一次（include guard 保证幂等）。
 #include "mcdr_dlss_impl.h"
+#include <cstdio>        // P111 探针：_wfopen / fwprintf（诊断文件，绕开尚未接管的日志 sink）
+#include <cwchar>
+
+// P111：Streamline（SL）interposer。头文件来自 external\streamline（git 子模块 @v2.14.16），
+// 导入库与运行时 DLL 来自 NVIDIA 的 SDK 压缩包（解到 lib\streamline，git 不记录这些二进制）。
+// 用 __has_include 判定：全新克隆若还没跑 scripts\sync-external.ps1，这里保持关闭而不是让编译炸。
+// 与其它 probing 头同理，必须留在全局模块片段（模块 purview 内文本包含头文件 → C5244）。
+#if __has_include(<sl.h>)
+#include <sl.h>
+#include <sl_dlss.h>   // P112：sl::DLSSMode / sl::DLSSOptions（sl.h 只含 core）
+#define MCDR_HAVE_STREAMLINE 1
+#else
+#define MCDR_HAVE_STREAMLINE 0
+#endif
 
 // JSON 一律用 vcpkg 里的 nlohmann/json（vcpkg.json 已声明 nlohmann-json）。手工拼字符串
 // 只要漏一处转义、少一个逗号或多一个引号就是非法 JSON，而解析方
@@ -594,6 +608,54 @@ constexpr D3D_FEATURE_LEVEL kProbeLevels[] = {
 };
 
 // 某块适配器能建出的最高功能级；(D3D_FEATURE_LEVEL)0 表示完全不支持 D3D12。
+// P112：Streamline 的 manual hooking 要求**设备本身也由 interposer 代理创建**
+// （ProgrammingGuideManualHooking.md:143-146：`proxyDevice = D3D12CreateDevice();`，再用
+// slGetNativeInterface/slUpgradeInterface 取原生设备）。否则 SL 不会把设备登记进它的管线，
+// DLSS 插件虽然加载（sl.log 有 "Loaded plugin 'sl.dlss'"）但特性永远 not ready ——
+// P112 实测 slIsFeatureLoaded / slGetFeatureFunction 都返回 0x1F（eErrorFeatureNotSupported）。
+// 这里运行时解析 interposer 的 D3D12CreateDevice；未请求 streamline 时退回系统 d3d12.dll，
+// 默认路径与改动前完全一致。
+typedef HRESULT(WINAPI* PFN_SL_D3D12CreateDevice)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+
+PFN_SL_D3D12CreateDevice interposerCreateDeviceFn() {
+    static const PFN_SL_D3D12CreateDevice fn = []() -> PFN_SL_D3D12CreateDevice {
+        char sl[8] = {};
+        const DWORD a = ::GetEnvironmentVariableA("MCDR_STREAMLINE", sl, 8);
+        bool want = (a == 1 && sl[0] == '1');
+        if (!want) {
+            char impl[24] = {};
+            const DWORD b = ::GetEnvironmentVariableA("MCDR_DLSS_IMPL", impl, 24);
+            want = b > 0 && std::strcmp(impl, "streamline") == 0;
+        }
+        if (!want) return nullptr;
+        HMODULE self = nullptr;
+        if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                      GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                  reinterpret_cast<LPCWSTR>(&interposerCreateDeviceFn), &self)) {
+            return nullptr;
+        }
+        wchar_t path[MAX_PATH] = {};
+        if (!::GetModuleFileNameW(self, path, MAX_PATH)) return nullptr;
+        std::wstring modulePath(path);
+        const auto slash = modulePath.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) return nullptr;
+        const std::wstring dir = modulePath.substr(0, slash + 1);
+        HMODULE mod = ::LoadLibraryW((dir + L"sl.interposer.dll").c_str());
+        if (mod == nullptr) return nullptr;
+        return reinterpret_cast<PFN_SL_D3D12CreateDevice>(::GetProcAddress(mod, "D3D12CreateDevice"));
+    }();
+    return fn;
+}
+
+// 设备创建入口：streamline 模式下走 interposer 代理，否则原生。
+HRESULT createD3D12Device(IUnknown* adapter, D3D_FEATURE_LEVEL level, REFIID riid, void** out) {
+    const PFN_SL_D3D12CreateDevice proxy = interposerCreateDeviceFn();
+    if (proxy != nullptr) {
+        return proxy(adapter, level, riid, out);
+    }
+    return ::D3D12CreateDevice(adapter, level, riid, out);
+}
+
 D3D_FEATURE_LEVEL probeHighestFeatureLevel(IDXGIAdapter* adapter) {
     for (auto level : kProbeLevels) {
         ComPtr<ID3D12Device> probe;
@@ -1770,7 +1832,168 @@ void logAgilityRuntime(ID3D12Device* device) {
                static_cast<unsigned long>(gAgility.applyHr));
 }
 
+#if MCDR_HAVE_STREAMLINE
+// P111/P112：Streamline 的「初始化」与「挂接设备」必须分两步，顺序按官方文档：
+//   ProgrammingGuideDLSS.md:14  "Call slInit as early as possible (before any dxgi/d3d11/d3d12 APIs are invoked)"
+//   ProgrammingGuideDLSS.md:53  设备建好之后再 slSetD3DDevice。
+// 之前把 slInit 放在设备创建之后（Phase 0/1），SL 无法完成 DXGI/D3D12 挂钩，插件虽然加载但
+// 特性始终 not loaded（slIsFeatureLoaded / slGetFeatureFunction 都返回 0x1F）。这里改成
+// ensureDevice() 的第一件事就 slInit（此时还没有任何 DXGI/D3D12 调用）。
+// 仍然不静态链接 sl.interposer.lib（LoadLibrary + GetProcAddress，理由见 P111 的教训）。
+namespace {
+HMODULE gSlModule = nullptr;
+std::wstring gSlDir;
+bool gSlInitAttempted = false;
+bool gSlRequested = false;
+sl::Result gSlInitResult = sl::Result::eErrorInitNotCalled;
+PFun_slSetD3DDevice* gSlSetDevice = nullptr;
+PFun_slIsFeatureLoaded* gSlIsLoaded = nullptr;
+}  // namespace
+
+// P112：SL 的 NGX 后端要求一个 **数字** applicationId（sl_appidentity.h / Preferences 注释：
+// "Id provided by NVIDIA, if not specified then engine type and version are required"；但实测
+// 只给 engine/engineVersion 时 SL 直接拒绝：sl.log commonEntry.cpp:1658
+// "Please provide correct application id when calling slInit - NGX based features will be disabled"，
+// 随后 dlssEntry.cpp:923 "Missing NGX context" ⇒ kFeatureDLSS 永远 not loaded（0x1F））。
+// 用户要求用 Illusion 的 modid 作为身份，这里取 modid 的 FNV-1a 32 位哈希（稳定、可复现）；
+// 若将来 NVIDIA 下发正式 Application ID，替换成那个数字即可。
+constexpr uint32_t fnv1a32(const char* s, uint32_t h = 2166136261u) {
+    return (*s == '\0')
+               ? h
+               : fnv1a32(s + 1, (h ^ static_cast<uint32_t>(static_cast<unsigned char>(*s))) * 16777619u);
+}
+
+bool streamlineRequested() {
+    char buf[24] = {};
+    const DWORD n = ::GetEnvironmentVariableA("MCDR_STREAMLINE", buf, 24);
+    if (n == 1 && buf[0] == '1') return true;
+    char impl[24] = {};
+    const DWORD m = ::GetEnvironmentVariableA("MCDR_DLSS_IMPL", impl, 24);
+    return m > 0 && _stricmp(impl, "streamline") == 0;
+}
+
+// 必须在任何 DXGI/D3D12 调用之前跑（ensureDevice 的第一步）。只做 slInit，不碰设备。
+void streamlineInitEarly() {
+    if (gSlInitAttempted) return;
+    gSlInitAttempted = true;
+    gSlRequested = streamlineRequested();
+    gSlDir = ownModuleDir();
+    FILE* probe = gSlDir.empty() ? nullptr : _wfopen((gSlDir + L"sl-probe.txt").c_str(), L"w, ccs=UTF-8");
+    if (probe) fwprintf(probe, L"env=%d dir=%s\n", gSlRequested ? 1 : 0, gSlDir.c_str());
+    if (!gSlRequested) { if (probe) fclose(probe); return; }
+    if (gSlDir.empty()) { if (probe) fclose(probe); return; }
+    const std::wstring dllPath = gSlDir + L"sl.interposer.dll";
+    gSlModule = ::LoadLibraryW(dllPath.c_str());
+    if (gSlModule == nullptr) {
+        if (probe) { fwprintf(probe, L"load=fail err=%lu\n", ::GetLastError()); fclose(probe); }
+        dbgLogWarn("P111 streamline: %s not found (err=%lu) - skipped", toUtf8(dllPath).c_str(),
+                   ::GetLastError());
+        return;
+    }
+    auto pInit = reinterpret_cast<PFun_slInit*>(::GetProcAddress(gSlModule, "slInit"));
+    gSlSetDevice = reinterpret_cast<PFun_slSetD3DDevice*>(::GetProcAddress(gSlModule, "slSetD3DDevice"));
+    gSlIsLoaded = reinterpret_cast<PFun_slIsFeatureLoaded*>(::GetProcAddress(gSlModule, "slIsFeatureLoaded"));
+    if (probe) fwprintf(probe, L"load=ok exports=%d\n", (pInit && gSlSetDevice && gSlIsLoaded) ? 1 : 0);
+    if (pInit == nullptr || gSlSetDevice == nullptr || gSlIsLoaded == nullptr) {
+        if (probe) fclose(probe);
+        dbgLogWarn("P111 streamline: %s is missing expected exports - skipped", toUtf8(dllPath).c_str());
+        return;
+    }
+    const wchar_t* paths[1] = { gSlDir.c_str() };
+    // P113：同时请求 Reflex（低延迟），插件才会加载。
+    // P113：DLSS + Reflex（低延迟）+ PCL（延迟统计的标记通道，文档 ProgrammingGuidePCL.md:115）。
+    sl::Feature features[3] = { sl::kFeatureDLSS, sl::kFeatureReflex, sl::kFeaturePCL };
+    sl::Preferences pref{};
+    pref.engine = sl::EngineType::eCustom;
+    pref.engineVersion = "1.0.0";
+    pref.applicationId = fnv1a32("dxr_mc");  // = modid 的 FNV-1a 哈希（见上方注释）
+    pref.projectId = "";
+    pref.renderAPI = sl::RenderAPI::eD3D12;
+    pref.logLevel = sl::LogLevel::eDefault;
+    pref.pathsToPlugins = paths;
+    pref.numPathsToPlugins = 1;
+    // 必须预声明 featuresToLoad（ProgrammingGuide.md:231）：为空时 SL 不加载任何插件。
+    pref.featuresToLoad = features;
+    pref.numFeaturesToLoad = 3;
+    pref.pathToLogsAndData = gSlDir.c_str();
+    pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
+                sl::PreferenceFlags::eDisableDebugText |
+                // 文档 ProgrammingGuide.md:853：使用 slSetTagForFrame 必须置这一位，
+                // 否则 tag 调用返回 eErrorMissingInputParameter(0x13)（P112 实测）。
+                sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+    gSlInitResult = (*pInit)(pref, sl::kSDKVersion);
+    if (probe) { fwprintf(probe, L"init=0x%X\n", static_cast<unsigned>(gSlInitResult)); fclose(probe); }
+    dbgLogWarn("P111 streamline: slInit=0x%X (early, before any DXGI/D3D12 call)", 
+               static_cast<unsigned>(gSlInitResult));
+}
+
+// 设备就绪后挂接：slSetD3DDevice + 查询 DLSS 特性是否已加载 + 一次 slDLSSSetOptions 探针。
+void applyStreamline(ID3D12Device* device) {
+    if (!gSlInitAttempted) streamlineInitEarly();
+    if (!gSlRequested || gSlModule == nullptr || gSlInitResult != sl::Result::eOk) return;
+    // P112 阶段 4：用 SL 自己的能力查询替代 NGX 的 caps 探测（让"双 NGX"只存在于代码里、
+    // 运行期只有 SL 这一套）。slIsFeatureSupported 需要适配器 LUID（ProgrammingGuideDLSS.md:77）。
+    int slSupport = -1;
+    {
+        using PFn_IsFeatureSupported = sl::Result (*)(sl::Feature, const sl::AdapterInfo&);
+        auto isSupported = reinterpret_cast<PFn_IsFeatureSupported>(
+            ::GetProcAddress(gSlModule, "slIsFeatureSupported"));
+        if (isSupported != nullptr && device != nullptr) {
+            const LUID luid = device->GetAdapterLuid();
+            sl::AdapterInfo info{};
+            info.deviceLUID = reinterpret_cast<uint8_t*>(const_cast<LUID*>(&luid));
+            info.deviceLUIDSizeInBytes = sizeof(LUID);
+            slSupport = static_cast<int>(isSupported(sl::kFeatureDLSS, info));
+        }
+    }
+    const sl::Result deviceResult = (*gSlSetDevice)(device);
+    bool loaded = false;
+    const sl::Result loadResult = (*gSlIsLoaded)(sl::kFeatureDLSS, loaded);
+    FILE* probe = gSlDir.empty() ? nullptr : _wfopen((gSlDir + L"sl-probe.txt").c_str(), L"a, ccs=UTF-8");
+    if (probe) {
+        fwprintf(probe, L"setDevice=0x%X load=0x%X dlssLoaded=%s\n",
+                 static_cast<unsigned>(deviceResult), static_cast<unsigned>(loadResult),
+                 loaded ? L"yes" : L"no");
+    }
+    dbgLogWarn("P111 streamline: slIsFeatureSupported(DLSS)=%d setDevice=0x%X load=0x%X dlssLoaded=%s", slSupport,
+               static_cast<unsigned>(deviceResult), static_cast<unsigned>(loadResult),
+               loaded ? "yes" : "no");
+    using PFn_GetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
+    auto getFeatureFunction = reinterpret_cast<PFn_GetFeatureFunction>(
+        ::GetProcAddress(gSlModule, "slGetFeatureFunction"));
+    unsigned getFnResult = 0xFFFFFFFFu;
+    int optResult = -1;
+    if (getFeatureFunction != nullptr) {
+        void* raw = nullptr;
+        const sl::Result r = getFeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", raw);
+        getFnResult = static_cast<unsigned>(r);
+        if (r == sl::Result::eOk && raw != nullptr) {
+            using PFn_SetOptions = sl::Result (*)(const sl::ViewportHandle&, const sl::DLSSOptions&);
+            auto setOptions = reinterpret_cast<PFn_SetOptions>(raw);
+            sl::DLSSOptions opt{};
+            opt.mode = sl::DLSSMode::eMaxQuality;
+            opt.outputWidth = 1920;
+            opt.outputHeight = 1080;
+            opt.preExposure = 1.0f;
+            opt.exposureScale = 1.0f;
+            opt.useAutoExposure = sl::Boolean::eFalse;
+            const sl::ViewportHandle viewport(0);
+            optResult = static_cast<int>(setOptions(viewport, opt));
+        }
+    }
+    if (probe) {
+        fwprintf(probe, L"dlssOptions: getFn=0x%X result=0x%X\n", getFnResult,
+                 static_cast<unsigned>(optResult));
+        fclose(probe);
+    }
+    dbgLogWarn("P111 streamline: slDLSSSetOptions probe getFn=0x%X result=0x%X", getFnResult,
+               static_cast<unsigned>(optResult));
+}
+#endif
+
 mcdr::Result<void> ensureDevice() {
+    // P112：SL 必须在任何 DXGI/D3D12 调用之前初始化（ProgrammingGuideDLSS.md:14）。
+    streamlineInitEarly();
     // P110 自检：MCDR_AGILITY=1 时在任何设备创建之前把全局 core 换成 619；默认空操作。
     applyAgilitySdk();
     // PIX 捕获层必须在任何 D3D12CreateDevice（含适配器探测）之前载入；未请求时空操作。
@@ -1805,7 +2028,7 @@ mcdr::Result<void> ensureDevice() {
         auto selectRes = selectDeviceAdapter();
         bool ok = static_cast<bool>(selectRes);
         std::string selectError = selectRes ? std::string() : selectRes.error().message;
-        if (ok && FAILED(D3D12CreateDevice(chosen.Get(), kRequiredFeatureLevel,
+        if (ok && FAILED(createD3D12Device(chosen.Get(), kRequiredFeatureLevel,
                                            IID_PPV_ARGS(&device)))) {
             // 探测通过却建不出设备（极罕见）：当成选择失败，走同一条错误路径。
             ok = false;
@@ -1820,7 +2043,7 @@ mcdr::Result<void> ensureDevice() {
             auto selectRes2 = selectDeviceAdapter();
             if (selectRes2) {
                 chosen = *selectRes2;
-                ok = SUCCEEDED(D3D12CreateDevice(chosen.Get(), kRequiredFeatureLevel,
+                ok = SUCCEEDED(createD3D12Device(chosen.Get(), kRequiredFeatureLevel,
                                                  IID_PPV_ARGS(&device)));
             } else {
                 ok = false;
@@ -1839,6 +2062,8 @@ mcdr::Result<void> ensureDevice() {
     dbgLogInfo("device ready: %s FL=%s %s", gCtx.adapterName.c_str(),
                featureLevelName(gCtx.featureLevel), capabilitiesText(gCtx.caps).c_str());
     logAgilityRuntime(device.Get());
+    // P111：MCDR_STREAMLINE=1 时做一次 Streamline interposer 探针（默认空操作）。
+    applyStreamline(device.Get());
     {
         LUID luid = device->GetAdapterLuid();
         ComPtr<IDXGIFactory4> tmpFactory;
@@ -7457,12 +7682,10 @@ int setAntiAliasing(int mode) {
         dbgLogError("P104: invalid anti-aliasing mode %d (valid: 0=OFF 1=SMAA 2=TAA 3=DLAA)", mode);
         return -1;
     }
-    if (mode == 2 || mode == 3) {
-        dbgLogWarn("P104: %s is not implemented yet; falling back to OFF (only SMAA is implemented)",
-                   antiAliasingName(mode));
-        gCtx.aaMode = 0;
-        return 0;
-    }
+    // P77：TAA（2）不再降级。它的 resolve 全部在 JVM 侧录制（`D3D12Taa`），native 只需要**别做
+    // SMAA** —— `applySmaaToTexture` 的闸门是 `aaMode != 1`，所以这里如实存 2 就等于"无 native
+    // 后处理"。DLAA（3）仍然由 DLSS 特性实现：JVM 侧会把它映射成 OFF 再传下来，真收到 3 说明另有
+    // 调用方，同样按"无 native 后处理"处理，不该再用"未实现"把用户的选项踢回 OFF。
     const int prev = gCtx.aaMode;
     gCtx.aaMode = mode;
     // 换模式时把"一次性失败"闸门复位：用户可以靠改设置再试一次。
@@ -7472,11 +7695,14 @@ int setAntiAliasing(int mode) {
         gCtx.smaaAppliedFrames = 0;
     }
     if (mode != prev) {
-        dbgLogInfo("P104: anti-aliasing = %s (%s)", antiAliasingName(mode),
+        dbgLogInfo("P77: anti-aliasing = %s (%s)", antiAliasingName(mode),
                    mode == 1 ? "SMAA, three passes in place after the world and before the GUI"
-                             : "no post-processing; plain blit");
+                   : mode == 2 ? "TAA, resolved on the JVM side after the world layer"
+                               : "no post-processing; plain blit");
     }
-    return 1;
+    // 契约（JVM 的 `D3D12AntiAliasing.push` 用 `status == pushed` 判成功）：成功时返回**生效的
+    // 模式本身**，0 是合法成功值（OFF）。旧实现恒返回 1，于是 OFF 被误报成"返回值异常"。
+    return mode;
 }
 
 // P108：DLSS 的**独立开关**（用户 m10920：DLSS 不再挂在抗锯齿上）。

@@ -253,6 +253,17 @@ int32_t MCDR_CALL mcdr_dx12SetDlssQuality(int32_t tier) {
     return d3d12_mc::setDlssQuality(tier);
 }
 
+void MCDR_CALL mcdr_dx12ReflexFrameBegin(void) { mcdr_reflex_frame_begin(); }
+
+void MCDR_CALL mcdr_dx12ReflexMarker(int32_t marker) { mcdr_reflex_marker(marker); }
+
+int32_t MCDR_CALL mcdr_dx12SetDlssConstants(const mcdr_dlss_constants* constants) {
+    // P112：Streamline 的 sl::Constants 需要相机矩阵/向量/近远平面等，这些数据只在 JVM 侧
+    // （D3D12Temporal）有。这里原样转交给 DLSS 实现单元缓存，等 evaluate 时喂给 slSetConstants。
+    // 返回 1=已缓存，0=参数为空。
+    return mcdr_dlss_set_constants(constants);
+}
+
 int32_t MCDR_CALL mcdr_dx12SetDlssRenderPreset(int32_t preset) {
     // P108ac (user m08033). The remaining noise/flicker is DLSS's own behaviour, and the user's
     // remedy is to swap the model — so the JVM gets a knob instead of us picking a default.

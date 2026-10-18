@@ -1,6 +1,7 @@
 module;
 
 #include "_d3d12_module_prelude.h"
+#include "mcdr_dlss_impl.h"  // P113：mcdr_reflex_before_present
 
 module mcdr.d3d12.device;
 
@@ -75,6 +76,72 @@ PFN_DCompositionCreateDevice resolveDCompCreateDevice() {
             GetProcAddress(mod, "DCompositionCreateDevice"));
     }();
     return fn;
+}
+
+// P112 阶段 0：swapchain 的 DXGI 工厂是否走 Streamline interposer。
+// SL 通过包装 DXGI 工厂来接管 swapchain 创建（sl.dlss 插件要靠它把 present 链挂上）；
+// 默认关，只有 MCDR_STREAMLINE=1 时才尝试，任何一步失败都回退原生 CreateDXGIFactory1，
+// 因此默认路径与改动前完全等价。
+typedef HRESULT(WINAPI* PFN_SL_CreateDXGIFactory1)(REFIID, void**);
+
+bool streamlineInterposerRequested() {
+    static const bool on = []() {
+        wchar_t buf[8] = {};
+        const DWORD n = GetEnvironmentVariableW(L"MCDR_STREAMLINE", buf, 8);
+        return n == 1 && buf[0] == L'1';
+    }();
+    return on;
+}
+
+// MCDR.dll 所在目录（带结尾反斜杠）—— 运行时 DLL 与 MCDR.dll 同目录。
+std::wstring ownModuleDirectory() {
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&ownModuleDirectory), &mod)) {
+        return {};
+    }
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(mod, path, MAX_PATH)) return {};
+    std::wstring s(path);
+    const auto slash = s.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : s.substr(0, slash + 1);
+}
+
+bool createFactoryViaStreamline(REFIID riid, void** out) {
+    if (!streamlineInterposerRequested() || out == nullptr) return false;
+    static const PFN_SL_CreateDXGIFactory1 fn = []() -> PFN_SL_CreateDXGIFactory1 {
+        const std::wstring dir = ownModuleDirectory();
+        if (dir.empty()) return nullptr;
+        HMODULE mod = LoadLibraryW((dir + L"sl.interposer.dll").c_str());
+        if (mod == nullptr) return nullptr;
+        return reinterpret_cast<PFN_SL_CreateDXGIFactory1>(
+            GetProcAddress(mod, "CreateDXGIFactory1"));
+    }();
+    if (fn == nullptr) {
+        dbgLogWarn("P112 SL: sl.interposer.dll / CreateDXGIFactory1 unavailable; native factory");
+        std::fprintf(stderr, "P112 SL: interposer unavailable -> native factory\n");
+        return false;
+    }
+    const HRESULT slHr = fn(riid, out);
+    if (FAILED(slHr)) {
+        dbgLogWarn("P112 SL: interposer CreateDXGIFactory1 %s; native factory", hrText(slHr).c_str());
+        std::fprintf(stderr, "P112 SL: interposer factory failed %s\n", hrText(slHr).c_str());
+        return false;
+    }
+    dbgLogWarn("P112 SL: DXGI factory created by sl.interposer");
+    std::fprintf(stderr, "P112 SL: DXGI factory via sl.interposer\n");
+    return true;
+}
+
+// 统一工厂入口：MCDR_STREAMLINE=1 且 interposer 可用时用它，否则原生。
+template <typename T>
+HRESULT createDxgiFactory(ComPtr<T>& factory) {
+    if (createFactoryViaStreamline(__uuidof(T),
+                                   reinterpret_cast<void**>(factory.GetAddressOf()))) {
+        return S_OK;
+    }
+    return CreateDXGIFactory1(IID_PPV_ARGS(&factory));
 }
 
 // 解绑/绑定 composition visual 的内容。DirectComposition 会持有 swapchain 的
@@ -507,7 +574,7 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
     // 具体调用（CreateDXGIFactory1 / EnumAdapters / ctx.adapter 赋值）。
     dbgLogDebug("createSurface: step=CreateDXGIFactory1 begin");
     std::fflush(stderr);
-    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    HRESULT hr = createDxgiFactory(factory);
     dbgLogDebug("createSurface: step=CreateDXGIFactory1 done hr=%08X", static_cast<unsigned>(hr));
     std::fflush(stderr);
     if (FAILED(hr)) {
@@ -813,7 +880,7 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
         // 重建 swapchain（与 createSurface 相同的策略：HWND 多 tier + 重试，
         // 全部被拒则回退 composition）。
         ComPtr<IDXGIFactory4> factory;
-        hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        hr = createDxgiFactory(factory);
         if (FAILED(hr)) {
             return mcdr::err("configureSurface", "CreateDXGIFactory1 failed " + hrText(hr));
         }
@@ -1420,7 +1487,10 @@ void presentSurface(Dx12Surface* s) {
                    static_cast<unsigned long long>(dc.clearColorCalls),
                    static_cast<unsigned long long>(dc.clearDepthCalls), dc.lastClearColorTexture);
     }
+    // P113：Reflex 要求 Present 之前 sleep（文档 ProgrammingGuideReflex.md §5）。
+    mcdr_reflex_before_present();
     HRESULT hr = s->swapChain->Present(syncInterval, flags);
+    mcdr_reflex_after_present();  // P115：PCL 的 ePresentEnd 标记
     // present 后 backbuffer 所有权已释放（vanilla 每帧 acquire->blit->present，
     // 若此处不重置，configureSurface 的 ResizeBuffers 会误以为仍有 acquired
     // backbuffer 而返回 DXGI_ERROR_NOT_CURRENTLY_AVAILABLE -> 画面冻结）。

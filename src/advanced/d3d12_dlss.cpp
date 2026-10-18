@@ -36,6 +36,21 @@
 
 #include <d3d12.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+// P112 阶段 1：Streamline 接管 DLSS 的实现选择（默认仍是直连 NGX，行为与 P108 一致）。
+#if __has_include(<sl.h>)
+#include <sl.h>
+#include <sl_dlss.h>   // sl::DLSSMode / sl::DLSSOptions（sl.h 只含 core）
+#include <sl_reflex.h>  // P113：sl::ReflexOptions / sl::ReflexMode
+#define MCDR_DLSS_HAVE_STREAMLINE 1
+#else
+#define MCDR_DLSS_HAVE_STREAMLINE 0
+#endif
+
 #include "mcdr_abi.h"
 // P108: the extern "C" interface shared with the device module. It defines the transition
 // callback types (DlssTransitionFn / DlssQueryStateFn) this unit stores in its state.
@@ -587,13 +602,18 @@ namespace
     //                 (low) render resolution", which is exactly our case: the velocity pass runs at
     //                 render res and writes render-pixel offsets. The old code left it off and even
     //                 documented the opposite, so NGX rescaled them as if they were display-sized.
-    //   MVJittered    **off**. The reference never sets it — it treats MVs as unjittered and passes
-    //                 the jitter separately via `InJitterOffsetX/Y`. Our jitter is frozen to 0 while
-    //                 DLSS runs anyway, so claiming jittered MVs was simply wrong.
+    //   MVJittered    **on**. D3D12Velocity.kt builds `currViewProj` from the JITTERED projection and
+    //                 then adds `PrevJitterPixels`, so both ends of every motion vector sit on the
+    //                 jittered grid — the jitter delta is inside them. Declaring that (MVJittered) is
+    //                 what lets NGX cancel it with `InJitterOffsetX/Y`; leaving it off made NGX treat
+    //                 those deltas as real motion. The old note ("jitter is frozen to 0 anyway") no
+    //                 longer holds: P110 removed the freeze, TAA and DLSS now share one Halton(2,3)
+    //                 sequence, and the flag is set unconditionally — with jitter 0 it is a no-op.
     //   IsHDR         off — 8-bit UNORM target.
     //
-    // `motionVectorJitterCancellation` is not a create flag; it goes through the parameter map at
-    // evaluate time (NVSDK_NGX_DLSS_Create_Params has no field for it).
+    // Cancelling that jitter needs no extra NGX knob: `MVJittered` plus the `InJitterOffsetX/Y`
+    // already passed to `EvaluateFeature` is the whole contract. (This SDK's header has no
+    // "motion vector jitter cancellation" parameter key at all — an earlier note here claimed one.)
     // P108ac (user m08033): the DLSS *model* is selected through NGX's "render preset" hint, one
     // parameter key per quality tier. Only the key matching the tier the feature is built with is
     // consulted, so set exactly that one — writing all six would be noise, and a stale value on an
@@ -662,6 +682,9 @@ namespace
         if (in.renderWidth != in.targetWidth || in.renderHeight != in.targetHeight) {
             flags |= static_cast<int32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes);
         }
+        // P110: the motion vectors already contain the sub-pixel jitter (see the note in the feature
+        // flag comment block above), so tell NGX to cancel it with InJitterOffsetX/Y.
+        flags |= static_cast<int32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVJittered);
         return flags;
     }
     // -----------------------------------------------------------------------
@@ -881,12 +904,112 @@ namespace
         return fallback;
     }
 
+    // P112 阶段 1：DLSS 实现选择。默认 "ngx"（P108 的直连路径，行为完全不变）；
+    // "streamline" 时由 Streamline 拥有 NGX —— 这里不调用 NVSDK_NGX_D3D12_Init_*，
+    // 否则同进程两套 NGX 会互相破坏（P111 实测 sl.log: getNGXFeatureRequirements
+    // ngxResult 0xbad00005），改为通过 interposer 的 slDLSSSetOptions 设置选项。
+    // evaluate 仍在阶段 2 才迁移，所以本阶段 DLSS 实际不出图（mcdr_dlss_create 返回 0）。
+    bool dlssImplStreamline() {
+        static const bool streamline = []() {
+            char buf[16] = {};
+            const DWORD n = ::GetEnvironmentVariableA("MCDR_DLSS_IMPL", buf, 16);
+            return n > 0 && _stricmp(buf, "streamline") == 0;
+        }();
+        return streamline;
+    }
+
+#if MCDR_DLSS_HAVE_STREAMLINE
+    using PFn_SlDLSSSetOptions = sl::Result (*)(const sl::ViewportHandle&, const sl::DLSSOptions&);
+
+    // MCDR.dll 所在目录（带结尾反斜杠）。
+    std::wstring dlssModuleDirectory() {
+        HMODULE self = nullptr;
+        if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                      GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                  reinterpret_cast<LPCWSTR>(&dlssModuleDirectory), &self)) {
+            return {};
+        }
+        wchar_t path[MAX_PATH] = {};
+        if (!::GetModuleFileNameW(self, path, MAX_PATH)) return {};
+        std::wstring pathStr(path);
+        const auto slash = pathStr.find_last_of(L"\\/");
+        return slash == std::wstring::npos ? std::wstring() : pathStr.substr(0, slash + 1);
+    }
+
+    // 运行时取 interposer 的 slDLSSSetOptions（不引入静态导入，缺 SL 时返回 nullptr）。
+    PFn_SlDLSSSetOptions slDlssSetOptionsFn() {
+        static const PFn_SlDLSSSetOptions fn = []() -> PFn_SlDLSSSetOptions {
+            const std::wstring dir = dlssModuleDirectory();
+            if (dir.empty()) return nullptr;
+            HMODULE sl = ::LoadLibraryW((dir + L"sl.interposer.dll").c_str());
+            if (sl == nullptr) return nullptr;
+            using PFn_GetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
+            auto getFeatureFunction = reinterpret_cast<PFn_GetFeatureFunction>(
+                ::GetProcAddress(sl, "slGetFeatureFunction"));
+            if (getFeatureFunction == nullptr) return nullptr;
+            void* raw = nullptr;
+            if (getFeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", raw) != sl::Result::eOk) {
+                return nullptr;
+            }
+            return reinterpret_cast<PFn_SlDLSSSetOptions>(raw);
+        }();
+        return fn;
+    }
+
+    // 把本帧几何 + 质量档写进 SL 的 DLSS 选项；把结果写到 sl-probe.txt 自证
+    // （设备创建期的 native 日志可能早于文件 sink，见 P111 教训）。
+    int32_t streamlineApplyOptions(const mcdr_dlss_input& in) {
+        const PFn_SlDLSSSetOptions fn = slDlssSetOptionsFn();
+        if (fn == nullptr) return -1;
+        sl::DLSSOptions opt{};
+        switch (s.qualityValue) {
+            case NVSDK_NGX_PerfQuality_Value_DLAA:       opt.mode = sl::DLSSMode::eDLAA; break;
+            case NVSDK_NGX_PerfQuality_Value_MaxQuality: opt.mode = sl::DLSSMode::eMaxQuality; break;
+            case NVSDK_NGX_PerfQuality_Value_Balanced:   opt.mode = sl::DLSSMode::eBalanced; break;
+            default:                                     opt.mode = sl::DLSSMode::eMaxPerformance; break;
+        }
+        opt.outputWidth = static_cast<uint32_t>(in.targetWidth);
+        opt.outputHeight = static_cast<uint32_t>(in.targetHeight);
+        opt.preExposure = in.preExposure > 0.0f ? in.preExposure : 1.0f;
+        opt.exposureScale = in.exposureScale > 0.0f ? in.exposureScale : 1.0f;
+        opt.useAutoExposure = sl::Boolean::eFalse;
+        const sl::ViewportHandle viewport(0);
+        const sl::Result r = fn(viewport, opt);
+        static int optionsProbeWrites = 0;
+        if (++optionsProbeWrites <= 3) if (FILE* f = _wfopen((dlssModuleDirectory() + L"sl-probe.txt").c_str(), L"a, ccs=UTF-8")) {
+            fwprintf(f, L"P112 dlss-options: mode=%d out=%ux%u render=%dx%d result=0x%X\n",
+                     static_cast<int>(opt.mode), opt.outputWidth, opt.outputHeight,
+                     static_cast<unsigned>(in.renderWidth), static_cast<unsigned>(in.renderHeight),
+                     static_cast<unsigned>(r));
+            fclose(f);
+        }
+        static int optionsLogged = 0;
+        if (optionsLogged < 3) {
+            ++optionsLogged;
+            logWarn("P112: DLSS impl=streamline — slDLSSSetOptions result=0x%X (mode=%d, out=%ux%u, "
+                "render=%dx%d)",
+                static_cast<unsigned>(r), static_cast<int>(opt.mode), opt.outputWidth,
+                opt.outputHeight, static_cast<unsigned>(in.renderWidth),
+                static_cast<unsigned>(in.renderHeight));
+        }
+        return static_cast<int32_t>(r);
+    }
+#endif
+
     bool ensureInit(ID3D12Device* device) {
         if (s.initAttempted) {
             return s.initOk && s.paramsOk;
         }
         s.initAttempted = true;
         s.device = device;
+        if (dlssImplStreamline()) {
+            // P112：SL 拥有 NGX。这里绝不能调用 NVSDK_NGX_D3D12_Init_*（同进程双 NGX 冲突，
+            // P111 实测 sl.log 里 getNGXFeatureRequirements 报 0xbad00005）。
+            logInfo("P112: DLSS impl=streamline — native NGX init skipped "
+                    "(Streamline owns the runtime; evaluate lands in phase 2)");
+            s.failure = "streamline mode: native NGX init skipped by design";
+            return false;
+        }
 
         // P108：**固定用 SDK 常量 `NVSDK_NGX_Version_API`(0x15)，不再做版本扫描**。
         // 依据：与我们的 DLL 同代（310.x）的生产实现（ETS2/ATS DLAA mod，src/dlaa.cpp，
@@ -1157,11 +1280,12 @@ namespace
             // PerfQualityValue and the size relationship differ: DLAA means "no upscaling", i.e.
             // render size == target size.
             //
-            // KNOWN LIMITATION (recorded, deliberately not worked around here): DLAA's quality
-            // depends on the sub-pixel projection jitter, and P75's jitter replacement path is
-            // currently frozen to 0 to avoid the "flat beige frame" regression. So this is
-            // "temporally accumulated DLAA without jitter" — it works, but is not the real thing.
-            // Do NOT unfreeze the jitter for it; once P75 is fixed, DLAA improves for free.
+            // P110b: DLAA now gets the real sub-pixel jitter — the projection UBO carries the same
+            // Halton sequence TAA uses, InJitterOffsetX/Y is that offset in render pixels, and the
+            // MVJittered feature flag tells NGX the motion vectors are already in jittered space.
+            // The old note here said the jitter was frozen to 0 because injection "collapsed the
+            // frame"; that diagnosis was built on byte-swapped matrix data (see known_bugs.md D.25)
+            // and no longer applies.
             static const uint32_t kTierToNgx[4] = {
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_MaxPerf),
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_Balanced),
@@ -1504,6 +1628,18 @@ int32_t mcdr_dlss_can_run(void* device) {
             return 0;
         }
     }
+#if MCDR_DLSS_HAVE_STREAMLINE
+    if (dlssImplStreamline()) {
+        // P112 阶段 1：SL 拥有 NGX —— 既不加载也不初始化 nvngx。对 JVM 报"可用"，
+        // 让 CreateDlssFeature 被调用（那里做 slDLSSSetOptions 并把结果写进 sl-probe.txt）。
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            logInfo("P112: DLSS impl=streamline — can_run reports available (Streamline owns NGX)");
+        }
+        return 1;
+    }
+#endif
     return ensureInit(static_cast<ID3D12Device*>(device)) ? 1 : 0;
 }
 
@@ -1556,6 +1692,8 @@ void mcdr_dlss_query(char* note, int32_t noteCap, char* optimal, int32_t optimal
         std::snprintf(runtime, static_cast<std::size_t>(runtimeCap), "%s", s.runtimePath.c_str());
     }
 }
+void tickCallStats(const char* kind);  // P114 诊断（定义在 streamline 段）
+
 int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
                          void* tlCtx) {
     if (in == nullptr) {
@@ -1565,6 +1703,18 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
         return -1;
     }
     if (!s.initOk || !s.paramsOk) {
+#if MCDR_DLSS_HAVE_STREAMLINE
+        // P112 阶段 1：streamline 模式下 ensureInit 主动跳过 NGX，因此必然走到这里；
+        // 把创建/选项交给 SL 的 slDLSSSetOptions，然后返回 0（evaluate 迁到阶段 2 才出图）。
+        // P112：NGX 在 streamline 模式下从未 init，这里把创建/选项交给 SL 并返回 1 ——
+        // 返回 1 表示"特征已就绪"，JVM 才会继续调用 mcdr_dx12EvaluateDlss；返回 0 会被
+        // 当成"特征未就绪"而跳过 evaluate（P112 实测）。
+        if (dlssImplStreamline()) {
+            tickCallStats("create");
+            (void)streamlineApplyOptions(*in);
+            return 1;
+        }
+#endif
         return 0;
     }
     auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
@@ -1939,6 +2089,588 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
     return 1;
 }
 
+// P113：最近一帧的 SL frame token（Reflex 的 slReflexSleep 要在 Present 前用它）。
+sl::FrameToken* gLastFrameToken = nullptr;
+
+    // P114 诊断：每秒统计 streamline 的 evaluate / create 调用次数。
+    // 若 evaluate/s 明显大于 fps，说明每帧被调了多次（那会直接把 DLSS 的 GPU 成本翻倍）。
+    void tickCallStats(const char* kind) {
+        static uint32_t evalCalls = 0;
+        static uint32_t createCalls = 0;
+        static ULONGLONG lastTick = 0;
+        (kind[0] == 'e' ? evalCalls : createCalls)++;
+        const ULONGLONG now = ::GetTickCount64();
+        if (lastTick == 0) { lastTick = now; return; }
+        if (now - lastTick >= 1000) {
+            logInfo("P112 calls/s eval=%u create=%u", evalCalls, createCalls);
+            evalCalls = 0;
+            createCalls = 0;
+            lastTick = now;
+        }
+    }
+
+    // P113/P115：Reflex 低延迟 + PCL 延迟标记 + 帧率限制器。
+    // 文档：ProgrammingGuideReflex.md §4（选项）/§5（Present 前 sleep）、ProgrammingGuidePCL.md（标记）。
+    using PFn_SetReflexOptions = sl::Result (*)(const sl::ReflexOptions&);
+    using PFn_ReflexSleep = sl::Result (*)(const sl::FrameToken&);
+    using PFn_PCLSetMarker = sl::Result (*)(sl::PCLMarker, const sl::FrameToken&);
+
+    namespace {
+        struct ReflexApi {
+            PFn_SetReflexOptions setOptions = nullptr;
+            PFn_ReflexSleep sleep = nullptr;
+            PFn_PCLSetMarker marker = nullptr;
+            sl::Result (*newFrameToken)(sl::FrameToken*&, const uint32_t*) = nullptr;
+            sl::Result (*getState)(sl::ReflexState&) = nullptr;
+            uint32_t frameCounter = 0;
+            bool resolved = false;
+            bool optionsApplied = false;
+            uint32_t frameLimitUs = 0;
+            uint32_t markerFailures = 0;
+        };
+        ReflexApi gReflex;
+        bool reflexEnabled() {
+            static const bool enabled = []() {
+                char v[8] = {};
+                const DWORD n = ::GetEnvironmentVariableA("MCDR_REFLEX", v, 8);
+                return !(n == 1 && v[0] == '0');
+            }();
+            return enabled;
+        }
+        void resolveReflexApi() {
+            if (gReflex.resolved) return;
+            gReflex.resolved = true;
+            char lim[16] = {};
+            const DWORD limLen = ::GetEnvironmentVariableA("MCDR_REFLEX_FRAME_LIMIT_US", lim, 16);
+            if (limLen > 0) {
+                gReflex.frameLimitUs = static_cast<uint32_t>(std::strtoul(lim, nullptr, 10));
+            }
+            const std::wstring dir = dlssModuleDirectory();
+            if (dir.empty()) return;
+            HMODULE sl = ::LoadLibraryW((dir + L"sl.interposer.dll").c_str());
+            if (sl == nullptr) return;
+            using PFn_GetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
+            auto gff = reinterpret_cast<PFn_GetFeatureFunction>(::GetProcAddress(sl, "slGetFeatureFunction"));
+            if (gff == nullptr) return;
+            void* raw = nullptr;
+            if (gff(sl::kFeatureReflex, "slReflexSetOptions", raw) == sl::Result::eOk) {
+                gReflex.setOptions = reinterpret_cast<PFn_SetReflexOptions>(raw);
+            }
+            raw = nullptr;
+            if (gff(sl::kFeatureReflex, "slReflexSleep", raw) == sl::Result::eOk) {
+                gReflex.sleep = reinterpret_cast<PFn_ReflexSleep>(raw);
+            }
+            raw = nullptr;
+            if (gff(sl::kFeaturePCL, "slPCLSetMarker", raw) == sl::Result::eOk) {
+                gReflex.marker = reinterpret_cast<PFn_PCLSetMarker>(raw);
+            }
+            gReflex.newFrameToken = reinterpret_cast<decltype(gReflex.newFrameToken)>(
+                ::GetProcAddress(sl, "slGetNewFrameToken"));
+            raw = nullptr;
+            if (gff(sl::kFeatureReflex, "slReflexGetState", raw) == sl::Result::eOk) {
+                gReflex.getState = reinterpret_cast<decltype(gReflex.getState)>(raw);
+            }
+        }
+        void applyReflexOptions() {
+            if (gReflex.setOptions == nullptr || gReflex.optionsApplied) return;
+            gReflex.optionsApplied = true;
+            sl::ReflexOptions opt{};
+            opt.mode = sl::ReflexMode::eLowLatency;
+            opt.frameLimitUs = gReflex.frameLimitUs;  // 0 = 不限帧（文档：与 mode 独立）
+            const sl::Result r = gReflex.setOptions(opt);
+            logWarn("P113 reflex: slReflexSetOptions(eLowLatency, frameLimitUs=%u) result=0x%X",
+                    gReflex.frameLimitUs, static_cast<unsigned>(r));
+            if (FILE* f = _wfopen((dlssModuleDirectory() + L"sl-probe.txt").c_str(), L"a, ccs=UTF-8")) {
+                fwprintf(f, L"P113 reflex: setOptions=0x%X sleep=%s marker=%s frameLimitUs=%u\n",
+                         static_cast<unsigned>(r), gReflex.sleep != nullptr ? L"ok" : L"missing",
+                         gReflex.marker != nullptr ? L"ok" : L"missing", gReflex.frameLimitUs);
+                fclose(f);
+            }
+        }
+        void emitMarker(sl::PCLMarker marker) {
+            if (gReflex.marker == nullptr || gLastFrameToken == nullptr) return;
+            const sl::Result r = gReflex.marker(marker, *gLastFrameToken);
+            if (r != sl::Result::eOk && gReflex.markerFailures < 3) {
+                ++gReflex.markerFailures;
+                logWarn("P113 pcl: marker %d result=0x%X", static_cast<int>(marker),
+                        static_cast<unsigned>(r));
+            }
+        }
+    }  // namespace
+
+    void mcdr_reflex_set_frame_limit(uint32_t micros) {
+        resolveReflexApi();
+        gReflex.frameLimitUs = micros;
+        gReflex.optionsApplied = false;  // 下次 Present 前重新下发
+    }
+
+    // P117：每帧开始（世界渲染之前）—— 建本帧的 SL frame token 并发 eSimulationStart。
+    // 文档 ProgrammingGuidePCL.md:144/152：simulation/submit/present 标记必须用**同一帧**的 token。
+    void mcdr_reflex_frame_begin(void) {
+        if (!reflexEnabled()) return;
+        resolveReflexApi();
+        gLastFrameToken = nullptr;
+        sl::FrameToken* token = nullptr;
+        uint32_t frameIndex = ++gReflex.frameCounter;
+        if (gReflex.newFrameToken != nullptr &&
+            gReflex.newFrameToken(token, &frameIndex) == sl::Result::eOk && token != nullptr) {
+            gLastFrameToken = token;
+        }
+        emitMarker(sl::PCLMarker::eSimulationStart);
+    }
+
+    // P117：通用标记（eSimulationEnd / eRenderSubmitStart 等由 JVM 在正确时机调）。
+    void mcdr_reflex_marker(int32_t marker) {
+        if (!reflexEnabled()) return;
+        resolveReflexApi();
+        emitMarker(static_cast<sl::PCLMarker>(marker));
+    }
+
+    void mcdr_reflex_before_present(void) {
+        if (!reflexEnabled()) return;
+        resolveReflexApi();
+        applyReflexOptions();
+        emitMarker(sl::PCLMarker::eRenderSubmitEnd);  // 本帧所有提交已完成，接着 Present
+        emitMarker(sl::PCLMarker::ePresentStart);
+        if (gReflex.sleep != nullptr && gLastFrameToken != nullptr) {
+            (void)gReflex.sleep(*gLastFrameToken);
+        }
+    }
+
+    void mcdr_reflex_after_present(void) {
+        if (!reflexEnabled()) return;
+        emitMarker(sl::PCLMarker::ePresentEnd);
+        gLastFrameToken = nullptr;  // 下一帧由 mcdr_reflex_frame_begin() 重新建
+
+        // P117：每秒读一次 ReflexState，把 PCL 统计的实测延迟打进日志（证明标记链路生效）。
+        static ULONGLONG lastStatsTick = 0;
+        static bool statsReported = false;
+        const ULONGLONG now = ::GetTickCount64();
+        if (gReflex.getState == nullptr) return;
+        if (lastStatsTick != 0 && now - lastStatsTick < 1000) return;
+        lastStatsTick = now;
+        sl::ReflexState state{};
+        if (gReflex.getState(state) != sl::Result::eOk || !state.latencyReportAvailable) return;
+        // 报告里有两串 frameID（一串是 QPC 量级的巨大值、一串是 1,2,3…），按 frameID 取最大
+        // 会挑到无效条目；按 simStartTime 取**最新**才是本帧那条。
+        const sl::ReflexReport* newest = nullptr;
+        for (const sl::ReflexReport& report : state.frameReport) {
+            if (report.frameID == 0 || report.simStartTime == 0 || report.presentEndTime == 0) continue;
+            if (newest == nullptr || report.simStartTime > newest->simStartTime) {
+                newest = &report;
+            }
+        }
+        if (newest == nullptr) return;
+        // 时间戳是 QPC tick（本机 10 MHz），不是纳秒：µs = ticks * 1e6 / 频率。
+        LARGE_INTEGER freq{};
+        ::QueryPerformanceFrequency(&freq);
+        const unsigned long long ticksPerUs =
+            freq.QuadPart > 0 ? static_cast<unsigned long long>(freq.QuadPart) / 1000000ull : 10ull;
+        const auto us = [ticksPerUs](uint64_t from, uint64_t to) -> unsigned long long {
+            return to > from ? (to - from) / ticksPerUs : 0ull;
+        };
+        const unsigned long long latency = us(newest->simStartTime, newest->presentEndTime);
+        const unsigned long long simUs = us(newest->simStartTime, newest->simEndTime);
+        const unsigned long long submitUs = us(newest->renderSubmitStartTime, newest->renderSubmitEndTime);
+        const unsigned long long presentUs = us(newest->presentStartTime, newest->presentEndTime);
+        logInfo("P113 pcl: latency=%lluus sim=%lluus submit=%lluus present=%lluus gpu=%uus active=%uus",
+                latency, simUs, submitUs, presentUs,
+                static_cast<unsigned>(newest->gpuFrameTimeUs),
+                static_cast<unsigned>(newest->gpuActiveRenderTimeUs));
+        if (!statsReported) {
+            statsReported = true;
+            if (FILE* f = _wfopen((dlssModuleDirectory() + L"sl-probe.txt").c_str(), L"a, ccs=UTF-8")) {
+                fwprintf(f, L"P113 pcl stats: latency=%lluus gpu=%uus active=%uus\n", latency,
+                         static_cast<unsigned>(newest->gpuFrameTimeUs),
+                         static_cast<unsigned>(newest->gpuActiveRenderTimeUs));
+                fclose(f);
+            }
+        }
+    }
+
+    // P112 阶段 3：每秒打一行 fps（两个实现路径共用），用于 ngx vs streamline 的同场景 A/B。
+    // 计数单位是 mcdr_dlss_evaluate 的成功次数 == 每秒评价的帧数。
+    void tickDlssFps(const char* impl) {
+        static ULONGLONG lastTick = 0;
+        static uint32_t frames = 0;
+        ++frames;
+        const ULONGLONG now = ::GetTickCount64();
+        if (lastTick == 0) {
+            lastTick = now;
+            return;
+        }
+        const ULONGLONG elapsed = now - lastTick;
+        if (elapsed >= 1000) {
+            logInfo("P112 fps=%u impl=%s", static_cast<unsigned>(frames * 1000ull / elapsed), impl);
+            frames = 0;
+            lastTick = now;
+        }
+    }
+
+#if MCDR_DLSS_HAVE_STREAMLINE
+    // P112：JVM 每帧送来的相机常量（sl::Constants 的数据源）。单线程（渲染线程）写入/读取。
+    mcdr_dlss_constants gCameraConstants{};
+    bool gCameraConstantsValid = false;
+
+    int32_t mcdr_dlss_set_constants(const mcdr_dlss_constants* constants) {
+        if (constants == nullptr) return 0;
+        gCameraConstants = *constants;
+        gCameraConstantsValid = true;
+        return 1;
+    }
+
+    using PFn_slGetNewFrameToken = sl::Result (*)(sl::FrameToken*&, const uint32_t*);
+    using PFn_slSetTagForFrame = sl::Result (*)(const sl::FrameToken&, const sl::ViewportHandle&,
+                                                const sl::ResourceTag*, uint32_t, sl::CommandBuffer*);
+    using PFn_slEvaluateFeature = sl::Result (*)(sl::Feature, const sl::FrameToken&,
+                                                 const sl::BaseStructure**, uint32_t,
+                                                 sl::CommandBuffer*);
+    // ProgrammingGuide.md §2.11.1：slSetConstants(constants, frame, viewport)
+    using PFn_slSetConstants = sl::Result (*)(const sl::Constants&, const sl::FrameToken&,
+                                             const sl::ViewportHandle&);
+
+    // P112 阶段 2：Streamline 的每帧调用面（全部运行时解析，不引入静态导入）。
+    struct StreamlineEvalApi {
+        PFn_SlDLSSSetOptions setOptions = nullptr;
+        PFn_slGetNewFrameToken newFrameToken = nullptr;
+        PFn_slSetTagForFrame setTags = nullptr;
+        PFn_slSetConstants setConstants = nullptr;
+        PFn_slEvaluateFeature evaluate = nullptr;
+    };
+
+    const StreamlineEvalApi& streamlineEvalApi() {
+        static const StreamlineEvalApi api = []() -> StreamlineEvalApi {
+            StreamlineEvalApi a{};
+            const std::wstring dir = dlssModuleDirectory();
+            if (dir.empty()) return a;
+            HMODULE sl = ::LoadLibraryW((dir + L"sl.interposer.dll").c_str());
+            if (sl == nullptr) return a;
+            a.newFrameToken = reinterpret_cast<PFn_slGetNewFrameToken>(
+                ::GetProcAddress(sl, "slGetNewFrameToken"));
+            a.setTags = reinterpret_cast<PFn_slSetTagForFrame>(
+                ::GetProcAddress(sl, "slSetTagForFrame"));
+            a.setConstants = reinterpret_cast<PFn_slSetConstants>(
+                ::GetProcAddress(sl, "slSetConstants"));
+            a.evaluate = reinterpret_cast<PFn_slEvaluateFeature>(
+                ::GetProcAddress(sl, "slEvaluateFeature"));
+            using PFn_GetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
+            auto gff = reinterpret_cast<PFn_GetFeatureFunction>(
+                ::GetProcAddress(sl, "slGetFeatureFunction"));
+            if (gff != nullptr) {
+                void* raw = nullptr;
+                if (gff(sl::kFeatureDLSS, "slDLSSSetOptions", raw) == sl::Result::eOk) {
+                    a.setOptions = reinterpret_cast<PFn_SlDLSSSetOptions>(raw);
+                }
+            }
+            return a;
+        }();
+        return api;
+    }
+
+    // P112：4x4 行主序矩阵工具（sl::Constants 需要 cameraViewToClip / clipToCameraView /
+    // clipToPrevClip / prevClipToClip 四个矩阵，而 JVM 只送 viewProj 与 prevViewProj）。
+    void mat4Multiply(const float* a, const float* b, float* out) {
+        float r[16];
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                float sum = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    sum += a[row * 4 + k] * b[k * 4 + col];
+                }
+                r[row * 4 + col] = sum;
+            }
+        }
+        std::memcpy(out, r, sizeof(r));
+    }
+
+    // Gauss-Jordan 求逆（失败返回 false，out 保持原样）。
+    bool mat4Inverse(const float* m, float* out) {
+        double a[4][8] = {};
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) a[row][col] = m[row * 4 + col];
+            a[row][4 + row] = 1.0;
+        }
+        for (int col = 0; col < 4; ++col) {
+            int pivot = col;
+            for (int row = col + 1; row < 4; ++row) {
+                if (std::fabs(a[row][col]) > std::fabs(a[pivot][col])) pivot = row;
+            }
+            if (std::fabs(a[pivot][col]) < 1e-12) return false;
+            if (pivot != col) {
+                for (int k = 0; k < 8; ++k) std::swap(a[col][k], a[pivot][k]);
+            }
+            const double inv = 1.0 / a[col][col];
+            for (int k = 0; k < 8; ++k) a[col][k] *= inv;
+            for (int row = 0; row < 4; ++row) {
+                if (row == col) continue;
+                const double f = a[row][col];
+                if (f == 0.0) continue;
+                for (int k = 0; k < 8; ++k) a[row][k] -= f * a[col][k];
+            }
+        }
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) out[row * 4 + col] = static_cast<float>(a[row][4 + col]);
+        }
+        return true;
+    }
+    // SL 的 DLSS 评价：按 ProgrammingGuideDLSS.md 的顺序 —— tag 资源 → 设选项 → evaluate。
+    // eDisableCLStateTracking 下资源状态由我们负责（这里沿用 NGX 路径的同一组状态）。
+    int32_t streamlineEvaluate(void* commandList, const mcdr_dlss_input& in, DlssTransitionFn tl,
+                               void* tlCtx) {
+        auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
+        if (cmd == nullptr) return 0;
+        tickCallStats("eval");
+        const StreamlineEvalApi& api = streamlineEvalApi();
+        auto* color = reinterpret_cast<ID3D12Resource*>(in.pInColor);
+        auto* depth = reinterpret_cast<ID3D12Resource*>(in.pInDepth);
+        auto* mv = reinterpret_cast<ID3D12Resource*>(in.pInMotionVectors);
+        auto* out = reinterpret_cast<ID3D12Resource*>(in.pInOutput);
+        if (api.setOptions == nullptr || api.newFrameToken == nullptr ||
+            api.setTags == nullptr || api.evaluate == nullptr) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                logWarn("P112: streamline evaluate unavailable — interposer exports or "
+                        "slDLSSSetOptions missing");
+            }
+            return 0;
+        }
+        if (color == nullptr || depth == nullptr || mv == nullptr || out == nullptr) return 0;
+        // P112：输出目标优先用 JVM 交付的 UAV 纹理（s.externalOutput，见 mcdr_dlss_set_output_texture）。
+        // 直接把 GUI 目标（无 UAV 位）标成 kBufferTypeScalingOutputColor，NGX 会报
+        // FAIL_RWFlagMissing(0xBAD00009)（SL 日志里是 "[sl.dlss] NGX evaluate feature failed"）。
+        // P114 诊断：确认 DLSS 的输入颜色到底是谁 —— 世界层（render 尺寸）还是已经合成好的
+        // GUI 目标（target 尺寸）。如果 color 是 target 尺寸，说明 GUI 也被送进 DLSS 了。
+        // 只在几何/指针变化时打印，这样 GUI 打开、窗口缩放等切换都会留下记录。
+        static ID3D12Resource* lastColor = nullptr;
+        static ID3D12Resource* lastOut = nullptr;
+        static uint32_t geomChanges = 0;
+        if ((color != lastColor || out != lastOut) && geomChanges < 40) {
+            ++geomChanges;
+            lastColor = color;
+            lastOut = out;
+            const D3D12_RESOURCE_DESC cd = color->GetDesc();
+            const D3D12_RESOURCE_DESC od = out->GetDesc();
+            logWarn("P114 geom#%u: color=%p %ux%u fmt=%d out=%p %ux%u fmt=%d render=%dx%d target=%dx%d",
+                    geomChanges, static_cast<void*>(color),
+                    static_cast<unsigned>(cd.Width), static_cast<unsigned>(cd.Height),
+                    static_cast<int>(cd.Format), static_cast<void*>(out),
+                    static_cast<unsigned>(od.Width), static_cast<unsigned>(od.Height),
+                    static_cast<int>(od.Format),
+                    static_cast<unsigned>(in.renderWidth), static_cast<unsigned>(in.renderHeight),
+                    static_cast<unsigned>(in.targetWidth), static_cast<unsigned>(in.targetHeight));
+        }
+        // P114（用户报告的 GUI 文字被当作运动物体）：DLSS 的 temporal history 以**自己的输出**
+        // 为反馈源。如果直接把 GUI 目标（每帧还要被 GUI 画一遍）标成 ScalingOutputColor，
+        // 历史缓冲会被 GUI 污染 —— 滑动界面时文字就被当成运动物体放大/拖出框外。
+        // NGX 路径从来没这个现象，因为它写的是私有 UAV / handover 纹理再拷回目标。
+        // 这里照做：优先 externalOutput（JVM 交付的 UAV），否则用模块私有的 dlssOutput，
+        // 只有两者都不可用才退化成直接写 GUI 目标。
+        ID3D12Resource* outResource = out;
+        bool copyBack = false;
+        const auto fitsTarget = [&in](ID3D12Resource* res) {
+            if (res == nullptr) return false;
+            const D3D12_RESOURCE_DESC d = res->GetDesc();
+            return d.Width == static_cast<UINT64>(in.targetWidth) &&
+                   d.Height == static_cast<UINT>(in.targetHeight);
+        };
+        if (fitsTarget(s.externalOutput)) {
+            outResource = s.externalOutput;
+            copyBack = true;
+        } else if (fitsTarget(s.dlssOutput)) {
+            outResource = s.dlssOutput;
+            copyBack = true;
+        }
+        static ID3D12Resource* lastSel = nullptr;
+        if (outResource != lastSel) {
+            lastSel = outResource;
+            logWarn("P114 out-sel: %s externalOutput=%p dlssOutput=%p out=%p",
+                    outResource == out ? "GUI-target" : "private-UAV",
+                    static_cast<void*>(s.externalOutput), static_cast<void*>(s.dlssOutput),
+                    static_cast<void*>(out));
+        }
+        s.transitionFn = tl;
+        s.transitionCtx = tlCtx;
+        // 文档（ProgrammingGuideDLSS.md:155）：**资源状态由 SL 管理，宿主不要手动 transition**；
+        // 宿主的责任是 evaluate 之后恢复命令列表状态（:242-253，配合 eDisableCLStateTracking）。
+        // P117：token 由 mcdr_reflex_frame_begin() 在帧开始建好；这里复用，保证 PCL 标记与
+        // DLSS evaluate 落在**同一帧**（文档要求）。没有 frame_begin（例如 Reflex 关闭）时兜底自建。
+        sl::FrameToken* token = gLastFrameToken;
+        if (token == nullptr) {
+            uint32_t frameIndex = static_cast<uint32_t>(s.submitCount);
+            if (api.newFrameToken(token, &frameIndex) != sl::Result::eOk || token == nullptr) return 0;
+            gLastFrameToken = token;
+        }
+        const sl::ViewportHandle viewport(0);
+        gLastFrameToken = token;  // P113：Reflex 在 Present 前要用它
+
+        // 1) 相机常量（每帧、尽量早；ProgrammingGuide.md §2.11.1）。没有 JVM 送来的
+        //    `mcdr_dlss_constants` 时只能跳过 —— slSetConstants 缺字段 DLSS 会拒绝该帧。
+        int constResult = -1;
+        if (gCameraConstantsValid) {
+            sl::Constants cnst{};
+            // P118 修（用户报「DLSS 静止不动也有随机拖影」）：这里有三个**传参错误**，每一个都足以
+            // 让 DLSS 在完全静止时每帧取错历史：
+            //   1) 布局：JVM 送的是列主序（JOML `Matrix4f.get(float[])`），而 `sl::Constants` 的
+            //      `float4x4` 明确要求**行主序**（sl_consts.h:183-185）。原来直接 memcpy，等于把
+            //      整组矩阵转置着交给 SL —— 静止时当前/上一帧只差一个 jitter，转置会把这点差异
+            //      映射到错误的 clip 轴上，于是每个像素每帧都多出约半个像素的错误位移 ⇒ 拖影。
+            //   2) `prevClipToClip` 抄成了 `inverse(prevViewProj)`，公式是
+            //      `prevClipToClip = clipToPrevClip.inverse() = inverse(prevViewProj) * viewProj`
+            //      （sl_consts.h:193-199），少了右乘的当前帧矩阵，它根本不是"上一帧 clip → 本帧
+            //      clip"的映射。
+            //   3) 矩阵求逆/相乘用的是本文件的行主序工具（mat4Multiply/mat4Inverse），所以必须先
+            //      把列主序输入转成行主序再做数学，否则连 `clipToPrevClip` 都是转置的。
+            const float* viewProj = gCameraConstants.viewProjection;
+            const float* prevViewProj = gCameraConstants.prevViewProjection;
+            float curVP[16] = {};
+            float prvVP[16] = {};
+            // 列主序 -> 行主序：rowMajor[r*4+c] = colMajor[c*4+r]
+            for (int r = 0; r < 4; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    curVP[r * 4 + c] = viewProj[c * 4 + r];
+                    prvVP[r * 4 + c] = prevViewProj[c * 4 + r];
+                }
+            }
+            float invCurVP[16] = {};
+            float invPrvVP[16] = {};
+            const bool invOk = mat4Inverse(curVP, invCurVP);
+            const bool invPrevOk = mat4Inverse(prvVP, invPrvVP);
+            // 行主序之后可以直接拷进 sl::float4x4（它就是行主序的 16 个 float）。
+            std::memcpy(&cnst.cameraViewToClip, curVP, sizeof(curVP));
+            if (invOk) {
+                std::memcpy(&cnst.clipToCameraView, invCurVP, sizeof(invCurVP));
+                // clipToPrevClip = clipToView * viewToViewPrev * viewToClipPrev
+                //                = inverse(curVP) * prevVP
+                float clipToPrev[16] = {};
+                mat4Multiply(invCurVP, prvVP, clipToPrev);
+                std::memcpy(&cnst.clipToPrevClip, clipToPrev, sizeof(clipToPrev));
+                if (invPrevOk) {
+                    // prevClipToClip 必须是上面那个的逆：inverse(prevVP) * curVP。
+                    // 旧代码写的是 inverse(prevVP)，等于把"上一帧 clip"直接当成"本帧 clip"。
+                    float prevClipToClip[16] = {};
+                    mat4Multiply(invPrvVP, curVP, prevClipToClip);
+                    std::memcpy(&cnst.prevClipToClip, prevClipToClip, sizeof(prevClipToClip));
+                }
+            }
+            cnst.jitterOffset = {gCameraConstants.jitterOffsetX, gCameraConstants.jitterOffsetY};
+            cnst.mvecScale = {gCameraConstants.mvecScaleX, gCameraConstants.mvecScaleY};
+            cnst.cameraPos = {gCameraConstants.cameraPosX, gCameraConstants.cameraPosY,
+                              gCameraConstants.cameraPosZ};
+            cnst.cameraUp = {gCameraConstants.cameraUpX, gCameraConstants.cameraUpY,
+                             gCameraConstants.cameraUpZ};
+            cnst.cameraRight = {gCameraConstants.cameraRightX, gCameraConstants.cameraRightY,
+                                gCameraConstants.cameraRightZ};
+            cnst.cameraFwd = {gCameraConstants.cameraFwdX, gCameraConstants.cameraFwdY,
+                              gCameraConstants.cameraFwdZ};
+            cnst.cameraNear = gCameraConstants.cameraNear;
+            cnst.cameraFar = gCameraConstants.cameraFar;
+            cnst.cameraFOV = gCameraConstants.cameraFovRadians;
+            cnst.cameraAspectRatio = gCameraConstants.cameraAspectRatio;
+            cnst.depthInverted = gCameraConstants.depthInverted ? sl::Boolean::eTrue
+                                                                : sl::Boolean::eFalse;
+            cnst.cameraMotionIncluded = gCameraConstants.cameraMotionIncluded
+                                            ? sl::Boolean::eTrue
+                                            : sl::Boolean::eFalse;
+            cnst.motionVectors3D =
+                gCameraConstants.motionVectors3D ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+            cnst.motionVectorsJittered = gCameraConstants.motionVectorsJittered
+                                             ? sl::Boolean::eTrue
+                                             : sl::Boolean::eFalse;
+            cnst.reset = gCameraConstants.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+            // 注意：本版 SDK 的 sl::Constants 没有 renderingGameFrames 字段（文档草稿里有、
+            // sl_consts.h:182 的实际结构没有），所以那一位只能留在 JVM/AI 侧不用。
+            cnst.motionVectorsDilated = sl::Boolean::eFalse;
+            cnst.orthographicProjection = sl::Boolean::eFalse;
+            constResult = static_cast<int>(api.setConstants(cnst, *token, viewport));
+        }
+
+        // 2) 资源 tag（lifecycle 按文档 :143-147：输入/输出 eOnlyValidNow，深度/MV eValidUntilPresent）
+        // 只保留输出这一个 barrier：文档 :155 说资源状态由 SL 管理，输入侧的 transition 没必要，
+        // 还会和 SMAA/GUI 的既有状态重复切；tag 里仍带上资源当前应有的 state（D3D12 下必填）。
+        transition(outResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        sl::Resource colorRes(sl::ResourceType::eTex2d, color,
+                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        sl::Resource depthRes(sl::ResourceType::eTex2d, depth,
+                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        sl::Resource mvRes(sl::ResourceType::eTex2d, mv,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        sl::Resource outRes(sl::ResourceType::eTex2d, outResource,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        sl::ResourceTag tags[4] = {
+            sl::ResourceTag(&colorRes, sl::kBufferTypeScalingInputColor,
+                            sl::ResourceLifecycle::eOnlyValidNow),
+            sl::ResourceTag(&depthRes, sl::kBufferTypeDepth,
+                            sl::ResourceLifecycle::eValidUntilPresent),
+            sl::ResourceTag(&mvRes, sl::kBufferTypeMotionVectors,
+                            sl::ResourceLifecycle::eValidUntilPresent),
+            sl::ResourceTag(&outRes, sl::kBufferTypeScalingOutputColor,
+                            sl::ResourceLifecycle::eOnlyValidNow),
+        };
+        const sl::Result tagResult = api.setTags(*token, viewport, tags, 4, cmd);
+
+        // 3) 选项（:170-186：各档 preset + 模式 + 输出尺寸 + 非 HDR/非自动曝光）
+        sl::DLSSOptions opt{};
+        opt.dlaaPreset = sl::DLSSPreset::ePresetK;
+        opt.qualityPreset = sl::DLSSPreset::ePresetK;
+        opt.balancedPreset = sl::DLSSPreset::ePresetK;
+        opt.performancePreset = sl::DLSSPreset::ePresetM;
+        opt.ultraPerformancePreset = sl::DLSSPreset::ePresetL;
+        switch (s.qualityValue) {
+            case NVSDK_NGX_PerfQuality_Value_DLAA:       opt.mode = sl::DLSSMode::eDLAA; break;
+            case NVSDK_NGX_PerfQuality_Value_MaxQuality: opt.mode = sl::DLSSMode::eMaxQuality; break;
+            case NVSDK_NGX_PerfQuality_Value_Balanced:   opt.mode = sl::DLSSMode::eBalanced; break;
+            default:                                     opt.mode = sl::DLSSMode::eMaxPerformance; break;
+        }
+        opt.outputWidth = static_cast<uint32_t>(in.targetWidth);
+        opt.outputHeight = static_cast<uint32_t>(in.targetHeight);
+        opt.preExposure = in.preExposure > 0.0f ? in.preExposure : 1.0f;
+        opt.exposureScale = in.exposureScale > 0.0f ? in.exposureScale : 1.0f;
+        opt.useAutoExposure = sl::Boolean::eFalse;
+        opt.colorBuffersHDR = sl::Boolean::eFalse;
+        opt.alphaUpscalingEnabled = sl::Boolean::eFalse;
+        const sl::Result optResult = api.setOptions(viewport, opt);
+
+        // 4) evaluate（文档 :235：inputs 只需要 viewport；资源已经在 tag 里给过）
+        const sl::BaseStructure* evalInputs[1] = {&viewport};
+        const sl::Result evalResult = api.evaluate(sl::kFeatureDLSS, *token, evalInputs, 1, cmd);
+        ++s.submitCount;
+
+        // 4.5) handover：只有当 SL 写的那张纹理不是 GUI 目标时才需要拷回（同尺寸、同格式）。
+        // P115：`outResource == out` 说明两者已经是同一张纹理，这一拷贝可以直接省掉。
+        if (copyBack && outResource != out && evalResult == sl::Result::eOk) {
+            transition(outResource, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            transition(out, D3D12_RESOURCE_STATE_COPY_DEST);
+            cmd->CopyResource(out, outResource);
+        }
+        // 5) 宿主负责恢复（:242-253 + eDisableCLStateTracking）：只恢复输出到 RT。
+        // 输入侧我们不再改状态，所以也没有要恢复的 barrier。
+        transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        static int loggedRuns = 0;
+        if (loggedRuns < 3) {
+            ++loggedRuns;
+            logWarn("P112: streamline evaluate tags=0x%X options=0x%X evaluate=0x%X "
+                    "(mode=%d, out=%ux%u)",
+                    static_cast<unsigned>(tagResult), static_cast<unsigned>(optResult),
+                    static_cast<unsigned>(evalResult), static_cast<int>(opt.mode),
+                    opt.outputWidth, opt.outputHeight);
+            if (FILE* f = _wfopen((dlssModuleDirectory() + L"sl-probe.txt").c_str(),
+                                  L"a, ccs=UTF-8")) {
+                fwprintf(f, L"streamline evaluate: constants=%d tags=0x%X options=0x%X evaluate=0x%X\n",
+                         constResult, static_cast<unsigned>(tagResult),
+                         static_cast<unsigned>(optResult), static_cast<unsigned>(evalResult));
+                fclose(f);
+            }
+        }
+        if (evalResult == sl::Result::eOk) {
+            tickDlssFps("streamline");
+            return 1;
+        }
+        return 0;
+    }
+#endif
+
 int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
                            void* tlCtx, DlssReadbackFn rb) {
     if (in == nullptr) {
@@ -1947,6 +2679,13 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     if (s.disabled) {
         return -1;
     }
+#if MCDR_DLSS_HAVE_STREAMLINE
+    if (dlssImplStreamline()) {
+        // P112 阶段 2：streamline 模式下 NGX 从未 init/创建，这里直接走 SL 的
+        // tag → options → evaluate 链（资源状态由 streamlineEvaluate 内部负责）。
+        return streamlineEvaluate(commandList, *in, tl, tlCtx);
+    }
+#endif
     if (!s.featureOk || s.params == nullptr) {
         return 0;
     }
@@ -2378,6 +3117,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
                 in->renderWidth, in->renderHeight, in->targetWidth, in->targetHeight,
                 mvIsRg16 ? "RG16 straight through" : "copied into an RG16 intermediate");
     }
+    tickDlssFps("ngx");
     return 1;
     }
 
