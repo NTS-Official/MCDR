@@ -85,12 +85,8 @@ PFN_DCompositionCreateDevice resolveDCompCreateDevice() {
 typedef HRESULT(WINAPI* PFN_SL_CreateDXGIFactory1)(REFIID, void**);
 
 bool streamlineInterposerRequested() {
-    static const bool on = []() {
-        wchar_t buf[8] = {};
-        const DWORD n = GetEnvironmentVariableW(L"MCDR_STREAMLINE", buf, 8);
-        return n == 1 && buf[0] == L'1';
-    }();
-    return on;
+    // P118：统一由 DLSS 实现单元决策（默认 Streamline，缺运行库自动回退 NGX）。
+    return mcdr_dlss_streamline_requested() != 0;
 }
 
 // MCDR.dll 所在目录（带结尾反斜杠）—— 运行时 DLL 与 MCDR.dll 同目录。
@@ -1403,6 +1399,72 @@ mcdr::Result<void> blitTextureToTexture(CommandContext* ctx, Dx12Object* src, Dx
     transitionTextureTo(ctx, src, D3D12_RESOURCE_STATE_RENDER_TARGET);
     dbgLogDebug("blitTextureToTexture: %llux%llu -> %llux%llu", srcDesc.Width, srcDesc.Height, dstDesc.Width,
                 dstDesc.Height);
+    return {};
+}
+
+mcdr::Result<void> sharpenTextureToTexture(CommandContext* ctx, Dx12Object* src, Dx12Object* dst,
+                                          float amount) {
+    if (!ctx || !ctx->commandList || !src || !src->resource || !dst || !dst->resource) {
+        return mcdr::err("sharpenTextureToTexture", "sharpenTextureToTexture: null ctx/src/dst");
+    }
+    if (src->resource.Get() == dst->resource.Get()) {
+        return mcdr::err("sharpenTextureToTexture",
+                         "sharpenTextureToTexture: src and dst are the same resource");
+    }
+
+    ID3D12GraphicsCommandList* cmd = ctx->commandList;
+    const D3D12_RESOURCE_DESC srcDesc = src->resource->GetDesc();
+    const D3D12_RESOURCE_DESC dstDesc = dst->resource->GetDesc();
+    if (dstDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dstDesc.SampleDesc.Count != 1) {
+        return mcdr::err("sharpenTextureToTexture",
+                         "sharpenTextureToTexture: dst is not a single-sampled 2D texture");
+    }
+
+    auto rtv = acquireTextureRtv(ctx, dst);
+    if (!rtv) {
+        return mcdr::err("sharpenTextureToTexture", "sharpenTextureToTexture: " + rtv.error().message);
+    }
+    auto init = initSharpenPipeline();
+    if (!init) {
+        return mcdr::err("sharpenTextureToTexture", "sharpenTextureToTexture: " + init.error().message);
+    }
+    const SharpenPipeline* sp = getSharpenPipeline();
+    if (sp == nullptr) {
+        return mcdr::err("sharpenTextureToTexture",
+                         "sharpenTextureToTexture: sharpen pipeline unavailable");
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dstRtv = rtv.value();
+    cmd->OMSetRenderTargets(1, &dstRtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<FLOAT>(dstDesc.Width), static_cast<FLOAT>(dstDesc.Height),
+                      0.0f, 1.0f};
+    cmd->RSSetViewports(1, &vp);
+    D3D12_RECT sc{0, 0, static_cast<LONG>(dstDesc.Width), static_cast<LONG>(dstDesc.Height)};
+    cmd->RSSetScissorRects(1, &sc);
+    transitionTextureTo(ctx, dst, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    cmd->SetGraphicsRootSignature(sp->rootSig.Get());
+    cmd->SetPipelineState(sp->pso.Get());
+    auto bind = blitBindSourceTexture(ctx, src, cmd);
+    if (!bind) {
+        return mcdr::err("sharpenTextureToTexture", "sharpenTextureToTexture: " + bind.error().message);
+    }
+
+    // b1 = {1/w, 1/h, amount, pad}：纹素步长按**源**尺寸算（采样源纹理）。
+    const float params[4] = {
+        srcDesc.Width == 0 ? 0.0f : 1.0f / static_cast<float>(srcDesc.Width),
+        srcDesc.Height == 0 ? 0.0f : 1.0f / static_cast<float>(srcDesc.Height), amount, 0.0f};
+    cmd->SetGraphicsRoot32BitConstants(1, 4, params, 0);
+
+    cmd->IASetVertexBuffers(0, 1, &sp->vbView);
+    cmd->IASetIndexBuffer(&sp->ibView);
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd->DrawIndexedInstanced(6, 1, 0, 0, 0);
+
+    // 与 blitTextureToTexture 一致：源回到 RENDER_TARGET（世界层那一帧后续还要用）。
+    transitionTextureTo(ctx, src, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    dbgLogDebug("sharpenTextureToTexture: %llux%llu -> %llux%llu amount=%.3f", srcDesc.Width,
+                srcDesc.Height, dstDesc.Width, dstDesc.Height, amount);
     return {};
 }
 

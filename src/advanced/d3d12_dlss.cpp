@@ -684,7 +684,7 @@ namespace
         }
         // P110: the motion vectors already contain the sub-pixel jitter (see the note in the feature
         // flag comment block above), so tell NGX to cancel it with InJitterOffsetX/Y.
-        flags |= static_cast<int32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVJittered);
+        // P134：MV 改成真实运动后不再置 MVJittered（否则 NGX 会去减一个不存在的 jitter 差）。
         return flags;
     }
     // -----------------------------------------------------------------------
@@ -904,19 +904,50 @@ namespace
         return fallback;
     }
 
-    // P112 阶段 1：DLSS 实现选择。默认 "ngx"（P108 的直连路径，行为完全不变）；
-    // "streamline" 时由 Streamline 拥有 NGX —— 这里不调用 NVSDK_NGX_D3D12_Init_*，
-    // 否则同进程两套 NGX 会互相破坏（P111 实测 sl.log: getNGXFeatureRequirements
-    // ngxResult 0xbad00005），改为通过 interposer 的 slDLSSSetOptions 设置选项。
-    // evaluate 仍在阶段 2 才迁移，所以本阶段 DLSS 实际不出图（mcdr_dlss_create 返回 0）。
+#if MCDR_DLSS_HAVE_STREAMLINE
+    std::wstring dlssModuleDirectory();  // 定义在下面，auto 探测要先用到
+#endif
+
+    // P121：**默认走 Streamline**。
+    //   1) `MCDR_DLSS_IMPL` 显式指定优先（`ngx` 强制回退、`streamline` 强制启用）；
+    //   2) 否则 `MCDR_STREAMLINE=1` 也算启用（历史开关）；
+    //   3) 否则 auto：`sl.interposer.dll` 与 MCDR.dll 同目录就用 Streamline，不在就回退 NGX
+    //      —— 发行版按 NVIDIA 许可不带运行库（AGENTS.md「不可再分发」），这条保证那时退回 NGX。
     bool dlssImplStreamline() {
-        static const bool streamline = []() {
-            char buf[16] = {};
-            const DWORD n = ::GetEnvironmentVariableA("MCDR_DLSS_IMPL", buf, 16);
-            return n > 0 && _stricmp(buf, "streamline") == 0;
-        }();
-        return streamline;
+        // P126（用户 m14488「现在已经改到了默认 streamline」之后的实测）：以前整段被
+        // `static const bool` 缓存成**一次判定**。而 `sl.interposer.dll` 是 JVM 侧启动时
+        // 才解压到 `dxrmc/` 的，native 的第一次调用可能早于解压完成 —— 于是判定成 false 并
+        // 永久缓存，后面即使 interposer 已经在目录里也一直走 NGX（NGX 在本机建不出 feature，
+        // `0xBAD0000C out of date`，于是每帧静默 return 0，表现就是「DLSS 没出图、只剩抖动」）。
+        // 现在：环境变量每次读（显式指定就该立即生效），文件探测只在**还没看到**时重试，
+        // 见到之后才锁存 —— 不会再把一次过早的否定结果固定下来。
+        char buf[16] = {};
+        const DWORD n = ::GetEnvironmentVariableA("MCDR_DLSS_IMPL", buf, 16);
+        if (n > 0) {
+            return _stricmp(buf, "streamline") == 0;
+        }
+        char legacy[8] = {};
+        if (::GetEnvironmentVariableA("MCDR_STREAMLINE", legacy, 8) == 1 && legacy[0] == '1') {
+            return true;
+        }
+#if MCDR_DLSS_HAVE_STREAMLINE
+        static bool interposerSeen = false;
+        if (!interposerSeen) {
+            const std::wstring dir = dlssModuleDirectory();
+            if (!dir.empty()) {
+                const std::wstring path = dir + L"sl.interposer.dll";
+                if (::GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    interposerSeen = true;
+                }
+            }
+        }
+        return interposerSeen;
+#else
+        return false;
+#endif
     }
+
+
 
 #if MCDR_DLSS_HAVE_STREAMLINE
     using PFn_SlDLSSSetOptions = sl::Result (*)(const sl::ViewportHandle&, const sl::DLSSOptions&);
@@ -1482,6 +1513,9 @@ namespace
                 static_cast<unsigned>(s.featureFlags), s.qualityValue);
     }
 }  // namespace
+
+// P118：给设备/交换链模块用的决策出口（外部链接；实现走上面的 dlssImplStreamline）。
+int32_t mcdr_dlss_streamline_requested(void) { return dlssImplStreamline() ? 1 : 0; }
 
 // ---------------------------------------------------------------------------
 // C interface for the device module. Every string crosses as a (char*, cap) buffer,
@@ -2418,6 +2452,29 @@ sl::FrameToken* gLastFrameToken = nullptr;
     int32_t streamlineEvaluate(void* commandList, const mcdr_dlss_input& in, DlssTransitionFn tl,
                                void* tlCtx) {
         auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
+        // P124 诊断（排查完删）：每 2 秒一行，说明这次调用带着什么进来 —— 之前
+        // `streamline evaluate` 探针一直没写过，说明本函数在探针之前就 return 了。
+        {
+            static ULONGLONG lastTick = 0;
+            static uint32_t calls = 0;
+            ++calls;
+            const ULONGLONG now = ::GetTickCount64();
+            if (lastTick == 0 || now - lastTick >= 2000) {
+                lastTick = now;
+                std::fprintf(stderr,
+                             "[dxrmc] P124 sl-eval call#%u: cmd=%p color=%p depth=%p mv=%p out=%p "
+                             "render=%ux%u target=%ux%u\n",
+                             static_cast<unsigned>(calls), static_cast<void*>(cmd),
+                             static_cast<void*>(reinterpret_cast<ID3D12Resource*>(in.pInColor)),
+                             static_cast<void*>(reinterpret_cast<ID3D12Resource*>(in.pInDepth)),
+                             static_cast<void*>(reinterpret_cast<ID3D12Resource*>(in.pInMotionVectors)),
+                             static_cast<void*>(reinterpret_cast<ID3D12Resource*>(in.pInOutput)),
+                             static_cast<unsigned>(in.renderWidth),
+                             static_cast<unsigned>(in.renderHeight),
+                             static_cast<unsigned>(in.targetWidth),
+                             static_cast<unsigned>(in.targetHeight));
+            }
+        }
         if (cmd == nullptr) return 0;
         tickCallStats("eval");
         const StreamlineEvalApi& api = streamlineEvalApi();
@@ -2499,7 +2556,6 @@ sl::FrameToken* gLastFrameToken = nullptr;
         if (token == nullptr) {
             uint32_t frameIndex = static_cast<uint32_t>(s.submitCount);
             if (api.newFrameToken(token, &frameIndex) != sl::Result::eOk || token == nullptr) return 0;
-            gLastFrameToken = token;
         }
         const sl::ViewportHandle viewport(0);
         gLastFrameToken = token;  // P113：Reflex 在 Present 前要用它
@@ -2691,16 +2747,48 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     if (in == nullptr) {
         return -1;
     }
-    if (s.disabled) {
-        return -1;
+    // P128 诊断（排查完删）：每 2 秒说明这次调用走哪条分支、被哪个闸门挡住。
+    {
+        static ULONGLONG lastTick = 0;
+        static uint32_t calls = 0;
+        ++calls;
+        const ULONGLONG now = ::GetTickCount64();
+        if (lastTick == 0 || now - lastTick >= 2000) {
+            lastTick = now;
+            const bool sl = dlssImplStreamline();
+            // P133：把"native 这一帧真正收到的 jitter"与 token 指针一起打出来。
+            // 符号 A/B 得到"一样抖"说明抖动不随所报 jitter 的符号变化 —— 那要么是
+            // 常量没被逐帧接纳（token 陈旧），要么是收到的 jitter 根本不随帧变化。
+            std::fprintf(stderr,
+                         "[dxrmc] P128 eval call#%u: impl=%s disabled=%d featureOk=%d params=%p "
+                         "cmd=%p render=%ux%u target=%ux%u recvJitter=(%.4f, %.4f) token=%p\n",
+                         static_cast<unsigned>(calls), sl ? "streamline" : "ngx",
+                         s.disabled ? 1 : 0, s.featureOk ? 1 : 0,
+                         static_cast<void*>(s.params), static_cast<void*>(commandList),
+                         static_cast<unsigned>(in->renderWidth),
+                         static_cast<unsigned>(in->renderHeight),
+                         static_cast<unsigned>(in->targetWidth),
+                         static_cast<unsigned>(in->targetHeight),
+                         static_cast<double>(gCameraConstants.jitterOffsetX),
+                         static_cast<double>(gCameraConstants.jitterOffsetY),
+                         static_cast<void*>(gLastFrameToken));
+        }
     }
 #if MCDR_DLSS_HAVE_STREAMLINE
+    // P127（p93 实测：native 已自报 impl=streamline，但 streamlineEvaluate 一次都没被调用）：
+    // `s.disabled` 是 **NGX 路径**自己的失败状态（建不出 feature / MV 中间纹理失败时置位）。
+    // 它原来排在这个分支之前，于是启动阶段只要 NGX 探测失败，Streamline 就被永久挡在门外，
+    // native 每帧静默 return -1，JVM 只看到 "failed to evaluate 30 frames in a row"。
+    // Streamline 模式下 NGX 的状态与它无关，所以必须先判 SL。
     if (dlssImplStreamline()) {
         // P112 阶段 2：streamline 模式下 NGX 从未 init/创建，这里直接走 SL 的
         // tag → options → evaluate 链（资源状态由 streamlineEvaluate 内部负责）。
         return streamlineEvaluate(commandList, *in, tl, tlCtx);
     }
 #endif
+    if (s.disabled) {
+        return -1;
+    }
     if (!s.featureOk || s.params == nullptr) {
         return 0;
     }

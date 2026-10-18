@@ -199,6 +199,18 @@ int32_t MCDR_CALL mcdr_dx12BlitTextureToTexture(mcdr_command_ctx* ctx, mcdr_obje
     return 1;
 }
 
+// P121: 后置锐化（TAA / DLAA / DLSS 共用）。src -> dst 的 5-tap unsharp，amount 取 [0,1]。
+// 与 blit 同一调用点语义，但要求 src != dst（同资源就地锐化不合法，native 会返回 0）。
+int32_t MCDR_CALL mcdr_dx12SharpenTextureToTexture(mcdr_command_ctx* ctx, mcdr_object* src,
+                                                   mcdr_object* dst, float amount) {
+    const auto r = d3d12_mc::sharpenTextureToTexture(ctx, src, dst, amount);
+    if (!r) {
+        mcdr::abi::failVoid("mcdr_dx12SharpenTextureToTexture", r.error().message);
+        return 0;
+    }
+    return 1;
+}
+
 // P108: DLSS. Same call point as mcdr_dx12ApplySmaaToTexture (world done, GUI not yet):
 // the world layer is upscaled from the render size into the window-sized target, which is
 // what the linear blit used to do. Silenced by the independent DLSS switch being off

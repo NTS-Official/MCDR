@@ -619,14 +619,8 @@ typedef HRESULT(WINAPI* PFN_SL_D3D12CreateDevice)(IUnknown*, D3D_FEATURE_LEVEL, 
 
 PFN_SL_D3D12CreateDevice interposerCreateDeviceFn() {
     static const PFN_SL_D3D12CreateDevice fn = []() -> PFN_SL_D3D12CreateDevice {
-        char sl[8] = {};
-        const DWORD a = ::GetEnvironmentVariableA("MCDR_STREAMLINE", sl, 8);
-        bool want = (a == 1 && sl[0] == '1');
-        if (!want) {
-            char impl[24] = {};
-            const DWORD b = ::GetEnvironmentVariableA("MCDR_DLSS_IMPL", impl, 24);
-            want = b > 0 && std::strcmp(impl, "streamline") == 0;
-        }
+        // P118：统一决策（默认 Streamline，缺运行库自动回退）。
+        const bool want = mcdr_dlss_streamline_requested() != 0;
         if (!want) return nullptr;
         HMODULE self = nullptr;
         if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -1864,12 +1858,8 @@ constexpr uint32_t fnv1a32(const char* s, uint32_t h = 2166136261u) {
 }
 
 bool streamlineRequested() {
-    char buf[24] = {};
-    const DWORD n = ::GetEnvironmentVariableA("MCDR_STREAMLINE", buf, 24);
-    if (n == 1 && buf[0] == '1') return true;
-    char impl[24] = {};
-    const DWORD m = ::GetEnvironmentVariableA("MCDR_DLSS_IMPL", impl, 24);
-    return m > 0 && _stricmp(impl, "streamline") == 0;
+    // P118：默认 Streamline（缺运行库自动回退 NGX），决策由 DLSS 实现单元统一给出。
+    return mcdr_dlss_streamline_requested() != 0;
 }
 
 // 必须在任何 DXGI/D3D12 调用之前跑（ensureDevice 的第一步）。只做 slInit，不碰设备。
@@ -6649,6 +6639,210 @@ mcdr::Result<void> initBlitPipeline() {
 
 const BlitPipeline* getBlitPipeline() { return gCtx.blitPipeline.get(); }
 
+// P121：锐化 PS —— 5-tap unsharp（中心 + 上下左右），参数走 32-bit 根常量 b1：
+// {rcpSize.x, rcpSize.y, amount, pad}。alpha 恒 1（目标是 RGBA8 世界层/呈现目标）。
+static const char kSharpenPS[] =
+    "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
+    "Texture2D<float4> srcTex : register(t0, space0);\n"
+    "SamplerState sharpenSampler : register(s0, space0);\n"
+    "cbuffer SharpenParams : register(b1, space0) {\n"
+    "    float2 RcpSize;\n"
+    "    float Amount;\n"
+    "    float Pad0;\n"
+    "};\n"
+    "float4 main(VS_OUT IN) : SV_Target {\n"
+    "    float3 c = srcTex.Sample(sharpenSampler, IN.tc).rgb;\n"
+    "    float3 blur = (srcTex.Sample(sharpenSampler, IN.tc + float2( RcpSize.x, 0.0)).rgb\n"
+    "                 + srcTex.Sample(sharpenSampler, IN.tc + float2(-RcpSize.x, 0.0)).rgb\n"
+    "                 + srcTex.Sample(sharpenSampler, IN.tc + float2(0.0,  RcpSize.y)).rgb\n"
+    "                 + srcTex.Sample(sharpenSampler, IN.tc + float2(0.0, -RcpSize.y)).rgb) * 0.25;\n"
+    "    return float4(max(c + (c - blur) * Amount, 0.0), 1.0);\n"
+    "}\n";
+
+mcdr::Result<void> initSharpenPipeline() {
+    if (auto d = ensureDevice(); !d) return mcdr::err("initSharpenPipeline", errorMessage(d.error()));
+    if (gCtx.sharpenPipeline) return {};
+
+    // 顶点/索引缓冲与 blit 共用：先确保 blit 管线建好，再把 view 抄过来。
+    if (auto b = initBlitPipeline(); !b) {
+        return mcdr::err("initSharpenPipeline", errorMessage(b.error()));
+    }
+    const BlitPipeline* bp = getBlitPipeline();
+    if (bp == nullptr) {
+        return mcdr::err("initSharpenPipeline", "initSharpenPipeline: blit pipeline unavailable");
+    }
+
+    auto sp = std::make_unique<SharpenPipeline>();
+    ComPtr<ID3D12RootSignature> rootSig;
+    {
+        // 参数 0：SRV 描述符表（t0）；参数 1：4 个 32-bit 根常量（b1）。
+        D3D12_DESCRIPTOR_RANGE srvRange{};
+        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRange.NumDescriptors = 1;
+        srvRange.BaseShaderRegister = 0;
+        srvRange.RegisterSpace = 0;
+        srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_DESCRIPTOR_TABLE table{};
+        table.NumDescriptorRanges = 1;
+        table.pDescriptorRanges = &srvRange;
+
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[0].DescriptorTable = table;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants.ShaderRegister = 1;  // b1
+        params[1].Constants.RegisterSpace = 0;
+        params[1].Constants.Num32BitValues = 4;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_STATIC_SAMPLER_DESC staticSam{};
+        staticSam.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        staticSam.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSam.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSam.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        staticSam.MipLODBias = 0.0f;
+        staticSam.MaxAnisotropy = 1;
+        staticSam.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        staticSam.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+        staticSam.MinLOD = 0.0f;
+        staticSam.MaxLOD = D3D12_FLOAT32_MAX;
+        staticSam.ShaderRegister = 0;
+        staticSam.RegisterSpace = 0;
+        staticSam.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+        rsDesc.NumParameters = 2;
+        rsDesc.pParameters = params;
+        rsDesc.NumStaticSamplers = 1;
+        rsDesc.pStaticSamplers = &staticSam;
+        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ComPtr<ID3DBlob> rsBlob, rsErr;
+        HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, &rsErr);
+        if (FAILED(hr)) {
+            return mcdr::err("initSharpenPipeline",
+                             "initSharpenPipeline: SerializeRootSignature hr=0x" + hrText(hr));
+        }
+        hr = gCtx.device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
+                                              IID_PPV_ARGS(&rootSig));
+        if (FAILED(hr)) {
+            return mcdr::err("initSharpenPipeline",
+                             "initSharpenPipeline: CreateRootSignature hr=0x" + hrText(hr));
+        }
+    }
+
+    // 编译 VS（复用 blit 的）/ PS：DXC + SM6 优先，失败退回 D3DCompile SM 5.1。
+    ComPtr<ID3DBlob> vsBlob, psBlob;
+    std::vector<uint8_t> vsBytes(kBlitVS, kBlitVS + sizeof(kBlitVS));
+    std::vector<uint8_t> psBytes(kSharpenPS, kSharpenPS + sizeof(kSharpenPS));
+    std::vector<uint8_t> vsDxil, psDxil;
+    const void* vsCode = nullptr;
+    SIZE_T vsCodeSize = 0;
+    const void* psCode = nullptr;
+    SIZE_T psCodeSize = 0;
+    const std::string smProfile = graphicsShaderModelProfile();
+    if (!smProfile.empty()) {
+        const std::string vsSrc(kBlitVS, sizeof(kBlitVS) - 1);
+        const std::string psSrc(kSharpenPS, sizeof(kSharpenPS) - 1);
+        auto vsDxc = compileHlslToDxil(vsSrc, "main", "vs_" + smProfile, vsDxil);
+        auto psDxc = vsDxc ? compileHlslToDxil(psSrc, "main", "ps_" + smProfile, psDxil) : vsDxc;
+        if (vsDxc && psDxc) {
+            vsCode = vsDxil.data();
+            vsCodeSize = vsDxil.size();
+            psCode = psDxil.data();
+            psCodeSize = psDxil.size();
+            dbgLogInfo("initSharpenPipeline: compiled with DXC SM %s", smProfile.c_str());
+        } else {
+            dbgLogWarn("initSharpenPipeline: DXC failed, falling back to D3DCompile SM 5.1");
+        }
+    }
+    if (vsCode == nullptr) {
+        auto vsRes = compileShaderBytecode(vsBytes, "sharpen_vs", "vs_5_1", vsBlob);
+        if (!vsRes) return mcdr::err("initSharpenPipeline", errorMessage(vsRes.error()));
+        auto psRes = compileShaderBytecode(psBytes, "sharpen_ps", "ps_5_1", psBlob);
+        if (!psRes) return mcdr::err("initSharpenPipeline", errorMessage(psRes.error()));
+        vsCode = vsBlob->GetBufferPointer();
+        vsCodeSize = vsBlob->GetBufferSize();
+        psCode = psBlob->GetBufferPointer();
+        psCodeSize = psBlob->GetBufferSize();
+    }
+
+    // PSO：与 blit 完全同状态（noDepth / noBlend / noCull），只是 PS 不同。
+    ComPtr<ID3D12PipelineState> pso;
+    {
+        D3D12_INPUT_ELEMENT_DESC ie[2] = {};
+        ie[0].SemanticName = "POSITION";
+        ie[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+        ie[0].InputSlot = 0;
+        ie[0].AlignedByteOffset = 0;
+        ie[0].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+        ie[1].SemanticName = "TEXCOORD";
+        ie[1].Format = DXGI_FORMAT_R32G32_FLOAT;
+        ie[1].InputSlot = 0;
+        ie[1].AlignedByteOffset = 8;
+        ie[1].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+
+        D3D12_RENDER_TARGET_BLEND_DESC rtBlend{};
+        rtBlend.BlendEnable = FALSE;
+        rtBlend.SrcBlend = D3D12_BLEND_ONE;
+        rtBlend.DestBlend = D3D12_BLEND_ZERO;
+        rtBlend.BlendOp = D3D12_BLEND_OP_ADD;
+        rtBlend.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rtBlend.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rtBlend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rtBlend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+        D3D12_BLEND_DESC blendDesc{};
+        blendDesc.RenderTarget[0] = rtBlend;
+
+        D3D12_RASTERIZER_DESC rasterDesc{};
+        rasterDesc.FillMode = D3D12_FILL_MODE_SOLID;
+        rasterDesc.CullMode = D3D12_CULL_MODE_NONE;
+        rasterDesc.DepthClipEnable = TRUE;
+
+        D3D12_DEPTH_STENCIL_DESC dsDesc{};
+        dsDesc.DepthEnable = FALSE;
+        dsDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        dsDesc.StencilEnable = FALSE;
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
+        psoDesc.pRootSignature = rootSig.Get();
+        psoDesc.VS = {vsCode, vsCodeSize};
+        psoDesc.PS = {psCode, psCodeSize};
+        psoDesc.InputLayout = {ie, 2};
+        psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psoDesc.NumRenderTargets = 1;
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        psoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        psoDesc.SampleDesc.Count = 1;
+        psoDesc.SampleMask = UINT_MAX;
+        psoDesc.BlendState = blendDesc;
+        psoDesc.RasterizerState = rasterDesc;
+        psoDesc.DepthStencilState = dsDesc;
+
+        HRESULT hr = gCtx.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pso));
+        if (FAILED(hr)) {
+            return mcdr::err("initSharpenPipeline",
+                             "initSharpenPipeline: CreateGraphicsPipelineState hr=0x" + hrText(hr));
+        }
+    }
+
+    sp->rootSig = rootSig;
+    sp->pso = pso;
+    sp->vertBuf = bp->vertBuf;
+    sp->idxBuf = bp->idxBuf;
+    sp->vbView = bp->vbView;
+    sp->ibView = bp->ibView;
+    gCtx.sharpenPipeline = std::move(sp);
+    dbgLogInfo("initSharpenPipeline: done rootSig=%p pso=%p", reinterpret_cast<void*>(rootSig.Get()),
+               reinterpret_cast<void*>(pso.Get()));
+    return {};
+}
+
+const SharpenPipeline* getSharpenPipeline() { return gCtx.sharpenPipeline.get(); }
+
 mcdr::Result<void> blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex,
                                          ID3D12GraphicsCommandList* cmd) {
     if (!srcTex || !srcTex->resource) {
@@ -7854,17 +8048,45 @@ int32_t dlssReadbackThunk(void* ctxOpaque, void* resourceOpaque, DlssTexStats* o
 }
 
 bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
+    // P129 诊断（排查完删）：每 2 秒一行，说明本帧卡在哪个闸门 —— p95 里 native 的
+    // `mcdr_dlss_evaluate`（P128）一次都没被调用，说明本函数在它之前就返回了。
+    struct Diag {
+        ULONGLONG last = 0;
+        uint32_t calls = 0;
+        void tick(const char* gate, bool dlssEnabled, bool listOpen, const mcdr_dlss_input& in) {
+            ++calls;
+            const ULONGLONG now = ::GetTickCount64();
+            if (last != 0 && now - last < 2000) {
+                return;
+            }
+            last = now;
+            std::fprintf(stderr,
+                         "[dxrmc] P129 applyDlss call#%u gate=%s dlssEnabled=%d listOpen=%d "
+                         "color=%p depth=%p mv=%p out=%p\n",
+                         static_cast<unsigned>(calls), gate, dlssEnabled ? 1 : 0,
+                         listOpen ? 1 : 0, static_cast<void*>(in.pInColor),
+                         static_cast<void*>(in.pInDepth),
+                         static_cast<void*>(in.pInMotionVectors),
+                         static_cast<void*>(in.pInOutput));
+        }
+    };
+    static Diag diag;
+    const bool listOpen = ctx != nullptr && ctx->listOpen && ctx->commandList != nullptr;
+
     // P108（用户 m10920）：闸门是**独立的 DLSS 开关**，不再看 aaMode。DLSS 与抗锯齿互不
     // 相干，两者都开时先 SMAA 再 DLSS 升采样（SMAA 的三趟在本函数之前跑，作用在同一张
     // 低分辨率世界层上）。
     if (!gCtx.dlssEnabled) {
+        diag.tick("dlss-switch-off", gCtx.dlssEnabled, listOpen, in);
         return false;  // 开关关着：一个动作都没有
     }
     if (!ctx || !ctx->listOpen || ctx->commandList == nullptr) {
+        diag.tick("no-open-list", gCtx.dlssEnabled, listOpen, in);
         return false;
     }
     if (in.pInColor == nullptr || in.pInDepth == nullptr || in.pInMotionVectors == nullptr ||
         in.pInOutput == nullptr) {
+        diag.tick("null-input-handle", gCtx.dlssEnabled, listOpen, in);
         return false;
     }
     wireDlssImpl();

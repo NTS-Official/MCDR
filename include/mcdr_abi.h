@@ -722,6 +722,10 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12ApplySmaaToTexture(mcdr_command_ctx* ctx, mc
 // renderScale is not 100%. A 1:1 copyTextureToTexture cannot do it: the scale factor is not 1.
 MCDR_API int32_t MCDR_CALL mcdr_dx12BlitTextureToTexture(mcdr_command_ctx* ctx, mcdr_object* src,
                                                          mcdr_object* dst);
+// P121：后置锐化（TAA / DLAA / DLSS 共用）。src -> dst 的 5-tap unsharp，amount 取 [0,1]；
+// src == dst 会被拒绝（返回 0），调用方需准备第二张同尺寸纹理。
+MCDR_API int32_t MCDR_CALL mcdr_dx12SharpenTextureToTexture(mcdr_command_ctx* ctx, mcdr_object* src,
+                                                        mcdr_object* dst, float amount);
 
 // `colorTextures` may contain NULL entries (unused attachments); they are
 // skipped. `colorMips` is the per-attachment RTV mip slice. `colorClearFlags`

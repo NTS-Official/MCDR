@@ -165,6 +165,7 @@ int setDlssOutput(mcdr_object* tex);
 
 // P22: 前向声明（DeviceContext 使用 std::unique_ptr<BlitPipeline>，需完整类型）
 struct BlitPipeline;
+struct SharpenPipeline;
 
 // ---------------------------------------------------------------------------
 // 设备上下文（进程内单例，Java 侧首次调用 dx12CreateDevice 时创建）
@@ -296,6 +297,7 @@ struct DeviceContext {
 
     // P22: blit 全屏四边形管线（懒初始化，device 级单例）
     std::unique_ptr<BlitPipeline> blitPipeline;
+    std::unique_ptr<SharpenPipeline> sharpenPipeline;
 
     // -----------------------------------------------------------------------
     // P104：SMAA（形态学抗锯齿）状态。全部懒初始化：第一次应用且 aaMode==SMAA 时才建
@@ -902,6 +904,19 @@ struct BlitPipeline {
 // 懒初始化 blit 管线（线程安全：第一次调用创建，后续直接返回）。
 mcdr::Result<void> initBlitPipeline();
 const BlitPipeline* getBlitPipeline();
+
+// P121: sharpen pipeline (TAA / DLAA / DLSS post pass). Reuses the blit VS + vertex buffer,
+// adds one 32-bit constant block (rcpSize.xy + amount).
+struct SharpenPipeline {
+    ComPtr<ID3D12RootSignature> rootSig;
+    ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12Resource> vertBuf;
+    ComPtr<ID3D12Resource> idxBuf;
+    D3D12_VERTEX_BUFFER_VIEW vbView{};
+    D3D12_INDEX_BUFFER_VIEW ibView{};
+};
+mcdr::Result<void> initSharpenPipeline();
+const SharpenPipeline* getSharpenPipeline();
 // P22: 在 srvHeap 为 srcTex 分配 SRV 槽位并设置根描述符表（srvGpu 已绑定）。
 // 调用方无需关心 srvHeap 内部细节。
 mcdr::Result<void> blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex, ID3D12GraphicsCommandList* cmd);
@@ -1094,6 +1109,9 @@ mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* 
 // 缩放比不是 1，所以不能走 1:1 的 copyTextureToTexture。
 // 结束状态：源回 RENDER_TARGET，目标停在 RENDER_TARGET（GUI pass 直接接着往上画）。
 mcdr::Result<void> blitTextureToTexture(CommandContext* ctx, Dx12Object* src, Dx12Object* dst);
+// P121: src -> dst 5-tap unsharp. amount <= 0 -> caller should use blitTextureToTexture.
+mcdr::Result<void> sharpenTextureToTexture(CommandContext* ctx, Dx12Object* src, Dx12Object* dst,
+                                          float amount);
 // P106：取（或创建）纹理的帧级瞬态 RTV —— blitTextureToTexture 要把目标当渲染目标用。
 mcdr::Result<D3D12_CPU_DESCRIPTOR_HANDLE> acquireTextureRtv(CommandContext* ctx, Dx12Object* tex);
 // Present(interval, flags)：FIFO=Present(1,0)；IMMEDIATE=Present(0,0)；

@@ -86,6 +86,9 @@ int32_t mcdr_dlss_set_output_texture(void* resource);
 void mcdr_reflex_before_present(void);
 // P115：Present 之后发 PCL 的 ePresentEnd 标记。
 void mcdr_reflex_after_present(void);
+// P118：当前是否启用 Streamline 路径（默认 auto：运行库存在即启用；`MCDR_DLSS_IMPL=ngx` 可强制回退）。
+int32_t mcdr_dlss_streamline_requested(void);
+
 // P117：PCL stats —— 帧开始（建本帧 token + eSimulationStart）与通用标记。
 void mcdr_reflex_frame_begin(void);
 void mcdr_reflex_marker(int32_t marker);
