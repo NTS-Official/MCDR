@@ -257,6 +257,10 @@ void MCDR_CALL mcdr_dx12ReflexFrameBegin(void) { mcdr_reflex_frame_begin(); }
 
 void MCDR_CALL mcdr_dx12ReflexMarker(int32_t marker) { mcdr_reflex_marker(marker); }
 
+void MCDR_CALL mcdr_dx12SetReflexMode(int32_t mode) { mcdr_reflex_set_mode(mode); }
+
+int32_t MCDR_CALL mcdr_dx12ReflexAvailable(void) { return mcdr_reflex_available(); }
+
 int32_t MCDR_CALL mcdr_dx12SetDlssConstants(const mcdr_dlss_constants* constants) {
     // P112：Streamline 的 sl::Constants 需要相机矩阵/向量/近远平面等，这些数据只在 JVM 侧
     // （D3D12Temporal）有。这里原样转交给 DLSS 实现单元缓存，等 evaluate 时喂给 slSetConstants。

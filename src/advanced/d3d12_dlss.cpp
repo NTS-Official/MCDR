@@ -2157,6 +2157,8 @@ sl::FrameToken* gLastFrameToken = nullptr;
             sl::Result (*newFrameToken)(sl::FrameToken*&, const uint32_t*) = nullptr;
             sl::Result (*getState)(sl::ReflexState&) = nullptr;
             uint32_t frameCounter = 0;
+            // P122：Reflex 模式（0=off 1=eLowLatency 2=eLowLatencyWithBoost），默认低延迟。
+            int32_t mode = 1;
             bool resolved = false;
             bool optionsApplied = false;
             uint32_t frameLimitUs = 0;
@@ -2173,7 +2175,8 @@ sl::FrameToken* gLastFrameToken = nullptr;
         }
         void resolveReflexApi() {
             if (gReflex.resolved) return;
-            gReflex.resolved = true;
+            // 只有真的取到函数才 latch：`Options.load` 阶段（slInit 之前）也会走到这里，
+            // 那时 `slGetFeatureFunction` 还没准备好，latch 住就永远解析不到了。
             char lim[16] = {};
             const DWORD limLen = ::GetEnvironmentVariableA("MCDR_REFLEX_FRAME_LIMIT_US", lim, 16);
             if (limLen > 0) {
@@ -2200,6 +2203,9 @@ sl::FrameToken* gLastFrameToken = nullptr;
             }
             gReflex.newFrameToken = reinterpret_cast<decltype(gReflex.newFrameToken)>(
                 ::GetProcAddress(sl, "slGetNewFrameToken"));
+            if (gReflex.setOptions != nullptr && gReflex.sleep != nullptr) {
+                gReflex.resolved = true;
+            }
             raw = nullptr;
             if (gff(sl::kFeatureReflex, "slReflexGetState", raw) == sl::Result::eOk) {
                 gReflex.getState = reinterpret_cast<decltype(gReflex.getState)>(raw);
@@ -2209,15 +2215,18 @@ sl::FrameToken* gLastFrameToken = nullptr;
             if (gReflex.setOptions == nullptr || gReflex.optionsApplied) return;
             gReflex.optionsApplied = true;
             sl::ReflexOptions opt{};
-            opt.mode = sl::ReflexMode::eLowLatency;
+            opt.mode = gReflex.mode == 2 ? sl::ReflexMode::eLowLatencyWithBoost
+                                        : (gReflex.mode == 1 ? sl::ReflexMode::eLowLatency
+                                                             : sl::ReflexMode::eOff);
             opt.frameLimitUs = gReflex.frameLimitUs;  // 0 = 不限帧（文档：与 mode 独立）
             const sl::Result r = gReflex.setOptions(opt);
-            logWarn("P113 reflex: slReflexSetOptions(eLowLatency, frameLimitUs=%u) result=0x%X",
-                    gReflex.frameLimitUs, static_cast<unsigned>(r));
+            logWarn("P113 reflex: slReflexSetOptions(mode=%d, frameLimitUs=%u) result=0x%X",
+                    gReflex.mode, gReflex.frameLimitUs, static_cast<unsigned>(r));
             if (FILE* f = _wfopen((dlssModuleDirectory() + L"sl-probe.txt").c_str(), L"a, ccs=UTF-8")) {
-                fwprintf(f, L"P113 reflex: setOptions=0x%X sleep=%s marker=%s frameLimitUs=%u\n",
+                fwprintf(f, L"P113 reflex: setOptions=0x%X sleep=%s marker=%s mode=%d frameLimitUs=%u\n",
                          static_cast<unsigned>(r), gReflex.sleep != nullptr ? L"ok" : L"missing",
-                         gReflex.marker != nullptr ? L"ok" : L"missing", gReflex.frameLimitUs);
+                         gReflex.marker != nullptr ? L"ok" : L"missing", gReflex.mode,
+                         gReflex.frameLimitUs);
                 fclose(f);
             }
         }
@@ -2254,6 +2263,25 @@ sl::FrameToken* gLastFrameToken = nullptr;
     }
 
     // P117：通用标记（eSimulationEnd / eRenderSubmitStart 等由 JVM 在正确时机调）。
+    // P122：界面上的 Reflex 模式（0=off 1=on 2=on+boost），下一帧 Present 前重新下发。
+    void mcdr_reflex_set_mode(int32_t mode) {
+        if (!reflexEnabled()) return;
+        // 只存值：`Options.load` 阶段调到这里时 SL 还没 init，不能在这里解析函数指针。
+        const int32_t clamped = mode < 0 ? 0 : (mode > 2 ? 2 : mode);
+        if (clamped == gReflex.mode) return;
+        gReflex.mode = clamped;
+        gReflex.optionsApplied = false;
+    }
+
+    // P122：Reflex 是否可用（三个入口都解析到才算），供界面置灰。
+    int32_t mcdr_reflex_available(void) {
+        if (!reflexEnabled()) return 0;
+        resolveReflexApi();
+        return (gReflex.setOptions != nullptr && gReflex.sleep != nullptr && gReflex.marker != nullptr)
+                   ? 1
+                   : 0;
+    }
+
     void mcdr_reflex_marker(int32_t marker) {
         if (!reflexEnabled()) return;
         resolveReflexApi();
@@ -2452,29 +2480,6 @@ sl::FrameToken* gLastFrameToken = nullptr;
     int32_t streamlineEvaluate(void* commandList, const mcdr_dlss_input& in, DlssTransitionFn tl,
                                void* tlCtx) {
         auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
-        // P124 诊断（排查完删）：每 2 秒一行，说明这次调用带着什么进来 —— 之前
-        // `streamline evaluate` 探针一直没写过，说明本函数在探针之前就 return 了。
-        {
-            static ULONGLONG lastTick = 0;
-            static uint32_t calls = 0;
-            ++calls;
-            const ULONGLONG now = ::GetTickCount64();
-            if (lastTick == 0 || now - lastTick >= 2000) {
-                lastTick = now;
-                std::fprintf(stderr,
-                             "[dxrmc] P124 sl-eval call#%u: cmd=%p color=%p depth=%p mv=%p out=%p "
-                             "render=%ux%u target=%ux%u\n",
-                             static_cast<unsigned>(calls), static_cast<void*>(cmd),
-                             static_cast<void*>(reinterpret_cast<ID3D12Resource*>(in.pInColor)),
-                             static_cast<void*>(reinterpret_cast<ID3D12Resource*>(in.pInDepth)),
-                             static_cast<void*>(reinterpret_cast<ID3D12Resource*>(in.pInMotionVectors)),
-                             static_cast<void*>(reinterpret_cast<ID3D12Resource*>(in.pInOutput)),
-                             static_cast<unsigned>(in.renderWidth),
-                             static_cast<unsigned>(in.renderHeight),
-                             static_cast<unsigned>(in.targetWidth),
-                             static_cast<unsigned>(in.targetHeight));
-            }
-        }
         if (cmd == nullptr) return 0;
         tickCallStats("eval");
         const StreamlineEvalApi& api = streamlineEvalApi();
@@ -2746,33 +2751,6 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
                            void* tlCtx, DlssReadbackFn rb) {
     if (in == nullptr) {
         return -1;
-    }
-    // P128 诊断（排查完删）：每 2 秒说明这次调用走哪条分支、被哪个闸门挡住。
-    {
-        static ULONGLONG lastTick = 0;
-        static uint32_t calls = 0;
-        ++calls;
-        const ULONGLONG now = ::GetTickCount64();
-        if (lastTick == 0 || now - lastTick >= 2000) {
-            lastTick = now;
-            const bool sl = dlssImplStreamline();
-            // P133：把"native 这一帧真正收到的 jitter"与 token 指针一起打出来。
-            // 符号 A/B 得到"一样抖"说明抖动不随所报 jitter 的符号变化 —— 那要么是
-            // 常量没被逐帧接纳（token 陈旧），要么是收到的 jitter 根本不随帧变化。
-            std::fprintf(stderr,
-                         "[dxrmc] P128 eval call#%u: impl=%s disabled=%d featureOk=%d params=%p "
-                         "cmd=%p render=%ux%u target=%ux%u recvJitter=(%.4f, %.4f) token=%p\n",
-                         static_cast<unsigned>(calls), sl ? "streamline" : "ngx",
-                         s.disabled ? 1 : 0, s.featureOk ? 1 : 0,
-                         static_cast<void*>(s.params), static_cast<void*>(commandList),
-                         static_cast<unsigned>(in->renderWidth),
-                         static_cast<unsigned>(in->renderHeight),
-                         static_cast<unsigned>(in->targetWidth),
-                         static_cast<unsigned>(in->targetHeight),
-                         static_cast<double>(gCameraConstants.jitterOffsetX),
-                         static_cast<double>(gCameraConstants.jitterOffsetY),
-                         static_cast<void*>(gLastFrameToken));
-        }
     }
 #if MCDR_DLSS_HAVE_STREAMLINE
     // P127（p93 实测：native 已自报 impl=streamline，但 streamlineEvaluate 一次都没被调用）：

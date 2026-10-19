@@ -89,6 +89,10 @@ void mcdr_reflex_after_present(void);
 // P118：当前是否启用 Streamline 路径（默认 auto：运行库存在即启用；`MCDR_DLSS_IMPL=ngx` 可强制回退）。
 int32_t mcdr_dlss_streamline_requested(void);
 
+// P122：Reflex 模式（0=off 1=eLowLatency 2=eLowLatencyWithBoost）与可用性查询。
+void mcdr_reflex_set_mode(int32_t mode);
+int32_t mcdr_reflex_available(void);
+
 // P117：PCL stats —— 帧开始（建本帧 token + eSimulationStart）与通用标记。
 void mcdr_reflex_frame_begin(void);
 void mcdr_reflex_marker(int32_t marker);

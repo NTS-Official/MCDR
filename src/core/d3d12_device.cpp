@@ -8048,45 +8048,17 @@ int32_t dlssReadbackThunk(void* ctxOpaque, void* resourceOpaque, DlssTexStats* o
 }
 
 bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
-    // P129 诊断（排查完删）：每 2 秒一行，说明本帧卡在哪个闸门 —— p95 里 native 的
-    // `mcdr_dlss_evaluate`（P128）一次都没被调用，说明本函数在它之前就返回了。
-    struct Diag {
-        ULONGLONG last = 0;
-        uint32_t calls = 0;
-        void tick(const char* gate, bool dlssEnabled, bool listOpen, const mcdr_dlss_input& in) {
-            ++calls;
-            const ULONGLONG now = ::GetTickCount64();
-            if (last != 0 && now - last < 2000) {
-                return;
-            }
-            last = now;
-            std::fprintf(stderr,
-                         "[dxrmc] P129 applyDlss call#%u gate=%s dlssEnabled=%d listOpen=%d "
-                         "color=%p depth=%p mv=%p out=%p\n",
-                         static_cast<unsigned>(calls), gate, dlssEnabled ? 1 : 0,
-                         listOpen ? 1 : 0, static_cast<void*>(in.pInColor),
-                         static_cast<void*>(in.pInDepth),
-                         static_cast<void*>(in.pInMotionVectors),
-                         static_cast<void*>(in.pInOutput));
-        }
-    };
-    static Diag diag;
-    const bool listOpen = ctx != nullptr && ctx->listOpen && ctx->commandList != nullptr;
-
     // P108（用户 m10920）：闸门是**独立的 DLSS 开关**，不再看 aaMode。DLSS 与抗锯齿互不
     // 相干，两者都开时先 SMAA 再 DLSS 升采样（SMAA 的三趟在本函数之前跑，作用在同一张
     // 低分辨率世界层上）。
     if (!gCtx.dlssEnabled) {
-        diag.tick("dlss-switch-off", gCtx.dlssEnabled, listOpen, in);
         return false;  // 开关关着：一个动作都没有
     }
     if (!ctx || !ctx->listOpen || ctx->commandList == nullptr) {
-        diag.tick("no-open-list", gCtx.dlssEnabled, listOpen, in);
         return false;
     }
     if (in.pInColor == nullptr || in.pInDepth == nullptr || in.pInMotionVectors == nullptr ||
         in.pInOutput == nullptr) {
-        diag.tick("null-input-handle", gCtx.dlssEnabled, listOpen, in);
         return false;
     }
     wireDlssImpl();

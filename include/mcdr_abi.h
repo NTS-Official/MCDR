@@ -586,6 +586,10 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssConstants(const mcdr_dlss_constants* 
 MCDR_API void MCDR_CALL mcdr_dx12ReflexFrameBegin(void);
 MCDR_API void MCDR_CALL mcdr_dx12ReflexMarker(int32_t marker);
 
+// P122：NVIDIA Reflex 模式（0=off 1=on 2=on+boost）与可用性（1=可用）。
+MCDR_API void MCDR_CALL mcdr_dx12SetReflexMode(int32_t mode);
+MCDR_API int32_t MCDR_CALL mcdr_dx12ReflexAvailable(void);
+
 // ---------------------------------------------------------------------------
 // Device and resources  (was jni_bridge.cpp — 13 exports)
 // ---------------------------------------------------------------------------
