@@ -92,7 +92,8 @@ void MCDR_CALL mcdr_dx12EndCommandList(mcdr_command_ctx* ctx) {
 uint64_t MCDR_CALL mcdr_dx12Submit(mcdr_command_ctx* ctx) {
     d3d12_mc::dbgLogDebug("submit: enter ctx=%p", static_cast<void*>(ctx));
     const auto r = d3d12_mc::submitCommandList(ctx);
-    // submitCommandList 只在失败时返回 err；成功但「无可提交」时值是 0 且没有 err。
+    // submitCommandList 只在失败时返回 err；返回值是本 ctx 的 per-command-list 序号
+    // （BUG-03，可直接交给 mcdr_dx12WaitForFence），「无可提交」时是 0。
     if (!r && !r.error().message.empty()) {
         mcdr::abi::failVoid("mcdr_dx12Submit", r.error().message);
     }
@@ -100,8 +101,12 @@ uint64_t MCDR_CALL mcdr_dx12Submit(mcdr_command_ctx* ctx) {
 }
 
 int32_t MCDR_CALL mcdr_dx12WaitForFence(mcdr_command_ctx* ctx, uint64_t value, int64_t timeoutNs) {
-    (void)ctx;  // waits on the device-level queue fence, deliberately not per-ctx
-    const auto r = d3d12_mc::waitForQueueFenceValue(value, static_cast<UINT64>(timeoutNs));
+    // BUG-03：等待的是**这个 ctx 自己的** per-command-list fence。value 来自
+    // mcdr_dx12GetFenceValue / mcdr_dx12Submit，三者属于同一条 per-ctx 时间线，
+    // 因此帧 encoder 的 token 只会被本帧提交满足，一次性 encoder（createBuffer(data)
+    // 的上传）不会提前把它推进。
+    const auto r = d3d12_mc::waitForContextFenceValue(ctx, static_cast<UINT64>(value),
+                                                     static_cast<UINT64>(timeoutNs));
     // 超时不是错误（GpuFence.awaitCompletion 语义），只有真正的失败才设 lastError。
     if (!r && r.error().message.find("timed out") == std::string::npos) {
         mcdr::abi::failVoid("mcdr_dx12WaitForFence", r.error().message);
@@ -110,11 +115,9 @@ int32_t MCDR_CALL mcdr_dx12WaitForFence(mcdr_command_ctx* ctx, uint64_t value, i
 }
 
 uint64_t MCDR_CALL mcdr_dx12GetFenceValue(mcdr_command_ctx* ctx) {
-    (void)ctx;
-    // createFence captures the global queue fence value (target = current + 1),
-    // mirroring the official shared encoder's currentSubmitIndex: a one-shot
-    // encoder's token also completes with the next submit.
-    return static_cast<uint64_t>(d3d12_mc::currentQueueFenceValue());
+    // createFence() 捕获的是本 ctx 的当前 per-command-list 序号，target = 该值 + 1；
+    // 等待对象是同一个 ctx 的 fence（BUG-03）。
+    return static_cast<uint64_t>(d3d12_mc::currentFenceValue(ctx));
 }
 
 int64_t MCDR_CALL mcdr_dx12GetTimestampNow(mcdr_command_ctx* ctx) {
@@ -209,6 +212,18 @@ int32_t MCDR_CALL mcdr_dx12SharpenTextureToTexture(mcdr_command_ctx* ctx, mcdr_o
         return 0;
     }
     return 1;
+}
+
+// P152: TAA resolve, native side. Same call point as SMAA (world drawn, GUI not yet), but the
+// history textures, the resolve pipeline and the jitter bookkeeping live in the device context,
+// so the JVM only pushes the per-frame values. Returns 1 = applied, 0 = skipped (mode is not
+// TAA / unsuitable target / already disabled), -1 = failed (one ERROR log, TAA disabled).
+int32_t MCDR_CALL mcdr_dx12ApplyTaaToTexture(mcdr_command_ctx* ctx, mcdr_object* scene,
+                                             mcdr_object* motion, float jitterX, float jitterY,
+                                             float prevJitterX, float prevJitterY, float blend,
+                                             int32_t reset, float sharpenAmount) {
+    return d3d12_mc::applyTaaToTexture(ctx, scene, motion, jitterX, jitterY, prevJitterX, prevJitterY,
+                                       blend, reset, sharpenAmount);
 }
 
 // P108: DLSS. Same call point as mcdr_dx12ApplySmaaToTexture (world done, GUI not yet):

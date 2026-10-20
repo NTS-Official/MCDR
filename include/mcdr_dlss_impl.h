@@ -119,29 +119,6 @@ int32_t mcdr_dlss_set_constants(const mcdr_dlss_constants* constants);
 // 指针，本单元只负责原样回传。
 using DlssTransitionFn = void (*)(void* ctx, void* resource, int32_t toState);
 using DlssQueryStateFn = int32_t (*)(void* ctx, void* resource);
-
-// B2：纹理读回的返回值（POD，**不要**在这里放容器 —— 模块与普通 TU 看到的
-// std::string/vector 不是同一个类型）。mean/min/max 都是**原始字节**统计，与
-// dumpManyResources 原来打印的 `mean=… min=… max=…` 同一口径，便于对照旧日志。
-typedef struct DlssTexStats {
-    double mean[4];
-    uint32_t min[4];
-    uint32_t max[4];
-} DlssTexStats;
-
-// B2：模块提供的**读回回调**。实现单元不再自建 command list/queue/fence/staging
-// （那正是 #525/#527/#838 与 RemoveDevice 的来源），而是把"读这张纹理的统计"交给
-// 设备模块：它用**当前这个 ctx 的 command list** 记录一次 tracking 内的
-// CopyTextureRegion 到 readback buffer，并在下一次调用时用模块 fence 等它完成。
-//
-// 语义（必须按此读）：
-//   * 返回 1 = out 已填好（**上一帧**记录的那份拷贝；诊断读数延迟一帧是设计选择，
-//     因为调用时 list 还开着、本帧的 copy 尚未提交）；
-//   * 返回 0 = 还没有可用的读数（第一次调用）或参数不可用；
-//   * 返回 -1 = 失败（创建/映射失败）。
-// resource 是**模块侧解包后的裸 ID3D12Resource***（见 mcdr_dlss_set_output_texture 的说明）。
-using DlssReadbackFn = int32_t (*)(void* ctx, void* resource, DlssTexStats* out);
-
 // ---------------------------------------------------------------------------
 // B4：私有纹理由**模块**创建（实现单元不再自建任何 D3D12 纹理）。
 //
@@ -184,7 +161,7 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
 // 每帧一次的真实 NGX 评价。commandList 是 ID3D12GraphicsCommandList*。
 // 返回 1=真的跑了 0=跳过（没特征/参数为空）-1=失败或已关闭。
 int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
-                           void* tlCtx, DlssReadbackFn rb);
+                           void* tlCtx);
 
 // P108：**深度快照**。DLSS 的评估点在世界画完、GUI 之前，而 vanilla 在
 // `GameRenderer.render` 的 clearDepthTexture 已把深度清成 0.0（reverse-Z 的"远"），所以

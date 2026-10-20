@@ -199,9 +199,7 @@ namespace
         bool createdWarned = false;   // a create failure was already reported
         bool evalOk = false;
         bool evalFailWarned = false;  // an evaluate failure was already reported
-        bool resetPending = false;    // history must be dropped on the next evaluate
-        // P108: one-shot log so a failing run states where the evaluate wrote.
-        bool evalDestinationLogged = false;
+        bool resetPending = false;    // a reset request is folded into the next Evaluate
         // P108 (user m10920): DLSS is now an INDEPENDENT switch, not an anti-aliasing mode.
         // The authoritative gate lives in the device module (gCtx.dlssEnabled); this mirror
         // only exists so the status query and the log lines can report it.
@@ -232,28 +230,8 @@ namespace
         UINT dlssOutputWidth = 0;
         UINT dlssOutputHeight = 0;
         DXGI_FORMAT dlssOutputFormat = DXGI_FORMAT_UNKNOWN;
-        // P108x: one-shot diagnostic state (temporary — used to localise the beige-frame
-        // report; the numbers localise, they never claim how the frame looks).
-        bool diagDone = false;
-        // B3：7 项 settled 读数已经请求过的帧数。模块的读回**延迟一帧**（见 dlssReadbackThunk），
-        // 所以只请求一次只能得到 "(not ready)"；evaluate 里按 kP108xDumpRounds 跑有限几轮。
-        int dumpRounds = 0;
-        ID3D12Fence* diagFence = nullptr;
-
-        // P108x: frame counter + the last private-output pointer, so a reading taken at the
-        // start of frame N can say whether it is looking at frame N-1's settled output.
-        uint64_t frameIndex = 0;
-        ID3D12Resource* prevPrivateOutput = nullptr;
-        uint64_t prevPrivateFrame = 0;
-        UINT64 diagFenceValue = 0;
-        bool diagClosedList = false;
-        bool preEvalFillDone = false;  // P108x: one-shot write-side bisect (see the evaluate body)
-        bool controlFillDone = false;  // P108x: CONTROL (module-created destination)
         // P108: tracked transitions are delegated to the device module (see transition()).
         DlssTransitionFn transitionFn = nullptr;
-        // B2：模块读回回调（见 mcdr_dlss_impl.h 的 DlssReadbackFn 说明）。本轮只保存，
-        // dump 路径仍是旧的 dumpManyResources；B3 才把 7 项读数切到它上面。
-        DlssReadbackFn readbackFn = nullptr;
         void* transitionCtx = nullptr;
         // P108: the private D32 depth snapshot (see mcdr_dlss_snapshot_depth). When present it
         // replaces the JVM's `pInDepth`, which by the time DLSS runs has already been cleared.
@@ -264,13 +242,10 @@ namespace
         UINT depthSnapshotHeight = 0;
         DXGI_FORMAT depthSnapshotFormat = DXGI_FORMAT_UNKNOWN;
         UINT depthSnapshotMips = 0;      // P108x: a full copy requires the whole shape to agree
-        UINT depthSnapshotArray = 0;
+        UINT depthSnapshotArray = 0;     // 同上：数组层数也要一起比对，否则全拷贝非法
         UINT depthSnapshotSamples = 0;
-        bool depthSnapshotShapeLogged = false;
         UINT64 depthSnapshotFrame = 0;   // frame counter at the last snapshot
         bool depthSnapshotWarned = false;
-        bool depthSnapshotUsedLogged = false;
-        bool depthInputLogged = false;  // P108x: one-shot "which resource/format NGX really gets"
 
         ID3D12Resource* mvBuffer = nullptr;      // intermediate for a non-RG16 MV input
         // B4：MV 中间纹理也由设备模块创建（同一入口），这里只留句柄。
@@ -987,8 +962,7 @@ namespace
         return fn;
     }
 
-    // 把本帧几何 + 质量档写进 SL 的 DLSS 选项；把结果写到 sl-probe.txt 自证
-    // （设备创建期的 native 日志可能早于文件 sink，见 P111 教训）。
+    // 把本帧几何 + 质量档写进 SL 的 DLSS 选项；失败时告警。
     int32_t streamlineApplyOptions(const mcdr_dlss_input& in) {
         const PFn_SlDLSSSetOptions fn = slDlssSetOptionsFn();
         if (fn == nullptr) return -1;
@@ -1006,17 +980,7 @@ namespace
         opt.useAutoExposure = sl::Boolean::eFalse;
         const sl::ViewportHandle viewport(0);
         const sl::Result r = fn(viewport, opt);
-        static int optionsProbeWrites = 0;
-        if (++optionsProbeWrites <= 3) if (FILE* f = _wfopen((dlssModuleDirectory() + L"sl-probe.txt").c_str(), L"a, ccs=UTF-8")) {
-            fwprintf(f, L"P112 dlss-options: mode=%d out=%ux%u render=%dx%d result=0x%X\n",
-                     static_cast<int>(opt.mode), opt.outputWidth, opt.outputHeight,
-                     static_cast<unsigned>(in.renderWidth), static_cast<unsigned>(in.renderHeight),
-                     static_cast<unsigned>(r));
-            fclose(f);
-        }
-        static int optionsLogged = 0;
-        if (optionsLogged < 3) {
-            ++optionsLogged;
+        if (r != sl::Result::eOk) {
             logWarn("P112: DLSS impl=streamline — slDLSSSetOptions result=0x%X (mode=%d, out=%ux%u, "
                 "render=%dx%d)",
                 static_cast<unsigned>(r), static_cast<int>(opt.mode), opt.outputWidth,
@@ -1665,12 +1629,7 @@ int32_t mcdr_dlss_can_run(void* device) {
 #if MCDR_DLSS_HAVE_STREAMLINE
     if (dlssImplStreamline()) {
         // P112 阶段 1：SL 拥有 NGX —— 既不加载也不初始化 nvngx。对 JVM 报"可用"，
-        // 让 CreateDlssFeature 被调用（那里做 slDLSSSetOptions 并把结果写进 sl-probe.txt）。
-        static bool logged = false;
-        if (!logged) {
-            logged = true;
-            logInfo("P112: DLSS impl=streamline — can_run reports available (Streamline owns NGX)");
-        }
+        // 让 CreateDlssFeature 被调用（那里做 slDLSSSetOptions）。
         return 1;
     }
 #endif
@@ -1726,7 +1685,6 @@ void mcdr_dlss_query(char* note, int32_t noteCap, char* optimal, int32_t optimal
         std::snprintf(runtime, static_cast<std::size_t>(runtimeCap), "%s", s.runtimePath.c_str());
     }
 }
-void tickCallStats(const char* kind);  // P114 诊断（定义在 streamline 段）
 
 int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
                          void* tlCtx) {
@@ -1744,7 +1702,6 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
         // 返回 1 表示"特征已就绪"，JVM 才会继续调用 mcdr_dx12EvaluateDlss；返回 0 会被
         // 当成"特征未就绪"而跳过 evaluate（P112 实测）。
         if (dlssImplStreamline()) {
-            tickCallStats("create");
             (void)streamlineApplyOptions(*in);
             return 1;
         }
@@ -1764,211 +1721,6 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
     }
     logFrameChange(*in, s.createdThisFrame);
     return 1;
-}
-
-// P108x: localisation helpers for the "world layer renders as a flat beige rectangle while
-// RTSS's OSD (drawn into the same swapchain) looks correct" report. Two things are checked
-// with numbers before anyone guesses:
-//   1. the exact DXGI format / flags of both sides of the CopyResource (a UNORM vs SRGB
-//      mismatch makes the copy fail *silently*, leaving the destination untouched);
-//   2. the destination's pixel statistics right after the copy — a uniform value means the
-//      copy did not land (the JVM's own clear colour is what remained on screen).
-// Read-back cannot say whether the frame "looks right"; it only says which texture lost the
-// world content. The visible verdict stays with the user.
-void logResourceFormat(const char* name, ID3D12Resource* res) {
-    if (res == nullptr) {
-        logInfo("P108x: %s = <null>", name);
-        return;
-    }
-    const D3D12_RESOURCE_DESC d = res->GetDesc();
-    logInfo("P108x: %s fmt=%d (SRGB=%d) %llux%u mips=%u flags=0x%X samples=%u", name,
-            static_cast<int>(d.Format),
-            (d.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-             d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
-                ? 1
-                : 0,
-            static_cast<unsigned long long>(d.Width), d.Height, d.MipLevels,
-            static_cast<unsigned>(d.Flags), d.SampleDesc.Count);
-}
-
-bool p108xFlag(const char* name) {
-    char buf[8] = {};
-    return ::GetEnvironmentVariableA(name, buf, sizeof(buf)) > 0 && buf[0] == '1';
-}
-
-// B3：7 项 settled 读数连续请求多少帧。第 1 帧全部 "(not ready)"（那一次拷贝刚录进还没提交的
-// 列表），第 2 帧起才有数字，之后每帧读的都是"上一帧 settled"的内容。有限轮数是刻意的：
-// 这是诊断而不是采样器。
-constexpr int kP108xDumpRounds = 8;
-
-// P108x: read a texture back and log its pixel statistics. Localisation only — the numbers
-// say whether a texture is empty/uniform/plausible; they never claim how the frame looks.
-//
-// B3: the readings now come from the **device module's** READBACK path (DlssReadbackFn, see
-// mcdr_dlss_impl.h) instead of a command list this unit builds for itself. Why that had to
-// change is recorded in dumpManyResources below.
-//
-// Trust rules (a diagnostic that can lie is worse than no diagnostic):
-//   * the transition into COPY_SOURCE is requested from the module, which tracks per-resource
-//     state (`ctx->resourceState`) and skips a transition when from == to — so the map never
-//     diverges from reality (that divergence was #525/#527/#838/RemoveDevice);
-//   * the copy lands in the module's READBACK buffer and the module waits on its own fence, so
-//     the bytes were really produced by the GPU rather than merely submitted;
-//   * bytes per pixel come from the DXGI format instead of being assumed;
-//   * a reading is **one frame late** by construction (the copy is recorded into the still-open
-//     list, so the data can only be mapped after that list was submitted) — a 0 return means
-//     "no reading yet", which is printed as such and never as a zero-filled texture.
-//
-// `state` used to be part of this struct: the unit declared the texture's state and restored it
-// around raw barriers. Both are gone — declaring a state here is exactly how the mismatch got
-// reintroduced, and the module is the only place that knows the true tracked state.
-struct P108xDumpItem {
-    ID3D12Resource* res;
-    const char* name;
-};
-
-UINT p108xBytesPerPixel(DXGI_FORMAT f) {
-    switch (f) {
-        case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
-        case DXGI_FORMAT_R16G16B16A16_FLOAT:
-        case DXGI_FORMAT_R32G32_FLOAT:
-        case DXGI_FORMAT_R32G32_UINT: return 8;
-        case DXGI_FORMAT_R32_TYPELESS:
-        case DXGI_FORMAT_D32_FLOAT:
-        case DXGI_FORMAT_R32_FLOAT:
-        case DXGI_FORMAT_R32_UINT:
-        case DXGI_FORMAT_R8G8B8A8_UNORM:
-        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-        case DXGI_FORMAT_B8G8R8A8_UNORM:
-        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-        case DXGI_FORMAT_R10G10B10A2_UNORM:
-        case DXGI_FORMAT_R16G16_UNORM:
-        case DXGI_FORMAT_R16G16_FLOAT: return 4;
-        case DXGI_FORMAT_R8G8_UNORM:
-        case DXGI_FORMAT_R16_UNORM:
-        case DXGI_FORMAT_R16_FLOAT: return 2;
-        case DXGI_FORMAT_R8_UNORM: return 1;
-        default: return 4;
-    }
-}
-
-// B3：**全部读回走模块的路径**（这是本次迁移的正文）。
-//
-// 旧版本在这个函数里自建 ID3D12CommandQueue / CommandAllocator / CommandList / Fence /
-// staging，并用裸 `ResourceBarrier` 把纹理切到 COPY_SOURCE 再切回调用方声明的状态。
-// 那些 barrier 对设备模块的 `ctx->resourceState` **不可见**，于是映射表与现实分叉，之后
-// 每一次跟踪型过渡都发出非法 barrier：
-//   [D3D12 ERROR #525] Before and after states must be different
-//   [D3D12 ERROR #527] Before state (...) ... specified by ...
-//   [D3D12 ERROR #838] Command lists must be successfully closed before execution
-//   [D3D12 ERROR #232] RemoveDevice (DXGI_ERROR_INVALID_CALL)
-// 而设备正是在一次"成功"的 evaluate 之后 1 ms 被拔掉的。自建命令列表还会与模块正在录制的
-// 那条列表争资源状态，所以这一整条路径都必须消失，而不是加个开关绕开。
-//
-// 现在本函数只做一件事：逐项把**裸资源**交给模块的 `s.readbackFn`
-// （设备模块的 readbackTextureStats；指针约定见 d3d12_device.cpp 里 dlssReadbackThunk 的
-// 注释），由它：
-//   * 用**当前这个 ctx 的 command list** 录一次 tracking 内的 CopyTextureRegion 到模块持有
-//     的 READBACK buffer（过渡全部经过 transitionTextureTo，绕不过 ctx->resourceState）；
-//   * 下一次调用时用模块自己的 fence 等那次提交完成，再映射、统计、回填 DlssTexStats；
-//   * 因此读数**延迟一帧**：返回 1 = 上一帧记下的那份拷贝。
-//
-// 返回值语义（按 mcdr_dlss_impl.h:100-111）：
-//   1 → out 已填好，按旧格式打 mean/min/max；
-//   0 → 这张纹理**还没有**读数（第一次请求它，或那次拷贝还录在本帧尚未提交的列表里）——
-//        打 `(not ready)`。**不是失败，也不能打成全 0**：全 0 会被读成"纹理是空的"，而
-//        "纹理是不是空的"正是这个诊断要回答的问题，一旦撒谎整个结论就反了；
-//  -1 → 失败（创建/映射失败），打一行 `(readback failed)` 并继续下一项，绝不拉起设备。
-void dumpManyResources(const P108xDumpItem* items, int count) {
-    if (!p108xFlag("DXRMC_P108X_DUMP")) {
-        return;
-    }
-    if (items == nullptr || count <= 0) {
-        return;
-    }
-    if (s.readbackFn == nullptr || s.transitionCtx == nullptr) {
-        static bool s_loggedNoReadback = false;
-        if (!s_loggedNoReadback) {
-            s_loggedNoReadback = true;
-            logInfo("P108x: dump skipped — the device module did not hand over a readback callback "
-                    "(this DLL is paired with a module older than B3)");
-        }
-        return;
-    }
-    // B3: two labels can name the SAME resource — `private-uav-from-previous-frame-settled` is
-    // `ngxTarget`, which IS `s.externalOutput` whenever the JVM handed a fitting UAV texture, and
-    // `input-depth-after-evaluate` is `s.depthSnapshot`, which IS the resource the
-    // `depth-snapshot-settled` item names. Asking the module twice in one frame for one texture
-    // answers "(not ready)" the second time (by design: that texture's copy was recorded moments
-    // ago into the still-open list, so the module refuses to wait for an unsubmitted fence), which
-    // would make those two labels permanently unreadable. So a resource is read ONCE per call and
-    // its reading is shared by every label that names it — same texture, same numbers, stated
-    // explicitly in the line so nobody mistakes it for two independent measurements.
-    struct ReadOnce {
-        ID3D12Resource* res;
-        int32_t rc;
-        DlssTexStats stats;
-    };
-    constexpr int kMaxReadPerCall = 8;
-    ReadOnce seen[kMaxReadPerCall] = {};
-    int seenCount = 0;
-    for (int i = 0; i < count; ++i) {
-        ID3D12Resource* res = items[i].res;
-        if (res == nullptr) {
-            continue;
-        }
-        const D3D12_RESOURCE_DESC d = res->GetDesc();
-        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Format == DXGI_FORMAT_UNKNOWN) {
-            logInfo("P108x: dump %s skipped (fmt=%d)", items[i].name, static_cast<int>(d.Format));
-            continue;
-        }
-        const UINT w = static_cast<UINT>(d.Width);
-        const UINT h = d.Height;
-        const UINT bpp = p108xBytesPerPixel(d.Format);
-        int32_t rc = 0;
-        DlssTexStats stats{};
-        bool shared = false;
-        for (int k = 0; k < seenCount; ++k) {
-            if (seen[k].res == res) {
-                rc = seen[k].rc;
-                stats = seen[k].stats;
-                shared = true;
-                break;
-            }
-        }
-        if (!shared) {
-            rc = s.readbackFn(s.transitionCtx, reinterpret_cast<void*>(res), &stats);
-            if (seenCount < kMaxReadPerCall) {
-                seen[seenCount].res = res;
-                seen[seenCount].rc = rc;
-                seen[seenCount].stats = stats;
-                ++seenCount;
-            }
-        }
-        const char* sharedNote = shared ? " [same texture as an earlier item in this round]" : "";
-        if (rc == 0) {
-            logInfo("P108x: dump %s %ux%u fmt=%d bpp=%u --- (not ready; the module recorded this "
-                    "texture's first readback on this frame and it settles on the next one)%s",
-                    items[i].name, w, h, static_cast<int>(d.Format), bpp, sharedNote);
-            continue;
-        }
-        if (rc < 0) {
-            logInfo("P108x: dump %s %ux%u fmt=%d bpp=%u --- (readback failed)%s", items[i].name, w, h,
-                    static_cast<int>(d.Format), bpp, sharedNote);
-            continue;
-        }
-        logInfo("P108x: dump %s %ux%u fmt=%d bpp=%u mean=%.1f/%.1f/%.1f/%.1f "
-                "min=%u/%u/%u/%u max=%u/%u/%u/%u (raw bytes)%s",
-                items[i].name, w, h, static_cast<int>(d.Format), bpp, stats.mean[0], stats.mean[1],
-                stats.mean[2], stats.mean[3], stats.min[0], stats.min[1], stats.min[2], stats.min[3],
-                stats.max[0], stats.max[1], stats.max[2], stats.max[3], sharedNote);
-    }
-}
-
-// Single-texture convenience wrapper.
-void dumpResourceStats(ID3D12Resource* res, const char* name) {
-    P108xDumpItem item{res, name};
-    dumpManyResources(&item, 1);
 }
 
 // P108: the depth snapshot (see mcdr_dlss_impl.h for why this exists).
@@ -2080,11 +1832,6 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
     // nothing when they differ; an explicit box copies the top mip of slice 0 regardless of the rest
     // of the shape, which is all DLSS samples anyway.
     // The snapshot's own state is QUERIED, never assumed — the debug layer also flagged a barrier
-    // whose Before state was wrong (#527, `0x800 COPY_SOURCE` on this very texture).
-    const int32_t snapBefore = (stateOf != nullptr)
-                                   ? stateOf(tlCtx, reinterpret_cast<void*>(s.depthSnapshot))
-                                   : static_cast<int32_t>(D3D12_RESOURCE_STATE_COMMON);
-    tl(tlCtx, depthResource, static_cast<int32_t>(D3D12_RESOURCE_STATE_COPY_SOURCE));
     tl(tlCtx, reinterpret_cast<void*>(s.depthSnapshot),
        static_cast<int32_t>(D3D12_RESOURCE_STATE_COPY_DEST));
     {
@@ -2098,18 +1845,6 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
         dst.SubresourceIndex = 0;
         const D3D12_BOX box{0, 0, 0, w, h, 1};
         cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
-    }
-    if (!s.depthSnapshotShapeLogged) {
-        // ④ release-build visibility: `CopyTextureRegion` returns void, so a shape problem would be
-        // silent outside the debug layer. Print both shapes and the queried state once.
-        s.depthSnapshotShapeLogged = true;
-        const D3D12_RESOURCE_DESC sd = s.depthSnapshot->GetDesc();
-        logInfo("P108x: depth snapshot copy: src %ux%u mips=%u array=%u samples=%u -> dst %llux%u "
-                "mips=%u array=%u samples=%u (box %ux%u, subresource 0 only), before_state=%d "
-                "(queried)",
-                w, h, dd.MipLevels, dd.DepthOrArraySize, dd.SampleDesc.Count,
-                static_cast<unsigned long long>(sd.Width), sd.Height, sd.MipLevels,
-                sd.DepthOrArraySize, sd.SampleDesc.Count, w, h, snapBefore);
     }
     tl(tlCtx, reinterpret_cast<void*>(s.depthSnapshot),
        static_cast<int32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
@@ -2126,22 +1861,6 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
 // P113：最近一帧的 SL frame token（Reflex 的 slReflexSleep 要在 Present 前用它）。
 sl::FrameToken* gLastFrameToken = nullptr;
 
-    // P114 诊断：每秒统计 streamline 的 evaluate / create 调用次数。
-    // 若 evaluate/s 明显大于 fps，说明每帧被调了多次（那会直接把 DLSS 的 GPU 成本翻倍）。
-    void tickCallStats(const char* kind) {
-        static uint32_t evalCalls = 0;
-        static uint32_t createCalls = 0;
-        static ULONGLONG lastTick = 0;
-        (kind[0] == 'e' ? evalCalls : createCalls)++;
-        const ULONGLONG now = ::GetTickCount64();
-        if (lastTick == 0) { lastTick = now; return; }
-        if (now - lastTick >= 1000) {
-            logInfo("P112 calls/s eval=%u create=%u", evalCalls, createCalls);
-            evalCalls = 0;
-            createCalls = 0;
-            lastTick = now;
-        }
-    }
 
     // P113/P115：Reflex 低延迟 + PCL 延迟标记 + 帧率限制器。
     // 文档：ProgrammingGuideReflex.md §4（选项）/§5（Present 前 sleep）、ProgrammingGuidePCL.md（标记）。
@@ -2220,14 +1939,9 @@ sl::FrameToken* gLastFrameToken = nullptr;
                                                              : sl::ReflexMode::eOff);
             opt.frameLimitUs = gReflex.frameLimitUs;  // 0 = 不限帧（文档：与 mode 独立）
             const sl::Result r = gReflex.setOptions(opt);
-            logWarn("P113 reflex: slReflexSetOptions(mode=%d, frameLimitUs=%u) result=0x%X",
-                    gReflex.mode, gReflex.frameLimitUs, static_cast<unsigned>(r));
-            if (FILE* f = _wfopen((dlssModuleDirectory() + L"sl-probe.txt").c_str(), L"a, ccs=UTF-8")) {
-                fwprintf(f, L"P113 reflex: setOptions=0x%X sleep=%s marker=%s mode=%d frameLimitUs=%u\n",
-                         static_cast<unsigned>(r), gReflex.sleep != nullptr ? L"ok" : L"missing",
-                         gReflex.marker != nullptr ? L"ok" : L"missing", gReflex.mode,
-                         gReflex.frameLimitUs);
-                fclose(f);
+            if (r != sl::Result::eOk) {
+                logWarn("P113 reflex: slReflexSetOptions(mode=%d, frameLimitUs=%u) result=0x%X",
+                        gReflex.mode, gReflex.frameLimitUs, static_cast<unsigned>(r));
             }
         }
         void emitMarker(sl::PCLMarker marker) {
@@ -2292,6 +2006,15 @@ sl::FrameToken* gLastFrameToken = nullptr;
         if (!reflexEnabled()) return;
         resolveReflexApi();
         applyReflexOptions();
+        // P131：JVM 的 frame-begin 钩子没跑到时（例如 DLSS 没在渲染），这一帧还没有 token。
+        // Reflex 的 sleep/限帧/标记全都要 token，缺了就整条链路静默失效；这里就地补一个。
+        if (gLastFrameToken == nullptr && gReflex.newFrameToken != nullptr) {
+            sl::FrameToken* token = nullptr;
+            uint32_t frameIndex = ++gReflex.frameCounter;
+            if (gReflex.newFrameToken(token, &frameIndex) == sl::Result::eOk && token != nullptr) {
+                gLastFrameToken = token;
+            }
+        }
         emitMarker(sl::PCLMarker::eRenderSubmitEnd);  // 本帧所有提交已完成，接着 Present
         emitMarker(sl::PCLMarker::ePresentStart);
         if (gReflex.sleep != nullptr && gLastFrameToken != nullptr) {
@@ -2303,70 +2026,6 @@ sl::FrameToken* gLastFrameToken = nullptr;
         if (!reflexEnabled()) return;
         emitMarker(sl::PCLMarker::ePresentEnd);
         gLastFrameToken = nullptr;  // 下一帧由 mcdr_reflex_frame_begin() 重新建
-
-        // P117：每秒读一次 ReflexState，把 PCL 统计的实测延迟打进日志（证明标记链路生效）。
-        static ULONGLONG lastStatsTick = 0;
-        static bool statsReported = false;
-        const ULONGLONG now = ::GetTickCount64();
-        if (gReflex.getState == nullptr) return;
-        if (lastStatsTick != 0 && now - lastStatsTick < 1000) return;
-        lastStatsTick = now;
-        sl::ReflexState state{};
-        if (gReflex.getState(state) != sl::Result::eOk || !state.latencyReportAvailable) return;
-        // 报告里有两串 frameID（一串是 QPC 量级的巨大值、一串是 1,2,3…），按 frameID 取最大
-        // 会挑到无效条目；按 simStartTime 取**最新**才是本帧那条。
-        const sl::ReflexReport* newest = nullptr;
-        for (const sl::ReflexReport& report : state.frameReport) {
-            if (report.frameID == 0 || report.simStartTime == 0 || report.presentEndTime == 0) continue;
-            if (newest == nullptr || report.simStartTime > newest->simStartTime) {
-                newest = &report;
-            }
-        }
-        if (newest == nullptr) return;
-        // 时间戳是 QPC tick（本机 10 MHz），不是纳秒：µs = ticks * 1e6 / 频率。
-        LARGE_INTEGER freq{};
-        ::QueryPerformanceFrequency(&freq);
-        const unsigned long long ticksPerUs =
-            freq.QuadPart > 0 ? static_cast<unsigned long long>(freq.QuadPart) / 1000000ull : 10ull;
-        const auto us = [ticksPerUs](uint64_t from, uint64_t to) -> unsigned long long {
-            return to > from ? (to - from) / ticksPerUs : 0ull;
-        };
-        const unsigned long long latency = us(newest->simStartTime, newest->presentEndTime);
-        const unsigned long long simUs = us(newest->simStartTime, newest->simEndTime);
-        const unsigned long long submitUs = us(newest->renderSubmitStartTime, newest->renderSubmitEndTime);
-        const unsigned long long presentUs = us(newest->presentStartTime, newest->presentEndTime);
-        logInfo("P113 pcl: latency=%lluus sim=%lluus submit=%lluus present=%lluus gpu=%uus active=%uus",
-                latency, simUs, submitUs, presentUs,
-                static_cast<unsigned>(newest->gpuFrameTimeUs),
-                static_cast<unsigned>(newest->gpuActiveRenderTimeUs));
-        if (!statsReported) {
-            statsReported = true;
-            if (FILE* f = _wfopen((dlssModuleDirectory() + L"sl-probe.txt").c_str(), L"a, ccs=UTF-8")) {
-                fwprintf(f, L"P113 pcl stats: latency=%lluus gpu=%uus active=%uus\n", latency,
-                         static_cast<unsigned>(newest->gpuFrameTimeUs),
-                         static_cast<unsigned>(newest->gpuActiveRenderTimeUs));
-                fclose(f);
-            }
-        }
-    }
-
-    // P112 阶段 3：每秒打一行 fps（两个实现路径共用），用于 ngx vs streamline 的同场景 A/B。
-    // 计数单位是 mcdr_dlss_evaluate 的成功次数 == 每秒评价的帧数。
-    void tickDlssFps(const char* impl) {
-        static ULONGLONG lastTick = 0;
-        static uint32_t frames = 0;
-        ++frames;
-        const ULONGLONG now = ::GetTickCount64();
-        if (lastTick == 0) {
-            lastTick = now;
-            return;
-        }
-        const ULONGLONG elapsed = now - lastTick;
-        if (elapsed >= 1000) {
-            logInfo("P112 fps=%u impl=%s", static_cast<unsigned>(frames * 1000ull / elapsed), impl);
-            frames = 0;
-            lastTick = now;
-        }
     }
 
 #if MCDR_DLSS_HAVE_STREAMLINE
@@ -2481,7 +2140,6 @@ sl::FrameToken* gLastFrameToken = nullptr;
                                void* tlCtx) {
         auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
         if (cmd == nullptr) return 0;
-        tickCallStats("eval");
         const StreamlineEvalApi& api = streamlineEvalApi();
         auto* color = reinterpret_cast<ID3D12Resource*>(in.pInColor);
         auto* depth = reinterpret_cast<ID3D12Resource*>(in.pInDepth);
@@ -2501,27 +2159,6 @@ sl::FrameToken* gLastFrameToken = nullptr;
         // P112：输出目标优先用 JVM 交付的 UAV 纹理（s.externalOutput，见 mcdr_dlss_set_output_texture）。
         // 直接把 GUI 目标（无 UAV 位）标成 kBufferTypeScalingOutputColor，NGX 会报
         // FAIL_RWFlagMissing(0xBAD00009)（SL 日志里是 "[sl.dlss] NGX evaluate feature failed"）。
-        // P114 诊断：确认 DLSS 的输入颜色到底是谁 —— 世界层（render 尺寸）还是已经合成好的
-        // GUI 目标（target 尺寸）。如果 color 是 target 尺寸，说明 GUI 也被送进 DLSS 了。
-        // 只在几何/指针变化时打印，这样 GUI 打开、窗口缩放等切换都会留下记录。
-        static ID3D12Resource* lastColor = nullptr;
-        static ID3D12Resource* lastOut = nullptr;
-        static uint32_t geomChanges = 0;
-        if ((color != lastColor || out != lastOut) && geomChanges < 40) {
-            ++geomChanges;
-            lastColor = color;
-            lastOut = out;
-            const D3D12_RESOURCE_DESC cd = color->GetDesc();
-            const D3D12_RESOURCE_DESC od = out->GetDesc();
-            logWarn("P114 geom#%u: color=%p %ux%u fmt=%d out=%p %ux%u fmt=%d render=%dx%d target=%dx%d",
-                    geomChanges, static_cast<void*>(color),
-                    static_cast<unsigned>(cd.Width), static_cast<unsigned>(cd.Height),
-                    static_cast<int>(cd.Format), static_cast<void*>(out),
-                    static_cast<unsigned>(od.Width), static_cast<unsigned>(od.Height),
-                    static_cast<int>(od.Format),
-                    static_cast<unsigned>(in.renderWidth), static_cast<unsigned>(in.renderHeight),
-                    static_cast<unsigned>(in.targetWidth), static_cast<unsigned>(in.targetHeight));
-        }
         // P114（用户报告的 GUI 文字被当作运动物体）：DLSS 的 temporal history 以**自己的输出**
         // 为反馈源。如果直接把 GUI 目标（每帧还要被 GUI 画一遍）标成 ScalingOutputColor，
         // 历史缓冲会被 GUI 污染 —— 滑动界面时文字就被当成运动物体放大/拖出框外。
@@ -2543,14 +2180,6 @@ sl::FrameToken* gLastFrameToken = nullptr;
             outResource = s.dlssOutput;
             copyBack = true;
         }
-        static ID3D12Resource* lastSel = nullptr;
-        if (outResource != lastSel) {
-            lastSel = outResource;
-            logWarn("P114 out-sel: %s externalOutput=%p dlssOutput=%p out=%p",
-                    outResource == out ? "GUI-target" : "private-UAV",
-                    static_cast<void*>(s.externalOutput), static_cast<void*>(s.dlssOutput),
-                    static_cast<void*>(out));
-        }
         s.transitionFn = tl;
         s.transitionCtx = tlCtx;
         // 文档（ProgrammingGuideDLSS.md:155）：**资源状态由 SL 管理，宿主不要手动 transition**；
@@ -2567,7 +2196,6 @@ sl::FrameToken* gLastFrameToken = nullptr;
 
         // 1) 相机常量（每帧、尽量早；ProgrammingGuide.md §2.11.1）。没有 JVM 送来的
         //    `mcdr_dlss_constants` 时只能跳过 —— slSetConstants 缺字段 DLSS 会拒绝该帧。
-        int constResult = -1;
         if (gCameraConstantsValid) {
             sl::Constants cnst{};
             // P118 修（用户报「DLSS 静止不动也有随机拖影」）：这里有三个**传参错误**，每一个都足以
@@ -2658,7 +2286,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             // sl_consts.h:182 的实际结构没有），所以那一位只能留在 JVM/AI 侧不用。
             cnst.motionVectorsDilated = sl::Boolean::eFalse;
             cnst.orthographicProjection = sl::Boolean::eFalse;
-            constResult = static_cast<int>(api.setConstants(cnst, *token, viewport));
+            (void)api.setConstants(cnst, *token, viewport);
         }
 
         // 2) 资源 tag（lifecycle 按文档 :143-147：输入/输出 eOnlyValidNow，深度/MV eValidUntilPresent）
@@ -2723,32 +2351,20 @@ sl::FrameToken* gLastFrameToken = nullptr;
         // 输入侧我们不再改状态，所以也没有要恢复的 barrier。
         transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-        static int loggedRuns = 0;
-        if (loggedRuns < 3) {
-            ++loggedRuns;
+        if (evalResult != sl::Result::eOk) {
             logWarn("P112: streamline evaluate tags=0x%X options=0x%X evaluate=0x%X "
                     "(mode=%d, out=%ux%u)",
                     static_cast<unsigned>(tagResult), static_cast<unsigned>(optResult),
                     static_cast<unsigned>(evalResult), static_cast<int>(opt.mode),
                     opt.outputWidth, opt.outputHeight);
-            if (FILE* f = _wfopen((dlssModuleDirectory() + L"sl-probe.txt").c_str(),
-                                  L"a, ccs=UTF-8")) {
-                fwprintf(f, L"streamline evaluate: constants=%d tags=0x%X options=0x%X evaluate=0x%X\n",
-                         constResult, static_cast<unsigned>(tagResult),
-                         static_cast<unsigned>(optResult), static_cast<unsigned>(evalResult));
-                fclose(f);
-            }
+            return 0;
         }
-        if (evalResult == sl::Result::eOk) {
-            tickDlssFps("streamline");
-            return 1;
-        }
-        return 0;
+        return 1;
     }
 #endif
 
 int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTransitionFn tl,
-                           void* tlCtx, DlssReadbackFn rb) {
+                           void* tlCtx) {
     if (in == nullptr) {
         return -1;
     }
@@ -2777,7 +2393,6 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // Install the module-provided tracked-transition callback for this call (see transition()).
     s.transitionFn = tl;
     s.transitionCtx = tlCtx;
-    s.readbackFn = rb;  // B3 会用它；本轮为 nullptr 时仅保存，不做任何读回。
     auto* color = reinterpret_cast<ID3D12Resource*>(in->pInColor);
     auto* depth = reinterpret_cast<ID3D12Resource*>(in->pInDepth);
     auto* mv = reinterpret_cast<ID3D12Resource*>(in->pInMotionVectors);
@@ -2849,13 +2464,6 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     ID3D12Resource* depthForDlss = depth;
     if (s.depthSnapshot != nullptr) {
         depthForDlss = s.depthSnapshot;
-        if (!s.depthSnapshotUsedLogged) {
-            s.depthSnapshotUsedLogged = true;
-            logInfo("P108: DLSS depth snapshot in use (%ux%u fmt=%d) — the JVM-supplied depth is "
-                    "not passed to NGX",
-                    s.depthSnapshotWidth, s.depthSnapshotHeight,
-                    static_cast<int>(s.depthSnapshotFormat));
-        }
     }
 
     // All four inputs go to PIXEL_SHADER_RESOURCE (NGX samples them) and the output to
@@ -2889,28 +2497,13 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // `mcdr_dx12SetDlssOutput`), use it and never build a private one. The private texture stays
     // only as a fallback for older JVM builds / older DLL pairings.
     ID3D12Resource* ngxTarget = out;
-    // Which of the three destinations the evaluate actually uses. Kept explicit because the old
-    // log collapsed "the JVM's UAV texture" and "our private fallback" into one misleading string
-    // (both satisfy `ngxTarget != out`), which sent a joint debugging run down the wrong path.
-    const char* destKind = "the JVM's target directly";
     if (s.externalOutput != nullptr) {
         const D3D12_RESOURCE_DESC ed = s.externalOutput->GetDesc();
         const bool fits = (ed.Width == static_cast<UINT64>(in->targetWidth)) &&
                           (ed.Height == static_cast<UINT>(in->targetHeight)) &&
                           (ed.Format == out->GetDesc().Format);
-        // P108x: the decision inputs, on the record. A joint run showed `override accepted` and then
-        // an evaluate that still chose the private fallback with no `cleared`/`does not fit` line —
-        // which is only possible if the state went null silently. Printing the inputs (and the
-        // state's own address) makes "empty" vs "mismatched" vs "two state copies" distinguishable
-        // on sight instead of inferred.
-        logInfo("P108x: DLSS output override state: externalOutput=%p fits=%d (need %dx%d fmt=%d, "
-                "have %llux%u fmt=%d), state=%p",
-                static_cast<void*>(s.externalOutput), fits ? 1 : 0, in->targetWidth, in->targetHeight,
-                static_cast<int>(out->GetDesc().Format), static_cast<unsigned long long>(ed.Width),
-                ed.Height, static_cast<int>(ed.Format), static_cast<const void*>(&s));
         if (fits) {
             ngxTarget = s.externalOutput;
-            destKind = "the JVM-supplied UAV texture";
             transition(out, D3D12_RESOURCE_STATE_COPY_DEST);
             transition(ngxTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         } else {
@@ -2930,19 +2523,10 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
                                                 out->GetDesc().Format);
         if (priv != nullptr) {
             ngxTarget = priv;
-            destKind = "our private UAV texture (the JVM supplied none)";
             // `out` only has to be a copy destination until the copy below.
             transition(out, D3D12_RESOURCE_STATE_COPY_DEST);
             transition(priv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
-    }
-    // Report where the evaluate writes, so a failing run says exactly what was tried.
-    if (!s.evalDestinationLogged) {
-        s.evalDestinationLogged = true;
-        logInfo("P108: DLSS Evaluate destination: %s (target %ux%u fmt=%d%s)", destKind,
-                static_cast<unsigned>(in->targetWidth), static_cast<unsigned>(in->targetHeight),
-                static_cast<int>(ngxTarget->GetDesc().Format),
-                ngxTarget != out ? "; result copied into the JVM target afterwards" : "");
     }
 
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep{};
@@ -2953,44 +2537,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // the optimal-settings query and is not what a working integration asks for.
     ep.Feature.InSharpness = 0.0f;
     ep.pInDepth = depthForDlss;
-    // P108x: state exactly WHICH resource NGX gets as depth, in which **DXGI** format. The frame
-    // log's `depthFmt=NN` is the JVM's own format ORDINAL (`mcdr_dlss_input.depthFormatOrdinal`),
-    // not a DXGI_FORMAT value, so it cannot be read as "51 = R8G8_SNORM" — this line is the
-    // authoritative one. A typeless/DSV view or a format NGX does not accept would explain an
-    // evaluate that reports success while producing nothing.
-    if (!s.depthInputLogged) {
-        s.depthInputLogged = true;
-        const D3D12_RESOURCE_DESC dd = depthForDlss->GetDesc();
-        const char* dxgiName = "?";
-        switch (dd.Format) {
-            case DXGI_FORMAT_D32_FLOAT: dxgiName = "D32_FLOAT"; break;
-            case DXGI_FORMAT_R32_FLOAT: dxgiName = "R32_FLOAT"; break;
-            case DXGI_FORMAT_R32_TYPELESS: dxgiName = "R32_TYPELESS"; break;
-            case DXGI_FORMAT_D24_UNORM_S8_UINT: dxgiName = "D24_UNORM_S8_UINT"; break;
-            case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: dxgiName = "R24_UNORM_X8_TYPELESS"; break;
-            case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: dxgiName = "D32_FLOAT_S8X24_UINT"; break;
-            case DXGI_FORMAT_D16_UNORM: dxgiName = "D16_UNORM"; break;
-            case DXGI_FORMAT_R16_UNORM: dxgiName = "R16_UNORM"; break;
-            default: break;
-        }
-        logInfo("P108x: DLSS depth input: resource=%p GetDesc().Format=%d (%s) %llux%u, "
-                "snapshot_used=%d, ordinal_from_jvm=%d",
-                static_cast<void*>(depthForDlss), static_cast<int>(dd.Format), dxgiName,
-                static_cast<unsigned long long>(dd.Width), dd.Height,
-                (depthForDlss == s.depthSnapshot) ? 1 : 0, in->depthFormatOrdinal);
-    }
     ep.pInMotionVectors = mvForDlss;
-    // P76f 诊断：把 NGX 真正拿到的那张运动矢量纹理读回来（`DXRMC_P108X_DUMP_MV=1`）。
-    //
-    // 为什么需要它：用户报告"整片地面只在相机移动时拖影"，而 mv 的每一条上游（深度快照、相机
-    // 坐标、逐物体行、平移视差项）在日志里都已经 `ok`。再往下就只能靠"mv 里到底有没有值"这一条
-    // 硬事实来二分：全 0 ⇒ 速度 pass 的写入/状态/深度链路有问题；有值 ⇒ 问题在 NGX 消费侧。
-    //
-    // 采样时机：相机静止时 mv **本来就该** 全 0，所以不能用"开局 8 帧"那套；这里每 300 次
-    // evaluate 取一次，覆盖到用户真正走动的时间段。读回本身延迟一帧（模块的 fence），无害。
-    if (p108xFlag("DXRMC_P108X_DUMP_MV") && (s.submitCount % 60u) == 0u) {
-        dumpResourceStats(mvForDlss, "input-motion-vectors");
-    }
     ep.InJitterOffsetX = in->jitterOffsetX;
     ep.InJitterOffsetY = in->jitterOffsetY;
     ep.InRenderSubrectDimensions.Width = static_cast<unsigned>(in->renderWidth);
@@ -3004,53 +2551,6 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
                              : 1.0f;
     // No transparency mask, no auto-exposure texture, no subrects: the data plane produces
     // none of them yet (see the ABI header's list of what MCDR does not have).
-
-        // P108x: one-shot WRITE-side bisect. The private UAV reads all-zero after the evaluate even
-        // though the read-back waits for the queue to drain (the helper signals a fence value one past
-        // its own copy), so "the GPU had not run yet" is ruled out. That leaves two possibilities:
-        //   (a) the texture cannot carry the write at all — then this pre-evaluate fill, which lands
-        //       in the same texture through the same queue, will read back zero too;
-        //   (b) DLSS really is not writing — then this fill reads back NON-zero and the post-evaluate
-        //       reading of the same texture stays zero.
-        // Filling `ngxTarget` with a copy of the colour input is deliberate: it uses the identical
-        // resource the evaluate is about to be handed, and the copy engine instead of a shader.
-        // P108x: the write-side bisect + CONTROL copies are DISABLED by default. They copy into the
-    // privately created textures from inside the evaluate, and that is the same family of copy that
-    // produced #944/#525/#527 — it is a prime suspect for the later DXGI_ERROR_DEVICE_HUNG
-    // (0x887A0006, a TDR at present time). Re-enable explicitly with DXRMC_P108X_TESTFILL=1 when the
-    // bisect is needed again.
-    if (p108xFlag("DXRMC_P108X_TESTFILL") && !s.preEvalFillDone && ngxTarget == s.dlssOutput) {
-            s.preEvalFillDone = true;
-            transition(color, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            transition(ngxTarget, D3D12_RESOURCE_STATE_COPY_DEST);
-            cmd->CopyResource(ngxTarget, color);
-            transition(color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            transition(ngxTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            const P108xDumpItem pre[] = {
-                {ngxTarget, "private-uav-after-testfill"},
-            };
-            logInfo("P108x: write-side bisect — private UAV filled from the colour input before "
-                    "the evaluate; if the line below is non-zero the texture is writable and DLSS "
-                    "is the one not writing");
-            dumpManyResources(pre, 1);
-        // P108x CONTROL: identical source, identical call site, but the destination is the
-        // JVM/module-created target instead of a texture we created ourselves. If this reads
-        // non-zero while the private texture reads zero, the asymmetry lives in our own texture.
-        if (!s.controlFillDone) {
-            s.controlFillDone = true;
-            transition(color, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            transition(out, D3D12_RESOURCE_STATE_COPY_DEST);
-            cmd->CopyResource(out, color);
-            transition(color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            const P108xDumpItem ctl[] = {
-                {out, "control-module-created-target-filled-from-colour"},
-            };
-            logInfo("P108x: CONTROL — the same colour input copied into the MODULE-created target "
-                    "at the same point; if this is non-zero the copy path works and the private "
-                    "texture is the odd one out");
-            dumpManyResources(ctl, 1);
-        }
-    }
 
     const NVSDK_NGX_Result er = NGX_D3D12_EVALUATE_DLSS_EXT(cmd, s.feature, s.params, &ep);
     if (NVSDK_NGX_FAILED(er)) {
@@ -3073,123 +2573,15 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // target and leave that target in RENDER_TARGET — the GUI render pass attaches it right
     // after this returns (the contract this entry point has always had).
     if (ngxTarget != out) {
-        if (p108xFlag("DXRMC_P108X_SKIP_COPY")) {
-            if (!s.evalDestinationLogged) {
-                s.evalDestinationLogged = true;
-                logInfo("P108x: DXRMC_P108X_SKIP_COPY=1 — the DLSS result is deliberately NOT "
-                        "copied into the JVM target (bisect: is the copy the problem?)");
-            }
-        } else if (p108xFlag("DXRMC_P108X_COPY_COLOR")) {
-            // Keep the evaluate running (so feature/sizes stay warm) but put the *input*
-            // colour into the target instead of the DLSS result. If the screen then shows the
-            // world in the top-left 640x360, the copy-back machinery lands and the problem is
-            // the DLSS output itself; if the screen stays beige, the copy-back never lands.
-            transition(color, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            D3D12_TEXTURE_COPY_LOCATION cs{};
-            cs.pResource = color;
-            cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            cs.SubresourceIndex = 0;
-            D3D12_TEXTURE_COPY_LOCATION cd{};
-            cd.pResource = out;
-            cd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            cd.SubresourceIndex = 0;
-            const D3D12_BOX box{0, 0, 0, static_cast<UINT>(in->renderWidth),
-                                static_cast<UINT>(in->renderHeight), 1};
-            cmd->CopyTextureRegion(&cd, 0, 0, 0, &cs, &box);
-            transition(color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            if (!s.evalDestinationLogged) {
-                s.evalDestinationLogged = true;
-                logInfo("P108x: DXRMC_P108X_COPY_COLOR=1 — the *input colour* is copied into the "
-                        "JVM target instead of the DLSS result (does the copy-back land?)");
-            }
-        } else {
-            transition(ngxTarget, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            cmd->CopyResource(out, ngxTarget);
-            transition(ngxTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        }
-        // P108x: one-shot localisation. Formats first (a UNORM/SRGB mismatch makes
-        // CopyResource fail SILENTLY and leaves `out` showing whatever was there before —
-        // which is exactly the "flat beige world area" symptom), then the destination's
-        // pixel statistics. Numbers localise; they never claim how the frame looks.
-        if (!s.diagDone) {
-            s.diagDone = true;
-            logResourceFormat("JVM target (pInOutput)", out);
-            logResourceFormat("private UAV texture", ngxTarget);
-            logResourceFormat("input color (pInColor)", color);
-            logResourceFormat("input depth (pInDepth)", depth);
-            logResourceFormat("input motion (pInMotionVectors)", mvForDlss);
-            logInfo("P108x: DXRMC_P108X_SKIP_COPY=%d DXRMC_P108X_DUMP=%d",
-                    p108xFlag("DXRMC_P108X_SKIP_COPY") ? 1 : 0,
-                    p108xFlag("DXRMC_P108X_DUMP") ? 1 : 0);
-        }
-        // B3: the 7 settled readings. They used to be requested ONCE (guarded by `s.diagDone`)
-        // through a queue this unit built for itself. Both halves of that are gone: the readings
-        // now come from the module's readback path, which is **one frame late by construction**
-        // (the copy is recorded into the still-open list, so its bytes can only be mapped after
-        // that list was submitted), and a single round would therefore only ever print
-        // "(not ready)". So the same 7 labels are requested for a bounded number of frames
-        // (kP108xDumpRounds): round 1 reports "(not ready)" for each texture, round 2 is the
-        // first with real numbers, and every later round reads the *previous* frame's settled
-        // content — exactly what the label names (`…-settled`, `…-from-previous-frame-settled`)
-        // have always claimed. Bounded, not per-frame: this is a diagnostic, not a sampler.
-        if (s.dumpRounds < kP108xDumpRounds) {
-            ++s.dumpRounds;
-            const P108xDumpItem batch[] = {
-                {out, "jvm-target-from-previous-frame-settled"},
-                {color, "input-color-after-evaluate"},
-                {ngxTarget, "private-uav-from-previous-frame-settled"},
-                {depthForDlss, "input-depth-after-evaluate"},
-                // P108x (parent's item 2): the ACTUAL NGX output, when the JVM supplied it.
-                // Read at the settle point — i.e. on a later frame, after the command list that
-                // produced it was submitted and fenced — so "NGX wrote / did not write" cannot be
-                // explained away as "the GPU had not run yet". This is the one number that settles
-                // the black-world question.
-                {s.externalOutput, "dlss-output-texture-settled"},
-                // P108x (parent's item 2): the snapshot is ALSO one of this unit's own
-                // `CreateCommittedResource` textures, i.e. the same class that provably cannot hold a
-                // write. Reading it next to the JVM's main depth separates "the snapshot copy never
-                // landed" from "the world depth really was empty".
-                {s.depthSnapshot, "depth-snapshot-settled"},
-                {depth, "jvm-main-depth-settled"},
-            };
-            dumpManyResources(batch, 7);
-        }
-        // P108x: same copy-back as above, but placed AFTER the evaluate (i.e. at the very end
-        // of our work for the frame). Lets a run compare "what pInColor held when DLSS was
-        // asked to upscale it" with the same texture later in the frame, which distinguishes
-        // "the hook fires before the world for this frame is drawn" from "the world layer is
-        // not in this texture at all".
-        if (p108xFlag("DXRMC_P108X_COPY_COLOR_AFTER")) {
-            transition(color, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            D3D12_TEXTURE_COPY_LOCATION cs{};
-            cs.pResource = color;
-            cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            cs.SubresourceIndex = 0;
-            D3D12_TEXTURE_COPY_LOCATION cd{};
-            cd.pResource = out;
-            cd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            cd.SubresourceIndex = 0;
-            const D3D12_BOX box{0, 0, 0, static_cast<UINT>(in->renderWidth),
-                                static_cast<UINT>(in->renderHeight), 1};
-            cmd->CopyTextureRegion(&cd, 0, 0, 0, &cs, &box);
-            transition(color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            if (!s.evalDestinationLogged) {
-                s.evalDestinationLogged = true;
-                logInfo("P108x: DXRMC_P108X_COPY_COLOR_AFTER=1 — input colour copied into the "
-                        "target at the END of our work in the frame");
-            }
-        }
+        transition(ngxTarget, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cmd->CopyResource(out, ngxTarget);
+        transition(ngxTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
     } else {
         transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
     s.resetPending = false;
 
-    ++s.frameIndex;
-    s.prevPrivateOutput = (ngxTarget != out) ? ngxTarget : nullptr;
-    s.prevPrivateFrame = s.frameIndex;
     ++s.submitCount;
     if (!s.evalOk) {
         s.evalOk = true;
@@ -3198,9 +2590,8 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
                 in->renderWidth, in->renderHeight, in->targetWidth, in->targetHeight,
                 mvIsRg16 ? "RG16 straight through" : "copied into an RG16 intermediate");
     }
-    tickDlssFps("ngx");
     return 1;
-    }
+}
 
     // Called from destroyDevice() BEFORE the D3D12 device goes away: NGX must release its
     // feature and shut down while the device is still alive.
@@ -3279,9 +2670,6 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
                 "will write here instead of this unit's private UAV texture",
                 static_cast<unsigned long long>(d.Width), d.Height, static_cast<int>(d.Format),
                 static_cast<unsigned>(d.Flags));
-        // A new destination invalidates the previous frame's assumption about where the result
-        // went, so let the next evaluate re-log its destination.
-        s.evalDestinationLogged = false;
     } else {
         logInfo("P108: DLSS output texture override cleared; back to the private UAV texture");
     }

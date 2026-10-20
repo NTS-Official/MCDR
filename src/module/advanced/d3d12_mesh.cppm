@@ -64,6 +64,24 @@ struct MeshPipelineDesc {
 
 mcdr::Result<void*> createMeshPipeline(const MeshPipelineDesc& desc);
 
+// P129：用外部根签名创建（地形 mesh 变体要复用 JVM 侧那套 b0..b3/t4/t5 绑定点，
+// 再由 JVM 建出“地形签名 + 段表/顶点/索引缓冲三个尾参”的扩展签名后交进来）。
+// externalRootSignature 为 0 时等价于上一个重载（内部按 bindings 新建）。
+// 传入的是 ID3D12RootSignature* 的地址值；本模块不导出 D3D12 类型，故用 uint64_t。
+mcdr::Result<void*> createMeshPipeline(const MeshPipelineDesc& desc, uint64_t externalRootSignature);
+
+// P129：按绑定点布局建一个根签名并交出裸指针（地址值，调用方用 releaseMeshRootSignature 释放）。
+// meshExtras=true 时在地形绑定之后追加三个 mesh 专用尾参：
+//   [N]   root CBV  b8  —— 段表（每段 firstIndex/indexCount/baseVertex）
+//   [N+1] descriptor table，含 t14（顶点 ByteAddressBuffer）、t15（索引 Buffer<uint>）
+// 这样地形 PSO 与 mesh PSO 能共用同一套 draw 绑定，只是 mesh 变体多三个槽位。
+// P140：meshletCull=true（需同时 meshExtras）时再追加两样，
+//   [N+2] 同表的第 4 个 range t17（meshlet 包围球）与 [N+3] root 32 位常量 b9（28 dword）。
+mcdr::Result<uint64_t> createMeshRootSignature(const std::vector<PipelineDesc::Binding>& bindings,
+                                               bool meshExtras, bool meshletCull);
+// 释放 createMeshRootSignature 交出的签名（传 0 安全）。
+void releaseMeshRootSignature(uint64_t rootSignature);
+
 // 本机是否具备 mesh 管线的最小条件（12_2 + mesh shader tier ≥ 1 + DXC 能编 ms_6_x
 // + 能拿到 ID3D12Device2）。why 收到不满足的原因（可为 nullptr）。
 bool meshPipelineSupported(std::string* why);
@@ -71,6 +89,17 @@ bool meshPipelineSupported(std::string* why);
 // DispatchMesh：x/y/z = 线程组数量（ctx 为 mcdr_command_ctx 句柄）。要求当前已
 // setPipeline 一个 mesh 管线。
 mcdr::Result<void> dispatchMesh(void* ctx, int x, int y, int z);
+
+// P141：meshlet 包围球 GPU 生成（compute pass）的根签名。
+// 参数布局：0 = root CBV b8（段表，与图形侧同一份 32 B/组数据）、
+//           1 = 描述符表 { SRV t14 顶点, SRV t15 索引, UAV u0 包围球 }。
+// 交出裸 ID3D12RootSignature* 地址值，用 releaseMeshRootSignature 释放（不进段派发注册表）。
+mcdr::Result<uint64_t> createMeshBoundsRootSignature();
+
+// P141：用上面那份签名建 cs_6_0 的 compute PSO。成功交出 Dx12Pipeline 句柄
+// （withDepth 字段承载 CS PSO），由 JVM 持有并交给 buildMeshletBounds；
+// 销毁仍走 D3D12DestroyPipeline。rootSignature 为 0 或字节码为空时失败。
+mcdr::Result<void*> createMeshBoundsPipeline(const void* csDxil, int32_t csLen, uint64_t rootSignature);
 
 }  // export namespace d3d12_mc —— 导出接口到此为止
 

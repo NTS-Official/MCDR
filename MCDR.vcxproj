@@ -67,8 +67,8 @@
       <LanguageStandard_C>stdclatest</LanguageStandard_C>
       <TreatWarningAsError>true</TreatWarningAsError>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
-      <!-- The core deliberately uses getenv()/fopen() for the DX12_DIAG_* and
-           DX12_DBG_* diagnostic switches; suppressing the CRT deprecation nag is
+      <!-- The core deliberately uses getenv()/fopen() for the DX12_NATIVE_LOG_FILE /
+           DX12_LOG_VERBOSE / MCDR_STREAMLINE switches; suppressing the CRT deprecation nag is
            preferable to touching 4.5k lines of working renderer code.
            NOMINMAX is defined here for the whole project rather than relying on the
            per-header #ifndef guards the core carries: several of those guards reset

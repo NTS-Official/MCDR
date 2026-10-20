@@ -15,7 +15,8 @@ module;
 
 module mcdr.abi.common;
 
-#include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
+#include "mcdr_abi.h"
+#include <cstdlib>   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 
 // P108：DLSS 实现单元（普通 TU，src\advanced\d3d12_dlss.cpp）的 C 接口 ——
 // mcdr_dx12SetDlssVendorDir 只是它的转发层。同 rtx_probe 的理由：模块看不到 NGX 类型。
@@ -195,6 +196,15 @@ void MCDR_CALL mcdrSetLogLevel(int32_t level) {
     d3d12_mc::setLogLevel(level);
 }
 
+void MCDR_CALL mcdr_dx12SetEnvironment(const char* name, const char* value) {
+    // A small, deliberate escape hatch: the Java side owns every user-visible setting, while the
+    // native layer keeps its plain getenv() reads. _putenv_s updates the CRT environment block,
+    // which is the copy getenv()/_wgetenv() in this DLL reads; an empty value removes the entry.
+    if (name == nullptr || name[0] == '\0') {
+        return;
+    }
+    (void)_putenv_s(name, value != nullptr ? value : "");
+}
 int32_t MCDR_CALL mcdrSetPixCapture(int32_t enabled) {
     // 1=loaded, 0=not requested, -1=requested but not loaded. Loading the capture
     // layer is irreversible for the process (PIX hooks D3D12 from inside it), so the
@@ -212,12 +222,13 @@ int32_t MCDR_CALL mcdrSetShadingRate(int32_t rate) {
 }
 
 int32_t MCDR_CALL mcdrSetAntiAliasing(int32_t mode) {
-    // P104/P108. mode mirrors the Java-side option: **0=OFF 1=SMAA 2=TAA 3=DLAA**. Only SMAA
-    // is implemented (three passes glued in place); TAA/DLAA are accepted and downgraded to
-    // OFF with a WARN.
+    // P104/P108/P152. mode mirrors the Java-side option: **0=OFF 1=SMAA 2=TAA 3=DLAA**. SMAA
+    // (three passes glued in place) and TAA (P152: a native resolve with an RGBA16F history
+    // ping-pong, see mcdr_dx12ApplyTaaToTexture) are implemented; DLAA is still accepted and
+    // downgraded to OFF with a WARN.
     // P108 (user m10920): DLSS is NO LONGER a value here — it has its own switch, see
     // mcdr_dx12SetDlssEnabled. Anti-aliasing and DLSS are independent.
-    // Returns 1=in effect, 0=accepted but not implemented, -1=unknown mode.
+    // Returns 1=in effect (OFF/SMAA/TAA), 0=accepted but not implemented (DLAA), -1=unknown mode.
     return d3d12_mc::setAntiAliasing(mode);
 }
 
@@ -260,6 +271,10 @@ void MCDR_CALL mcdr_dx12ReflexMarker(int32_t marker) { mcdr_reflex_marker(marker
 void MCDR_CALL mcdr_dx12SetReflexMode(int32_t mode) { mcdr_reflex_set_mode(mode); }
 
 int32_t MCDR_CALL mcdr_dx12ReflexAvailable(void) { return mcdr_reflex_available(); }
+
+void MCDR_CALL mcdr_dx12SetReflexFrameLimit(int32_t micros) {
+    mcdr_reflex_set_frame_limit(static_cast<uint32_t>(micros < 0 ? 0 : micros));
+}
 
 int32_t MCDR_CALL mcdr_dx12SetDlssConstants(const mcdr_dlss_constants* constants) {
     // P112：Streamline 的 sl::Constants 需要相机矩阵/向量/近远平面等，这些数据只在 JVM 侧

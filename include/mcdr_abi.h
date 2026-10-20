@@ -271,6 +271,13 @@ MCDR_API void MCDR_CALL mcdrSetLogVerbose(int32_t enabled);
 // Native log level: 0=error, 1=warning, 2=info, 3=debug.
 MCDR_API void MCDR_CALL mcdrSetLogLevel(int32_t level);
 
+/// Set (or, with a null/empty value, clear) one process-wide environment variable from the
+/// Java-side configuration, so the handful of native switches that are still read with
+/// getenv()/_wgetenv() (DX12_DEBUG_LAYER, MCDR_DLSS_IMPL, DX12_NATIVE_LOG_FILE, ...) can be
+/// driven from config/dxr_mc-client.toml instead of the launcher environment. Must be called
+/// before the first device is created; later calls only affect reads that happen afterwards.
+MCDR_API void MCDR_CALL mcdr_dx12SetEnvironment(const char* name, const char* value);
+
 // PIX GPU capture: load Microsoft PIX's capture layer (WinPixGpuCapturer.dll) into
 // this process. The layer hooks D3D12, so it has to be in place BEFORE the first
 // device is created — the mod calls this as soon as its config is read, and the
@@ -300,7 +307,9 @@ MCDR_API int32_t MCDR_CALL mcdrSetShadingRate(int32_t rate);
 // after the world has rendered and before the GUI is drawn — see
 // mcdr_dx12ApplySmaaToTexture, which the Java side calls at exactly that point. Applying
 // it to the composed frame instead (at the final blit) also softened the GUI.
-// TAA/DLAA are accepted but treated as OFF (a WARN names them).
+// TAA (2) has a native resolve as well since P152 — see mcdr_dx12ApplyTaaToTexture; it
+// keeps an RGBA16F history ping-pong inside the device and runs at the same call point.
+// DLAA (3) is still accepted but treated as OFF (a WARN names it).
 //
 // P108 (user m10920): DLSS is **no longer** a value of this option. Upscaling and
 // anti-aliasing are separate concerns, so DLSS got its own switch — see
@@ -309,8 +318,8 @@ MCDR_API int32_t MCDR_CALL mcdrSetShadingRate(int32_t rate);
 // upscales that result into the window-sized target.
 //
 // No restart is needed — a mode change takes effect on the next frame. Returns 1 when the
-// mode is in effect, 0 when it was accepted but not implemented (TAA/DLAA), and -1 for an
-// unknown mode.
+// mode is in effect (OFF, SMAA, TAA), 0 when it was accepted but not implemented (DLAA),
+// and -1 for an unknown mode.
 MCDR_API int32_t MCDR_CALL mcdrSetAntiAliasing(int32_t mode);
 
 // P108 (user m10920): DLSS upscaling on/off, independent of the anti-aliasing mode and of
@@ -590,6 +599,9 @@ MCDR_API void MCDR_CALL mcdr_dx12ReflexMarker(int32_t marker);
 MCDR_API void MCDR_CALL mcdr_dx12SetReflexMode(int32_t mode);
 MCDR_API int32_t MCDR_CALL mcdr_dx12ReflexAvailable(void);
 
+// P131：Reflex 自己的限帧器（微秒/帧，0 = 关闭）。配置项 [dlss] reflexFrameLimitUs 的唯一入口。
+MCDR_API void MCDR_CALL mcdr_dx12SetReflexFrameLimit(int32_t micros);
+
 // ---------------------------------------------------------------------------
 // Device and resources  (was jni_bridge.cpp — 13 exports)
 // ---------------------------------------------------------------------------
@@ -664,6 +676,10 @@ MCDR_API void MCDR_CALL mcdr_dx12DestroyCommandEncoder(mcdr_command_ctx* ctx);
 MCDR_API void MCDR_CALL mcdr_dx12BeginCommandList(mcdr_command_ctx* ctx);
 MCDR_API void MCDR_CALL mcdr_dx12BeginCommandListWithWait(mcdr_command_ctx* ctx, uint64_t waitForValue);
 MCDR_API void MCDR_CALL mcdr_dx12EndCommandList(mcdr_command_ctx* ctx);
+// Fence 语义（per-command-ctx，BUG-03）：mcdr_dx12GetFenceValue 返回该 ctx 的
+// per-command-list 序号，mcdr_dx12WaitForFence 只等待该 ctx 自己的提交，
+// mcdr_dx12Submit 返回的也是同一条时间线上的序号。因此帧 encoder 的 fence token
+// 不会被一次性 encoder（createBuffer(data) 的临时上传）提前满足。
 MCDR_API uint64_t MCDR_CALL mcdr_dx12Submit(mcdr_command_ctx* ctx);
 MCDR_API int32_t MCDR_CALL mcdr_dx12WaitForFence(mcdr_command_ctx* ctx, uint64_t value, int64_t timeoutNs);
 MCDR_API uint64_t MCDR_CALL mcdr_dx12GetFenceValue(mcdr_command_ctx* ctx);
@@ -731,6 +747,27 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12BlitTextureToTexture(mcdr_command_ctx* ctx, 
 MCDR_API int32_t MCDR_CALL mcdr_dx12SharpenTextureToTexture(mcdr_command_ctx* ctx, mcdr_object* src,
                                                         mcdr_object* dst, float amount);
 
+// P152: TAA resolve, native side. Same call point as mcdr_dx12ApplySmaaToTexture (world drawn,
+// GUI not yet), but the cross-frame state lives here: two RGBA16F history textures (ping-pong),
+// the resolve pipeline and the jitter/history bookkeeping are owned by the device context, so
+// the JVM only pushes per-frame values. Two passes: scene + history[read] + motion ->
+// history[write], then a blit (or a 5-tap sharpen when sharpenAmount > 0) back into `scene`,
+// which is left in RENDER_TARGET so the GUI pass can keep using it as an attachment.
+//
+// `motion` may be a texture view (the velocity target is handed over as one) — the native side
+// unwraps it. The jitter values are in pixels and are expected to be already applied to the
+// projection matrix; `reset` != 0 (first frame, teleport, resize, history-generation change)
+// makes this frame bypass the blend. `blend` is the weight of the current frame (1/16 is the
+// usual value); `sharpenAmount` <= 0 selects the plain blit.
+//
+// Returns 1 when TAA really ran this frame, 0 when it was skipped (mode is not TAA, the textures
+// are unsuitable, or an earlier failure disabled it) and -1 when it failed — a failure disables
+// TAA and logs one ERROR. A no-op when the anti-aliasing mode is not TAA.
+MCDR_API int32_t MCDR_CALL mcdr_dx12ApplyTaaToTexture(mcdr_command_ctx* ctx, mcdr_object* scene,
+                                                     mcdr_object* motion, float jitterX, float jitterY,
+                                                     float prevJitterX, float prevJitterY, float blend,
+                                                     int32_t reset, float sharpenAmount);
+
 // `colorTextures` may contain NULL entries (unused attachments); they are
 // skipped. `colorMips` is the per-attachment RTV mip slice. `colorClearFlags`
 // is 0 = load, 1 = clear. `clearColors` holds 4 floats per attachment.
@@ -785,14 +822,124 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12CompileShaderDxc(const char* source, int32_t
                                                      const char* entry, const char* profile, void* outDxil,
                                                      int32_t outCapacity);
 
+// P124（mesh 引入 Step 1）：能力与原因的统一查询 —— 与 UI 置灰的判据同源。
+// 返回 1=支持 0=不支持；outReason 写入 UTF-8 原因（可为 NULL/capacity=0，只查能力）。
+MCDR_API int32_t MCDR_CALL mcdr_dx12QueryMeshSupport(char* outReason, int32_t capacity);
+
 // Creates an amplification/mesh pipeline from DXIL bytecode. Returns NULL and
 // sets the last error when the device does not support mesh shaders (tier 0).
 MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateMeshPipeline(const mcdr_mesh_pipeline_desc* desc);
+
+// 与 mcdr_dx12CreateMeshPipeline 相同，但复用调用方提供的根签名
+// （ID3D12RootSignature* 的地址值，0 = 退回内部按 bindings 新建）。
+//
+// 用途（P129）：地形 mesh 变体要复用现有地形的绑定点布局（b0..b3 / t4 / t5），
+// 而段表、顶点缓冲、索引缓冲是 MS 新需要的尾参。JVM 侧按“地形签名 + 3 个尾参”
+// 建好扩展签名后交进来，mesh PSO 与地形 PSO 才能共用同一套 draw 绑定。
+MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateMeshPipelineWithRootSignature(
+    const mcdr_mesh_pipeline_desc* desc, uint64_t rootSignature);
+
+// 按绑定点布局建根签名（返回 ID3D12RootSignature* 的地址值，失败返回 0）。
+// meshExtras != 0 时追加 mesh 专用尾参：root CBV b8（段表）+ 第二个描述符表（t14 顶点/t15 索引）。
+// meshletCull != 0 时（必须同时 meshExtras）再追加：描述符表多一个 t17（meshlet 包围球）+
+// root 32 位常量 b9（28 个 dword：6 个 float4 视锥平面 + base/count + 2 个 pad）。
+// 非 meshExtras 时带 ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT（图形管线用）；meshExtras 时不能带。
+// 调用方必须用 mcdr_dx12ReleaseRootSignature 释放。
+MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateMeshRootSignature(
+    const mcdr_pipeline_binding_desc* bindings, int32_t count, int32_t meshExtras, int32_t meshletCull);
+MCDR_API void MCDR_CALL mcdr_dx12ReleaseRootSignature(uint64_t rootSignature);
 
 // DispatchMesh with thread-group counts. Requires a mesh pipeline bound through
 // mcdr_dx12SetPipeline, an open render pass, and bindings pushed with
 // mcdr_dx12PushDescriptors. Returns 1 on success.
 MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchMesh(mcdr_command_ctx* ctx, int32_t x, int32_t y, int32_t z);
+
+// P137：mesh 段派发 —— 一次调用把整批地形段交给 mesh 管线的多个 thread group，
+// 替代逐段 DrawIndexed（solid_terrain 一帧 ~350 段）。
+//
+// 数据约定（与 mesh_plan.md 的 HLSL 契约一致）：
+//   * sections：96 字节/段的紧排区块数据（mat4 modelView 0..63、float visibility 64、
+//     ivec2 atlas 68..75、ivec3 区块原点 80..91）—— t16 的 ByteAddressBuffer，
+//     第 i 段的基址 = i*96。
+//   * segments：32 字节/组，{ uint firstIndex; uint indexCount; int baseVertex;
+//     uint sectionIndex; uint indexStride; uint pad0, pad1, pad2; }。firstIndex 相对
+//     indexBuffer 的 SRV 起点（单位＝索引），indexCount 是本组要处理的索引数（≤126），
+//     baseVertex 相对 vertexBuffer 的 SRV 起点，sectionIndex 指向 sections 里的段号，
+//     indexStride = 2（16 位索引）或 4（32 位索引）。
+//   * 每组最多 126 个索引（mesh shader 线程组上限 128，且一段 1536 索引必须切片），
+//     所以 groupCount 通常是 sum(ceil(indexCount/126))。
+//
+// 前置条件：已 mcdr_dx12SetPipeline 绑定派发用的 mesh PSO，并用
+// mcdr_dx12PushDescriptors 推过该 PSO 的普通绑定（地形 CBV + 纹理表）。
+// 本函数只补 mesh 尾参：root CBV b8（段表）+ 描述符表 t14 顶点 / t15 索引 / t16 区块。
+// groupCount > 1024 时按每批 1024 组分多次 DispatchMesh（b8 每次重设偏移）。
+// 返回 1 成功；0 失败（原因见 mcdrLastError()）。
+MCDR_API int32_t MCDR_CALL mcdr_dx12MeshDrawSegments(
+    mcdr_command_ctx* ctx, mcdr_object* vertexBuffer, int64_t vertexOffset, mcdr_object* indexBuffer,
+    int64_t indexOffset, mcdr_object* sections, int64_t sectionsOffset, int64_t sectionsLength,
+    mcdr_object* segments, int64_t segmentsOffset, int32_t groupCount);
+
+// P139：mcdr_dx12MeshDrawSegments 的 indirect 版本 —— 段表与 sections 的约定完全相同，
+// 只是线程组数由 args 缓冲给出（每命令 12 字节：uint ThreadGroupCountX/Y/Z，即
+// D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH 的签名），用 ExecuteIndirect 一次提交
+// maxCommandCount 条次派发。
+//
+// 段表基址仍由 segmentsOffset 决定，所以一次调用覆盖的是"从该基址起的一段连续组"；
+// 超过 1024 组就按批多次调用。args 缓冲必须是 GENERIC_READ（UPLOAD）堆上的资源。
+// 设备不支持 DISPATCH_MESH 签名时返回 0（原因见 mcdrLastError()），调用方回退到 direct。
+MCDR_API int32_t MCDR_CALL mcdr_dx12MeshDrawSegmentsIndirect(
+    mcdr_command_ctx* ctx, mcdr_object* vertexBuffer, int64_t vertexOffset, mcdr_object* indexBuffer,
+    int64_t indexOffset, mcdr_object* sections, int64_t sectionsOffset, int64_t sectionsLength,
+    mcdr_object* segments, int64_t segmentsOffset, mcdr_object* args, int64_t argsOffset,
+    int32_t maxCommandCount);
+
+// P140：带 meshlet 剔除的段派发（配合 meshletCull 根签名 + 带 AS 的 PSO）。
+//
+// 与 mcdr_dx12MeshDrawSegments 的差别只有三处：
+//   * meshletBounds：16 字节/组的包围球表 { float x, y, z, radius }，与段表**同序**、
+//     按"全局组号"索引（t17）；基址由 meshletBoundsOffset 给出（本项目恒为 0）。
+//   * frustumPlanes：6 个 float4 的**视空间**平面（内侧 = dot(n, c) + d >= 0），只用前
+//     cullPlanes 个（本项目第一版只用 4 个侧面）。
+//   * 线程组数按 AS 折算：ceil(组数/128)，AS 逐 meshlet 做球体-视锥测试，把存活的组号
+//     压缩进 payload 再 DispatchMesh(count)，被剔除的组不会启动 mesh shader。
+//
+// 返回 1 成功；0 失败（原因见 mcdrLastError()）。
+MCDR_API int32_t MCDR_CALL mcdr_dx12MeshDrawSegmentsCulled(
+    mcdr_command_ctx* ctx, mcdr_object* vertexBuffer, int64_t vertexOffset, mcdr_object* indexBuffer,
+    int64_t indexOffset, mcdr_object* sections, int64_t sectionsOffset, int64_t sectionsLength,
+    mcdr_object* segments, int64_t segmentsOffset, mcdr_object* meshletBounds, int64_t meshletBoundsOffset,
+    const float* frustumPlanes, int32_t cullPlanes, int32_t groupCount);
+
+// ---------------------------------------------------------------------------
+// P141：meshlet 包围球 —— GPU（compute）生成
+// ---------------------------------------------------------------------------
+// 为什么要它：AS 里的球体-视锥测试需要每个 meshlet 的包围球。CPU 侧拿不到区块顶点字节
+// （区块几何走 UberGpuBuffer 的 staging→heap 拷贝，不经 map），而"在 AS 里逐 meshlet 读
+// 顶点算 AABB"实测会成片多剔（同机位 mean|Δ|=33.99，段级包围球则是 0.20）。因此改为：
+// 先用下面这支 compute pass 从 t14/t15 生成包围球写进 UAV 缓冲，AS 再按 CPU 表（mode 0）读。
+//
+// 根签名（mcdr_dx12CreateMeshBoundsRootSignature）：
+//   param 0 = root CBV b8  —— 段表（与图形侧同一份 32 B/组数据）
+//   param 1 = descriptor table { SRV t14 顶点, SRV t15 索引, UAV u0 包围球 }
+// 包 围 球 = 16 B { float3 center（对象空间 AABB 中心）; float radius }，按组号顺序。
+// 缓冲必须是 usage 位 512（ALLOW_UNORDERED_ACCESS）建的，且长度 >= 组数 * 16。
+MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateMeshBoundsRootSignature(void);
+
+// cs  = DXIL 字节（cs_6_0，入口 bounds_main）；rootSignature 来自上一支。
+// 返回 compute 管线句柄（销毁仍用 mcdr_dx12DestroyPipeline）；失败返回 NULL。
+MCDR_API void* MCDR_CALL mcdr_dx12CreateMeshBoundsPipeline(const void* csDxil, int32_t csLen,
+                                                           uint64_t rootSignature);
+
+// 对前 groupCount 个组生成包围球：第 i 组读段表 meshSegments[i]，结果写
+// bounds[boundsOffset + i*16]。结束后 bounds 处于 NON_PIXEL_SHADER_RESOURCE，
+// 可直接作为 mcdr_dx12MeshDrawSegmentsCulled 的 t17（mode 0）传入。
+// 返回 1 成功；0 失败（原因见 mcdrLastError()）。
+MCDR_API int32_t MCDR_CALL mcdr_dx12MeshBuildBounds(mcdr_command_ctx* ctx, mcdr_pipeline* pipeline,
+                                                    mcdr_object* vertexBuffer, int64_t vertexOffset,
+                                                    mcdr_object* indexBuffer, int64_t indexOffset,
+                                                    mcdr_object* segments, int64_t segmentsOffset,
+                                                    mcdr_object* bounds, int64_t boundsOffset,
+                                                    int32_t groupCount);
 
 // ---------------------------------------------------------------------------
 // Surface  (was jni_bridge_p5.cpp — 13 exports)
@@ -981,3 +1128,4 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12AsyncFenceRegisterCallback(mcdr_fence_mgr* m
 #endif
 
 #endif // MCDR_ABI_H
+

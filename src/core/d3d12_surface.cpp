@@ -14,19 +14,6 @@ import mcdr.error;
 // PresentMode 序数 = 官方枚举 ordinal：
 //   IMMEDIATE=0, MAILBOX=1, FIFO=2, FIFO_RELAXED=3
 // DXGI FLIP 模型支持 {IMMEDIATE, FIFO, FIFO_RELAXED}（MAILBOX 无直接对应）。
-// Diagnostic: fill backbuffer with colored clear instead of copying src texture.
-// Uncomment to test whether the backbuffer通路 itself works.
-// 屏幕变绿 => 通路正常，问题在 src 纹理内容；仍黑屏 => 跳到第三阶段检查 Present。
-// 启用方式：改为 #define DIAG_CLEAR_BACKBUFFER_TO_GREEN 1 并重新编译。
-// 注意：DIAG_CLEAR 路径仅应在 selfTestSurface / testRenderLoop 中临时启用。
-// 游戏正常流程必须保持为 0，否则每帧清屏会覆盖渲染内容。
-#define DIAG_CLEAR_BACKBUFFER_TO_GREEN 0
-// P20: 启用后每 30 帧在 blit 前读回源纹理像素，诊断着色器输出颜色。
-// 结论（已获取）：纯绿 = shader 正确；全黑 = shader 未写入或深度/裁剪问题；旧数据 = 渲染 pass 未执行。
-// P49：默认关闭。该诊断每次执行都 deviceWaitIdle（整卡同步）+ 分配一整个 back buffer
-// 大小的 staging 缓冲 + 9 条 dbgLog（每条含 stderr 与日志文件 flush），且在 Release 中
-// 每 30 帧无条件触发——会周期性打断 P48 多帧飞行的 CPU/GPU 重叠。需要时改为 1 重编译。
-#define DIAG_READBACK_COLOR_TEX 0
 
 namespace d3d12_mc {
 
@@ -37,8 +24,6 @@ std::string hrText(HRESULT hr) {
     snprintf(buf, sizeof(buf), "HRESULT 0x%08lX", static_cast<unsigned long>(hr));
     return buf;
 }
-
-// P100：逐帧追踪开关定义在模块接口（mcdr_device.cppm 的 frameTraceEnabled，inline）。
 
 // 把当前线程消息队列抽干 ms 毫秒。CreateSwapChainForHwnd 返回 E_ACCESSDENIED
 // (0x80070005) 时多为瞬态：窗口刚由 GLFW 创建、DWM 尚未完成重定向，或被第三方
@@ -116,17 +101,13 @@ bool createFactoryViaStreamline(REFIID riid, void** out) {
     }();
     if (fn == nullptr) {
         dbgLogWarn("P112 SL: sl.interposer.dll / CreateDXGIFactory1 unavailable; native factory");
-        std::fprintf(stderr, "P112 SL: interposer unavailable -> native factory\n");
         return false;
     }
     const HRESULT slHr = fn(riid, out);
     if (FAILED(slHr)) {
         dbgLogWarn("P112 SL: interposer CreateDXGIFactory1 %s; native factory", hrText(slHr).c_str());
-        std::fprintf(stderr, "P112 SL: interposer factory failed %s\n", hrText(slHr).c_str());
         return false;
     }
-    dbgLogWarn("P112 SL: DXGI factory created by sl.interposer");
-    std::fprintf(stderr, "P112 SL: DXGI factory via sl.interposer\n");
     return true;
 }
 
@@ -488,40 +469,6 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
         return mcdr::err("createSurface", "device not initialized (call dx12CreateDevice first)");
     }
 
-    // P33 诊断：清空调试层消息（防止自测期间累积的旧消息干扰本次判断）
-    if (ctx.infoQueue) {
-        UINT64 n = ctx.infoQueue->GetNumStoredMessages();
-        if (n > 0) {
-            for (UINT64 i = 0; i < n; ++i) {
-                SIZE_T len = 0;
-                if (FAILED(ctx.infoQueue->GetMessage(static_cast<UINT>(i), nullptr, &len))) continue;
-                std::vector<char> buf(len > 0 ? len : 1);
-                D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
-                if (SUCCEEDED(ctx.infoQueue->GetMessage(static_cast<UINT>(i), msg, &len))) {
-                    const char* sev = "?";
-                    switch (msg->Severity) {
-                        case D3D12_MESSAGE_SEVERITY_CORRUPTION: sev = "CORRUPTION"; break;
-                        case D3D12_MESSAGE_SEVERITY_ERROR: sev = "ERROR"; break;
-                        case D3D12_MESSAGE_SEVERITY_WARNING: sev = "WARNING"; break;
-                        case D3D12_MESSAGE_SEVERITY_INFO: sev = "INFO"; break;
-                        default: break;
-                    }
-                    const int sevInt = static_cast<int>(msg->Severity);
-                    if (sevInt <= static_cast<int>(D3D12_MESSAGE_SEVERITY_ERROR)) {
-                        dbgLogError("PreSwapInfoQueue[%s] %s", sev,
-                                    msg->pDescription ? msg->pDescription : "");
-                    } else if (sevInt == static_cast<int>(D3D12_MESSAGE_SEVERITY_WARNING)) {
-                        dbgLogWarn("PreSwapInfoQueue[%s] %s", sev,
-                                   msg->pDescription ? msg->pDescription : "");
-                    } else {
-                        dbgLogInfo("PreSwapInfoQueue[%s] %s", sev,
-                                   msg->pDescription ? msg->pDescription : "");
-                    }
-                }
-            }
-            ctx.infoQueue->ClearStoredMessages();
-        }
-    }
     DXGI_ADAPTER_DESC devDesc{};
     if (!ctx.adapter) {
         return mcdr::err("createSurface", "createSurface: ctx.adapter is null");
@@ -529,50 +476,10 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
     ctx.adapter->GetDesc(&devDesc);
     dbgLogDebug("createSurface: devLuid=%08X%08X desc=%S", devDesc.AdapterLuid.LowPart,
                 devDesc.AdapterLuid.HighPart, devDesc.Description);
-    std::fflush(stderr);
-    // #region debug-point A:hwnd-validation
-    HWND win = nullptr;
-    LONG_PTR classStyle = 0;
-    if (hwnd != 0) {
-        win = reinterpret_cast<HWND>(hwnd);
-        DWORD wndPid = 0;
-        DWORD wndTid = GetWindowThreadProcessId(win, &wndPid);
-        RECT rc{};
-        BOOL hasRect = GetClientRect(win, &rc);
-        wchar_t className[256]{};
-        GetClassNameW(win, className, 255);
-        classStyle = GetClassLongPtrW(win, GCL_STYLE);
-        dbgLogDebug(
-            "createSurface: isWindow=%d wndTid=%lu wndPid=%lu curTid=%lu curPid=%lu "
-            "clientRect=%ld,%ld-%ld,%ld hasRect=%d classStyle=0x%llx CS_OWNDC=%d CS_CLASSDC=%d "
-            "CS_PARENTDC=%d class=%S",
-            IsWindow(win) ? 1 : 0, static_cast<unsigned long>(wndTid),
-            static_cast<unsigned long>(wndPid), static_cast<unsigned long>(GetCurrentThreadId()),
-            static_cast<unsigned long>(GetCurrentProcessId()), static_cast<long>(rc.left),
-            static_cast<long>(rc.top), static_cast<long>(rc.right), static_cast<long>(rc.bottom),
-            hasRect ? 1 : 0, static_cast<unsigned long long>(classStyle),
-            (classStyle & CS_OWNDC) ? 1 : 0, (classStyle & CS_CLASSDC) ? 1 : 0,
-            (classStyle & CS_PARENTDC) ? 1 : 0, className);
-    }
-    // #endregion
-
-    // P33：CreateSwapChainForHwnd 在部分环境下对所有 tier 返回 E_ACCESSDENIED
-    // (0x80070005，见 Issue #11)。GLFW 窗口类固定带 CS_OWNDC，此处仅作信息记录；
-    // 真正的兜底是 createSwapChainForWindow() 内的多 tier 重试 + Composition 回退。
-    if (win != nullptr && (classStyle & CS_OWNDC) != 0) {
-        dbgLogInfo("createSurface: window class has CS_OWNDC (GLFW); "
-                   "composition fallback available if HWND tiers are denied");
-    }
+    HWND win = hwnd != 0 ? reinterpret_cast<HWND>(hwnd) : nullptr;
 
     ComPtr<IDXGIFactory4> factory;
-    // 诊断：上一次运行在「CS_OWNDC 提示」之后、configureSurface 打印之前静默中断且无任何
-    // 错误输出（见 debug.log）。此处按步骤打点并 fflush，以便把中断位置精确定位到
-    // 具体调用（CreateDXGIFactory1 / EnumAdapters / ctx.adapter 赋值）。
-    dbgLogDebug("createSurface: step=CreateDXGIFactory1 begin");
-    std::fflush(stderr);
     HRESULT hr = createDxgiFactory(factory);
-    dbgLogDebug("createSurface: step=CreateDXGIFactory1 done hr=%08X", static_cast<unsigned>(hr));
-    std::fflush(stderr);
     if (FAILED(hr)) {
         return mcdr::err("createSurface", "CreateDXGIFactory1 failed " + hrText(hr));
     }
@@ -590,18 +497,6 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
             }
         }
     }
-    dbgLogDebug("createSurface: step=adapter-scan done adapter=%p",
-                reinterpret_cast<void*>(ctx.adapter.Get()));
-    std::fflush(stderr);
-
-    // P3.1 诊断：打印 SwapChain 格式，确认不是深度/单通道格式
-    dbgLogInfo("configureSurface: swapchain format=DXGI_FORMAT_R8G8B8A8_UNORM (scFmt=%d)",
-           static_cast<int>(DXGI_FORMAT_R8G8B8A8_UNORM));
-
-    // P33：诊断——打印 HWND 值，帮助排查 E_ACCESSDENIED 问题。
-    dbgLogDebug("dx12CreateSurface: hwnd=0x%llx queue=0x%p", static_cast<unsigned long long>(hwnd),
-                reinterpret_cast<void*>(ctx.queue.Get()));
-    std::fflush(stderr);
 
     // 初始尺寸：composition 回退路径需要真实客户区尺寸；HWND 路径仍用 1x1 占位
     // （由 configureSurface 的 ResizeBuffers 调整到目标尺寸）。
@@ -629,7 +524,6 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
             "falling back to the GL window HWND",
             static_cast<unsigned long>(GetLastError()));
     }
-    std::fflush(stderr);
 
     SwapChainBundle bundle;
     auto swapChainRes = createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, presentChild, initW,
@@ -1017,9 +911,6 @@ mcdr::Result<void> acquireSurface(Dx12Surface* s) {
     // P34 诊断：记录 GetCurrentBackBufferIndex 的原始返回值和 HRESULT
     UINT rawIdx = s->swapChain->GetCurrentBackBufferIndex();
     s->currentImageIndex = static_cast<int>(rawIdx);
-    if (p109TraceEnabled()) {
-        dbgLogInfo("P109 op acquire surface=%p idx=%u", reinterpret_cast<void*>(s), rawIdx);
-    }
     UINT bbCount = static_cast<UINT>(s->backBuffers.size());
     dbgLogDebug("acquireSurface: rawIdx=%u bbCount=%u currentImageIndex=%d", rawIdx, bbCount,
                 s->currentImageIndex);
@@ -1124,11 +1015,6 @@ mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* 
             ctx->resourceState[bb] = D3D12_RESOURCE_STATE_PRESENT;
         }
     }
-    if (p109TraceEnabled()) {
-        dbgLogInfo("P109 op blit ctx=%p idx=%d dst=%p inPass=%d cmd=%p", reinterpret_cast<void*>(ctx),
-                   s->currentImageIndex, reinterpret_cast<void*>(dst), static_cast<int>(ctx->inRenderPass),
-                   reinterpret_cast<void*>(cmd));
-    }
     if (ctx->inRenderPass) {
         // 诊断（限 3 次）：blit 被录在一条**仍打开的 render pass** 里。这是 #538 的可疑成因——
         // blit 会把 back buffer 的 RTV 绑上，而 pass 自己的附件绑定已经被覆盖；pass 结束时
@@ -1145,57 +1031,11 @@ mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* 
     // 源纹理可能是本帧渲染 pass 的输出（RENDER_TARGET/DEPTH_WRITE），或刚
     // 上传完的 COMMON；按跟踪状态过渡到 COPY_SOURCE 再拷贝。
     if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COPY_SOURCE);
-#if DIAG_READBACK_COLOR_TEX
-    // P20 诊断：在 CopyTextureRegion 之前读回源纹理像素，确认 shader 输出颜色。
-    // 必须在拷贝前执行——CopyTextureRegion 是"读源写目标"原子操作，拷贝后源
-    // 内容已不可读；且后续帧可能复用该纹理导致 COMMON→COPY_SOURCE barrier 错配。
-    // 仅每 ~30 帧执行（deviceWaitIdle 同步开销）。
-    // 注意：srcTex 可能在 self-test 路径中为 null（纯 clear），需先判断。
-    if (srcTex) {
-        static int rbCount = 0;
-        if (++rbCount % 30 == 0) {
-            dbgReadbackTexturePixels(srcTex, "colorTex-before-copy");
-        }
-    }
-#endif
 
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = dst;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    // Diagnostic: 用纯红色填充 Backbuffer，验证 backbuffer 通路是否工作。
-    // 屏幕变红 => 通路正常，问题在 src 纹理内容；仍黑屏 => 跳到第三阶段检查 Present。
-#if DIAG_CLEAR_BACKBUFFER_TO_GREEN
-    D3D12_RESOURCE_BARRIER clearBarrier{};
-    clearBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    clearBarrier.Transition.pResource = dst;
-    clearBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    clearBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    clearBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    cmd->ResourceBarrier(1, &clearBarrier);
-    dbgLogDebug("blitSurface: after clear barrier transition");
-    float greenColor[4] = {0.0f, 1.0f, 0.0f, 1.0f};
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = s->rtvHandles[(size_t)s->currentImageIndex];
-    dbgLogDebug("blitSurface: rtv ptr=%p idx=%d", (void*)rtv.ptr, s->currentImageIndex);
-    cmd->ClearRenderTargetView(rtv, greenColor, 0, nullptr);
-    dbgLogDebug("blitSurface: after ClearRenderTargetView");
-    clearBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    clearBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    cmd->ResourceBarrier(1, &clearBarrier);
-    dbgLogDebug("DIAG_CLEAR_BACKBUFFER_TO_GREEN: backbuffer filled green, w=%u h=%u", w, h);
-    // P11：与 #else 路径保持一致——源纹理显式回切 COMMON，避免残留 COPY_SOURCE
-    // 状态导致下一帧 beginRenderPass 的 COMMON→RENDER_TARGET barrier 错配（ERROR）。
-    if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
-    // backbuffer 需回退到 PRESENT，否则下一帧 beginRenderPass 按 COMMON/PRESENT
-    // 写 StateBefore 会与实际的 COPY_DEST 错配（ERROR）。
-    D3D12_RESOURCE_BARRIER backToPresent{};
-    backToPresent.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    backToPresent.Transition.pResource = dst;
-    backToPresent.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    backToPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    backToPresent.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    cmd->ResourceBarrier(1, &backToPresent);
-#else
     // srcTex 为 null 时（首次/自检路径）：backbuffer 内容未定义（驱动常显示
     // 红/杂色），用纯黑 clear 兜底避免启动红屏，再回切 PRESENT。
     if (!srcTex) {
@@ -1300,7 +1140,6 @@ mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* 
         // 7. 源纹理 → COMMON（为下一帧 beginRenderPass 准备）
         if (srcTex) transitionTextureTo(ctx, srcTex, D3D12_RESOURCE_STATE_COMMON);
     }
-#endif
     // P6 诊断：源纹理实际尺寸（拷贝是 min(源, backbuffer) 区域，若源比窗口小
     // 画面会留黑边；若源未渲染则纯色）。
     // srcTex 为 null 时（纯 clear 路径）跳过诊断日志，避免解引用空指针。
@@ -1321,21 +1160,6 @@ mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* 
     s->lastBlitIndex = s->currentImageIndex;
     // P95：本帧已有内容 —— presentSurface 只在这种情况下才 Present。
     s->blittedThisFrame.store(true, std::memory_order_release);
-    // P100：逐帧追踪（MCDR_FRAME_LOG=1）——本帧 blit 的源/目标 + 本帧累计清屏次数。
-    if (frameTraceEnabled()) {
-        static unsigned long long p100BlitFrames = 0;
-        ++p100BlitFrames;
-        DeviceContext& dc = deviceContext();
-        dbgLogInfo("P100 blit: blitFrame=%llu src=%p dst=%p idx=%d clearColor=%llu clearDepth=%llu "
-                   "clearColorRgn=%llu clearDepthRgn=%llu lastClearColor=%p lastClearDepth=%p srcMatchesClear=%d",
-                   p100BlitFrames, reinterpret_cast<const void*>(srcTex), reinterpret_cast<const void*>(dst),
-                   s->currentImageIndex, static_cast<unsigned long long>(dc.clearColorCalls),
-                   static_cast<unsigned long long>(dc.clearDepthCalls),
-                   static_cast<unsigned long long>(dc.clearColorRegionCalls),
-                   static_cast<unsigned long long>(dc.clearDepthRegionCalls), dc.lastClearColorTexture,
-                   dc.lastClearDepthTexture,
-                   (srcTex != nullptr && dc.lastClearColorTexture == static_cast<const void*>(srcTex)) ? 1 : 0);
-    }
     return {};
 }
 
@@ -1472,10 +1296,6 @@ void presentSurface(Dx12Surface* s) {
     if (!s || !s->swapChain) {
         return;
     }
-    if (p109TraceEnabled()) {
-        dbgLogInfo("P109 op present surface=%p idx=%d blitted=%d", reinterpret_cast<void*>(s),
-                   s->currentImageIndex, static_cast<int>(s->blittedThisFrame.load()));
-    }
     // P109（#538 修复）状态约定：back buffer 的 RT→PRESENT 过渡**不能**在这里做——
     // 本函数跑在渲染线程上，调用时该帧的命令列表早已 Close+Execute（见
     // d3d12_device.cpp 的 renderThreadFunc：submitCommandList → presentSurface），
@@ -1538,16 +1358,6 @@ void presentSurface(Dx12Surface* s) {
     if (logThisPresent) {
         dbgLogInfo("presentSurface: idx=%d sync=%u flags=%u tearing=%d suboptimal=%d", s->currentImageIndex,
                    syncInterval, flags, static_cast<int>(s->allowTearing), static_cast<int>(s->suboptimal));
-    }
-    // P100：逐帧追踪（MCDR_FRAME_LOG=1）——本帧 present 前的清屏计数（blit 行是同一帧的配对行）。
-    if (frameTraceEnabled()) {
-        static unsigned long long p100PresentFrames = 0;
-        ++p100PresentFrames;
-        DeviceContext& dc = deviceContext();
-        dbgLogInfo("P100 present: presentFrame=%llu idx=%d clearColor=%llu clearDepth=%llu lastClearColor=%p",
-                   p100PresentFrames, s->currentImageIndex,
-                   static_cast<unsigned long long>(dc.clearColorCalls),
-                   static_cast<unsigned long long>(dc.clearDepthCalls), dc.lastClearColorTexture);
     }
     // P113：Reflex 要求 Present 之前 sleep（文档 ProgrammingGuideReflex.md §5）。
     mcdr_reflex_before_present();

@@ -101,13 +101,16 @@ int setPixCapture(bool enabled);
 int setShadingRate(int rate);
 
 // P104：抗锯齿模式（来自 Java 侧的视频设置选项 dxrMcAaMode，与 VRS 一样**不需要重启**）。
-// mode 取值与 Kotlin 的 D3D12AntiAliasing 一致：**0=OFF 1=SMAA 2=TAA 3=DLAA**（2/3 仍未实现，
-// 按 OFF 处理并在设置时 WARN 一次）。目前真正实现的是 SMAA（applySmaaToTexture 就地三趟）。
+// mode 取值与 Kotlin 的 D3D12AntiAliasing 一致：**0=OFF 1=SMAA 2=TAA 3=DLAA**。
+// P152 起 1 与 2 都真正实现了：1 = SMAA（applySmaaToTexture 就地三趟，形态学、单帧），
+// 2 = TAA（applyTaaToTexture，时域累积，历史纹理乒乓由本模块持有）。3 = DLAA 仍由 DLSS
+// 特性实现（JVM 侧把它映射成 OFF 再传下来，见 setDlssQuality 的档位 3），所以这里收到 3
+// 也只是"无 native 后处理"。
 //
 // P108（用户 m10920）：**DLSS 已从这个枚举里拆出去**，改用独立开关 setDlssEnabled / 独立选项
 // dxrMcDlss。抗锯齿与 DLSS 现在互相独立：两者都开时先对低分辨率世界层做 SMAA，再由 DLSS
 // 升采样到窗口尺寸（见 applySmaaToTexture / applyDlssToTexture 的注释）。
-// 返回 1=接受（该模式已生效） 0=该模式尚未实现（TAA/DLAA，等价于关） -1=非法取值。
+// 返回 1=接受（该模式已生效） 0=该模式尚未实现（DLAA，等价于关） -1=非法取值。
 int setAntiAliasing(int mode);
 // 模式名（日志用）：OFF / SMAA / TAA / DLAA / UNKNOWN(n)。
 const char* antiAliasingName(int mode);
@@ -199,19 +202,14 @@ struct DeviceContext {
     // P6：ExecuteIndirect 用 command signature（DrawIndexedInstanced / DrawInstanced）
     ComPtr<ID3D12CommandSignature> cmdSigIndexed;
     ComPtr<ID3D12CommandSignature> cmdSigNonIndexed;
+    // P139：mesh 段派发的 indirect 变体（D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH，
+    // ByteStride 12 = 三个 UINT 的线程组数）。AS 剔除要按 GPU 侧的计数派发，
+    // 而 ExecuteIndirect 必须先有这条 command signature。
+    ComPtr<ID3D12CommandSignature> cmdSigMesh;
 
     UINT srvInc = 0, rtvInc = 0, dsvInc = 0, samplerInc = 0;
     UINT drawInc = 0;  // == srvInc（同属 CBV_SRV_UAV 堆类型）
 
-    // P100：逐帧清屏追踪（低成本纯计数）。clear*Texture 累加，asyncRenderBeginFrame 每帧清零，
-    // blitSurface/presentSurface 在 MCDR_FRAME_LOG=1 时打印。目的：定位「本帧到底清没清屏、
-    // 清的是不是被 blit 的那张 RT」——叠帧（旧内容透过新画面）+ 亮度骤增都指向这一条。
-    uint64_t clearColorCalls = 0;
-    uint64_t clearDepthCalls = 0;
-    uint64_t clearColorRegionCalls = 0;
-    uint64_t clearDepthRegionCalls = 0;
-    const void* lastClearColorTexture = nullptr;
-    const void* lastClearDepthTexture = nullptr;
 
     std::string adapterName;
     ComPtr<IDXGIAdapter> adapter;  // 与 device 绑定的 DXGI adapter（用于 CreateDXGIFactoryForAdapter）
@@ -371,6 +369,30 @@ struct DeviceContext {
     // 一次致命失败（描述符堆耗尽等）后彻底关闭 SMAA：避免每帧重试刷日志，也避免把
     // 中间纹理留在与预期不符的状态上继续用。
     bool smaaDisabled = false;
+
+    // -----------------------------------------------------------------------
+    // P152：TAA 的跨帧状态。
+    // 历史纹理由**本模块自己持有**（JVM 不再建 2560x1334 的 RGBA16F 乒乓）：按主目标尺寸
+    // 懒创建，尺寸变化时整组重建。两张乒乓 —— read 是上一帧的输出，write 是本帧的渲染目标。
+    // -----------------------------------------------------------------------
+    ComPtr<ID3D12Resource> taaHistory[2];
+    D3D12_CPU_DESCRIPTOR_HANDLE taaHistoryRtv[2]{};
+    UINT64 taaWidth = 0;
+    UINT64 taaHeight = 0;
+    // 两张历史纹理的 RTV 堆（2 槽、NONE-visibility）。不用 allocRtvHandle 的理由同 SMAA：
+    // 那是持久单调分配，resize 重建中间纹理时每轮都会泄漏槽位。
+    ComPtr<ID3D12DescriptorHeap> taaRtvHeap;
+    // resolve 管线：根参数 0 = 12 个 32-bit 参数（10 个有效 + 2 个对齐 pad），根参数 1 =
+    // t1..t3 三张 SRV；PS 全用 Load + 手算双线性，所以没有采样器。
+    ComPtr<ID3D12RootSignature> taaRootSig;
+    ComPtr<ID3D12PipelineState> taaPso;
+    int taaReadIndex = 0;
+    int taaWriteIndex = 1;
+    bool taaHistoryValid = false;  // false ⇒ 本帧 resolve 以 reset=1 开始（历史不可信）
+    bool taaDisabled = false;      // 一次致命失败后永久关闭，避免每帧重试刷日志
+    bool taaUnavailableLogged = false;  // 建管线失败 / 目标不适用只报一次
+    bool taaSharpenFallbackWarned = false;  // 锐化趟失败退回纯 blit 只 WARN 一次
+    UINT64 taaAppliedFrames = 0;            // 已应用帧数（首帧打一行 INFO 便于实机确认）
 };
 
 // ---------------------------------------------------------------------------
@@ -439,30 +461,6 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
 // JNI 层访问设备上下文（读 adapterName/featureLevel）。
 DeviceContext& deviceContext();
 
-// P100：逐帧追踪开关（环境变量 MCDR_FRAME_LOG=1）。开启后 clear* / blitSurface /
-// presentSurface 每帧各打一行，用于判定「本帧清没清屏、清的是不是被 blit 的那张 RT、
-// 有没有 present 却没 blit 的帧」——叠帧（旧内容透过新画面）、亮度骤增、黑屏一瞬
-// 这三个症状都落在这条链上。默认关闭（每帧多行 INFO 会显著放慢启动加载）。
-inline bool frameTraceEnabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("MCDR_FRAME_LOG");
-        return v != nullptr && v[0] == '1';
-    }();
-    return enabled;
-}
-
-// P109（诊断，默认关）：按顺序记录 render-op（begin/end render pass、blit、draw、
-// present、acquire、begin list）序列，用于定位"某条 draw 的绑定跟预期不一致"这类
-// 状态错配（#538：把 COMMON|PRESENT 的 back buffer 当 RENDER_TARGET 画）。
-// 只写日志、**不发任何 GPU 调用**，因此不会像 D.9 里的 raw barrier 那样与
-// ctx->resourceState 分叉。环境变量 MCDR_P109_TRACE=1 打开。
-inline bool p109TraceEnabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("MCDR_P109_TRACE");
-        return v != nullptr && v[0] == '1';
-    }();
-    return enabled;
-}
 
 
 
@@ -544,6 +542,17 @@ struct Dx12Pipeline {
     // P72：mesh 管线（AS/MS）标记。mesh PSO 没有 IA 阶段，setPipeline 不再设置
     // IASetPrimitiveTopology（IA 状态对 mesh 管线无效，且 PSO 里本就不含输入布局）。
     bool isMesh = false;
+    // P137：mesh 尾参在根签名里的参数索引（建根签名时按 CBV 稠密编号 + 地形 SRV 表
+    // 的实际排版算出来，再经 createMeshPipeline 抄进来）。PushDescriptors 只设到地形
+    // SRV 表（索引 = CBV 个数），b8 段表与 t14/t15/t16 表由 drawMeshSegments 补。
+    // 0 表示该 PSO 没有 mesh 尾参。
+    UINT segmentParam = 0;
+    UINT geometryParam = 0;
+    // P140：meshlet 剔除。cullParam != 0 表示根签名里有 b9 root 常量（视锥 + 本批基址/组数）；
+    // hasAs 表示 PSO 真的带 amplification shader —— 此时派发的线程组数是 ceil(组数/128)，
+    // 由 AS 再压缩成实际的 mesh 组数。
+    UINT cullParam = 0;
+    bool hasAs = false;
 };
 
 
@@ -670,6 +679,10 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx);
 mcdr::Result<void> waitForFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs);
 // 当前 fence value（Java 侧 createFence 记录用）。
 UINT64 currentFenceValue(CommandContext* ctx);
+// 等待**该 ctx 自己**的 per-command-list fence 达到 value（Kotlin GpuFence.awaitCompletion
+// 的落点，BUG-03）。token 只由这个 ctx 的提交推进，与其它 encoder 解耦；timeoutNs 为纳秒，
+// 超时返回 err("… timed out after …ns")，由调用方决定是否当作失败。
+mcdr::Result<void> waitForContextFenceValue(CommandContext* ctx, UINT64 value, UINT64 timeoutNs);
 
 // ---------------------------------------------------------------------------
 // P33 async：独立 C++ 渲染线程（渲染工作从主线程剥离）
@@ -931,6 +944,23 @@ mcdr::Result<void> blitBindSourceTexture(CommandContext* ctx, Dx12Object* srcTex
 // 世界层上，然后由 applyDlssToTexture 把它升采样到窗口尺寸。
 bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex);
 
+// P152：TAA（时域抗锯齿）—— 与 applySmaaToTexture 同一个调用点（世界层画完、GUI 之前），
+// 区别是状态在**本模块**里跨帧保留（历史纹理乒乓 + jitter），JVM 每帧只送参数。
+//
+// 两趟：① scene(t1) + history[read](t2) + motion(t3) → history[write]（RGBA16F，在 YCoCg
+// 空间做 variance clipping，混合权重恒为 1-blend）；② history[write] 回填进 scene（锐化量
+// > 0 时走 sharpen PSO，否则纯采样 blit —— 历史是 16F、主目标是 8 位，不能 CopyResource）。
+//
+// jitter 是**投影矩阵里已经加进去的**亚像素偏移（像素单位，与 D3D12Temporal 同约定），本函数
+// 不改矩阵：它把本帧颜色重采样回未抖动网格，再按运动矢量把历史取回来。reset != 0（首帧 /
+// 传送 / 改分辨率 / 历史代变化）时本帧直接输出原始样本、不参与混合。
+//
+// 返回 1 = 已应用；0 = 跳过（参数不适用 / 场景格式不是 RGBA8 / 已被一次性闸门关掉）；
+// -1 = 失败。任何失败都只报一次并永久关闭，调用方保持既有画面即可。
+int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion, float jitterX,
+                      float jitterY, float prevJitterX, float prevJitterY, float blend, int reset,
+                      float sharpenAmount);
+
 // P108：DLSS 的跨帧上采样入口（真实 NVSDK_NGX 评价调用）。
 //
 // 与 applySmaaToTexture **同一个调用点**（世界画完、GUI 之前），但目标不同：SMAA 是
@@ -995,6 +1025,45 @@ mcdr::Result<void> drawInstanced(CommandContext* ctx, UINT vertexCount, UINT ins
 mcdr::Result<void> drawIndexedIndirect(CommandContext* ctx, Dx12Object* commands, long long offset,
                                        UINT drawCount);
 mcdr::Result<void> drawIndirect(CommandContext* ctx, Dx12Object* commands, long long offset, UINT drawCount);
+
+// P137：mesh 段派发。sections = 96 B/段（t16）、segments = 32 B/组（b8，≤1024 组/批）、
+// vertexBuffer/indexBuffer 走 t14/t15 的 RAW SRV（R32_TYPELESS + BUFFER_SRV_FLAG_RAW，
+// 供 ByteAddressBuffer 读取）。普通绑定仍由 pushDescriptors 负责，本函数只补 tail 参数。
+mcdr::Result<void> drawMeshSegments(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
+                                    Dx12Object* indexBuffer, long long indexOffset, Dx12Object* sections,
+                                    long long sectionsOffset, long long sectionsLength, Dx12Object* segments,
+                                    long long segmentsOffset, int groupCount);
+
+// P140：带 meshlet 剔除的段派发。meshletBounds = 16 B/组的包围球表（t17，与段表同序，
+// 索引是"全局组号"）；frustumPlanes = 6 个 float4 视空间平面（内侧 dot(n,c)+d >= 0），
+// 只用前 cullPlanes 个。已绑定的 PSO 必须 hasAs（AS 才会按压缩后的数量派发 mesh 组）。
+// 段表之外的四个缓冲都可以为 null（null = 该 PSO 没有对应尾参）。
+mcdr::Result<void> drawMeshSegmentsCulled(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
+                                          Dx12Object* indexBuffer, long long indexOffset, Dx12Object* sections,
+                                          long long sectionsOffset, long long sectionsLength, Dx12Object* segments,
+                                          long long segmentsOffset, Dx12Object* meshletBounds,
+                                          long long meshletBoundsOffset, const float* frustumPlanes, int cullPlanes,
+                                          int groupCount);
+
+// P139：同一个段派发的 indirect 版本。args 里每条 12 字节（DISPATCH_MESH 的
+// ThreadGroupCountX/Y/Z），maxCommandCount 条命令都读同一个 b8 段表基址 ⇒ 调用方
+// 每次只覆盖一批（≤1024 组），大于一批时按批多次调用。语义与 drawMeshSegments 一致，
+// 只是线程组数改由 GPU 侧缓冲给出（AS 剔除后要按 GPU 计数派发就走这条）。
+mcdr::Result<void> drawMeshSegmentsIndirect(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
+                                            Dx12Object* indexBuffer, long long indexOffset, Dx12Object* sections,
+                                            long long sectionsOffset, long long sectionsLength, Dx12Object* segments,
+                                            long long segmentsOffset, Dx12Object* args, long long argsOffset,
+                                            int maxCommandCount);
+
+// P141：用 compute 管线为每个 meshlet 组生成对象空间包围球（16 B：center.xyz + radius），
+// 写进 bounds（必须是用 usage 位 512 建的 UAV 缓冲）。pipeline 是 createMeshBoundsPipeline
+// 交出的句柄（= Dx12Pipeline*，withDepth 承载 CS PSO）。groupCount 与段表的组数一致：
+// 第 i 组读 meshSegments[i]，结果写 bounds[boundsOffset + i*16]。
+// 结束后 bounds 处于 NON_PIXEL_SHADER_RESOURCE，可直接作为 AS 的 t17 读取。
+mcdr::Result<void> buildMeshletBounds(CommandContext* ctx, Dx12Pipeline* pipeline, Dx12Object* vertexBuffer,
+                                      long long vertexOffset, Dx12Object* indexBuffer, long long indexOffset,
+                                      Dx12Object* segments, long long segmentsOffset, Dx12Object* bounds,
+                                      long long boundsOffset, int groupCount);
 
 // ---------------------------------------------------------------------------
 // Surface（P5）：DXGI swapchain（镜像官方 VulkanGpuSurface）。
