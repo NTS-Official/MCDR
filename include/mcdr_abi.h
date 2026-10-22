@@ -287,6 +287,51 @@ MCDR_API void MCDR_CALL mcdr_dx12SetEnvironment(const char* name, const char* va
 // paths that were searched). Idempotent.
 MCDR_API int32_t MCDR_CALL mcdrSetPixCapture(int32_t enabled);
 
+// Where PIX's DLLs live: the mod's [debug] pixDirectory config, which may name a DLL itself or
+// the directory holding them. This exists because locating the DLLs has to be a documented
+// setting, not an environment variable — the project rule is that every switch and every path
+// the player can change goes through the NeoForge config and a dedicated entry point here
+// (an env var is an entry point nobody can find in the config screen).
+// Call it before mcdrSetPixCapture: the layer has to be loaded before the first device is
+// created, so the path has to be known that early. An empty string clears the setting and
+// restores automatic detection (next to MCDR.dll, then the newest %ProgramFiles%\Microsoft
+// PIX\<version>). Returns 1 when the path was accepted, 0 when it was cleared, and -1 when it is
+// not valid UTF-8 or does not exist (a WARN line says which).
+MCDR_API int32_t MCDR_CALL mcdrSetPixDirectory(const char* utf8Path);
+
+// PIX timing capture, driven by this process instead of by PIX's UI. PIX's own continuous
+// ("counters") recording keeps everything inside the PIX session — nothing reaches the disk
+// unless the user saves it — while a GPU capture taken by attaching lands in
+// %TEMP%\*.wpix. A capture that has to appear under the game directory therefore has to be
+// started from inside the process: PIXBeginCapture(PIX_CAPTURE_TIMING, {file_name}) ...
+// PIXEndCapture(0). The runtime and capturer DLLs are loaded by mcdrSetPixCapture (they hook
+// D3D12/ETW as they load, so they want to be in place before the first device), and
+// mcdrStartPixTimingCapture loads them lazily if that has not happened yet.
+//
+// `utf8Path` is the full path of the .wpix to write; the caller creates the directory. The
+// call is made on a thread of its own because PIX's runtime sets up COM on load and the render
+// thread's apartment is already fixed (calling from there answers RPC_E_CHANGED_MODE).
+// Returns 1 when the capture started, 0 when one was already running, and on failure the
+// HRESULT that explains it (always negative), so the caller can show the code as-is:
+// E_FAIL when the runtime DLLs could not be loaded, E_INVALIDARG for an empty path,
+// HRESULT_FROM_WIN32(ERROR_TIMEOUT) when PIX did not answer in time, and PIX's own code
+// otherwise (E_ACCESSDENIED = the process is not elevated, ERROR_ALREADY_EXISTS = a capture
+// session from an earlier run is still alive). mcdrLastError() carries the readable reason.
+// A timing capture records through ETW sessions. PIX's documentation says membership in the
+// built-in `Performance Log Users` group (S-1-5-32-559) is enough; on this machine it is NOT
+// (measured 2026-10-21: the group was active and enabled and the call still returned
+// E_ACCESSDENIED, while the same call in an elevated process returned S_OK and wrote the
+// file). Elevation is therefore required here, and because gradle reuses a daemon it has to
+// be an elevated launch with `--no-daemon` (or `gradlew --stop` first).
+MCDR_API int32_t MCDR_CALL mcdrStartPixTimingCapture(const char* utf8Path);
+
+// Stops the capture that mcdrStartPixTimingCapture started. PIX writes the file out on its own
+// thread, so this returns without waiting (a capture with the memory events on is hundreds of
+// megabytes and would otherwise stall the frame that called it). Returns 1 when a stop was
+// requested, 0 when nothing was recording, and a negative HRESULT when the writer thread could
+// not be started.
+MCDR_API int32_t MCDR_CALL mcdrStopPixTimingCapture(void);
+
 // Variable-rate shading: the shading-rate control point. `rate` is a raw
 // D3D12_SHADING_RATE value (1X1=0x0, 1X2=0x1, 2X1=0x4, 2X2=0x5, 2X4=0x6, 4X2=0x9,
 // 4X4=0xA) and applies to every graphics command list the renderer starts from then

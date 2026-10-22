@@ -92,6 +92,21 @@ void setLogLevel(int level);
 // 之前**调用（捕获层靠挂钩 D3D12 工作），幂等；返回 1=已载入 0=未请求 -1=请求了但没载入。
 int setPixCapture(bool enabled);
 
+// PIX 的 dll 在哪儿（配置项 [debug] pixDirectory，mcdrSetPixDirectory）：给 dll 全路径本身，或
+// 它们所在的目录。空字符串 = 清掉、回到自动检测（MCDR.dll 同目录 → %ProgramFiles% 下最新版）。
+// 要在 setPixCapture() 之前调用，载入时机在第一次 D3D12 设备创建之前。
+// 返回 1=已设置 0=已清空 -1=路径无效（不是 UTF-8，或不存在）。
+int setPixDirectory(const char* utf8Path);
+
+// PIX 程序化 timing 捕获（mcdrStartPixTimingCapture / mcdrStopPixTimingCapture）。与 GPU 捕获层
+// 不同，这两个是真的让 PIX 去录一段并把结果写成 .wpix —— 因为 PIX 界面上的持续捕获只把数据
+// 留在 PIX 会话里，不 Save 就没有文件。路径是 UTF-8 的 .wpix 全路径，目录由调用方建好。
+// start 返回 1=已开始 0=已经在录 负值=失败的 HRESULT（调用方直接把码显示给玩家；E_ACCESSDENIED
+// 表示进程没提权 —— 本机实测 Performance Log Users 组不够。可读原因仍在日志里）；
+// stop 返回 1=已请求 0=没有在录 负值=失败的 HRESULT。stop 不等写盘：PIX 在另一条线程上落盘。
+int startPixTimingCapture(const char* utf8Path);
+int stopPixTimingCapture();
+
 // P97：VRS 着色粒度控制点。rate = 原始 D3D12_SHADING_RATE（1X1=0x0 1X2=0x1 2X1=0x4
 // 2X2=0x5 2X4=0x6 4X2=0x9 4X4=0xA），-1 = 关闭（一个 RSSetShadingRate 都不调用，设备
 // 保持默认 1X1）。取值只存进 DeviceContext，真正的落到命令列表由 applyShadingRate()

@@ -98,6 +98,10 @@ bool PartitionedDescriptorAllocator::writeCBV(UINT slot, ID3D12Resource* buffer,
 
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
     cbv.BufferLocation = buffer->GetGPUVirtualAddress() + offset;
+    // D3D12_CONSTANT_BUFFER_VIEW_DESC.BufferLocation 必须 256 字节对齐。基址天然对齐，
+    // 所以能违反它的只有调用方给的 offset —— 宁可写不出描述符（调用方拿 0 去报错），
+    // 也不要交出一张会让 shader 读错位的视图。
+    if (cbv.BufferLocation % 256ULL != 0) return false;
     UINT64 aligned = (size + 255) & ~255ULL;
     if (aligned == 0) aligned = 256;
     cbv.SizeInBytes = static_cast<UINT>(std::min<UINT64>(aligned, 0xFFFFFFFFULL));

@@ -212,6 +212,22 @@ int32_t MCDR_CALL mcdrSetPixCapture(int32_t enabled) {
     return d3d12_mc::setPixCapture(enabled != 0);
 }
 
+int32_t MCDR_CALL mcdrSetPixDirectory(const char* utf8Path) {
+    // Where to find PIX's DLLs, from the [debug] pixDirectory config. Must arrive before
+    // mcdrSetPixCapture: the layer is loaded before the first D3D12 device exists.
+    return d3d12_mc::setPixDirectory(utf8Path);
+}
+
+int32_t MCDR_CALL mcdrStartPixTimingCapture(const char* utf8Path) {
+    // The one capture PIX's UI cannot produce for us: its continuous recording stays inside
+    // the PIX session, so a file only exists once the process drives PIXBeginCapture itself.
+    return d3d12_mc::startPixTimingCapture(utf8Path);
+}
+
+int32_t MCDR_CALL mcdrStopPixTimingCapture(void) {
+    return d3d12_mc::stopPixTimingCapture();
+}
+
 int32_t MCDR_CALL mcdrSetShadingRate(int32_t rate) {
     // P97. rate is a raw D3D12_SHADING_RATE (1X1=0x0 1X2=0x1 2X1=0x4 2X2=0x5 2X4=0x6
     // 4X2=0x9 4X4=0xA), -1 = off. Returns 1=accepted (including "the device does not

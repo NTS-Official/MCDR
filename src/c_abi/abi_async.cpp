@@ -79,6 +79,23 @@ void logFail(const char* what) {
     std::fflush(stderr);
 }
 
+// The bundle path binds CBVs as root descriptors exactly like the sync path, so it
+// inherits the same D3D12 rule: the GPU address must be a multiple of 256. Those
+// offsets come from the JVM, and an unaligned one yields shader-side garbage rather
+// than a driver error, so report it here instead of recording an invalid list.
+void logAlignmentFail(const char* what, long long offset) {
+    char line[1024];
+    const int n = d3d12_mc::formatLogPrefix(line, sizeof(line), "ERROR", "dx12");
+    if (n > 0 && static_cast<size_t>(n) < sizeof(line)) {
+        std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n),
+                      "%s: CBV is not 256-byte aligned (buffer offset=%lld)", what, offset);
+        std::fprintf(stderr, "%s\n", line);
+    } else {
+        std::fprintf(stderr, "[dx12] %s: CBV is not 256-byte aligned (offset=%lld)\n", what, offset);
+    }
+    std::fflush(stderr);
+}
+
 // Shared body of mcdr_dx12AsyncBundleRecordPartition for both indexing modes.
 int32_t recordPartition(PartitionedDescriptorAllocator* a, BundleRecorder* r, int32_t baseSlot,
                         int32_t bindingCount, int32_t sharedBindings, const mcdr_binding_slot* bindings,
@@ -168,8 +185,13 @@ int32_t recordPartition(PartitionedDescriptorAllocator* a, BundleRecorder* r, in
             if (b.offset < 0) {
                 return 0;
             }
-            r->setRootConstantBufferView(static_cast<UINT>(ci), buf->resource->GetGPUVirtualAddress()
-                                                                    + static_cast<UINT64>(b.offset));
+            const D3D12_GPU_VIRTUAL_ADDRESS cbvVa =
+                buf->resource->GetGPUVirtualAddress() + static_cast<UINT64>(b.offset);
+            if (cbvVa % 256ULL != 0) {
+                logAlignmentFail(what, b.offset);
+                return 0;
+            }
+            r->setRootConstantBufferView(static_cast<UINT>(ci), cbvVa);
             ++ci;
         }
     }
@@ -213,8 +235,13 @@ int32_t recordPartition(PartitionedDescriptorAllocator* a, BundleRecorder* r, in
                 if (b.offset < 0) {
                     return 0;
                 }
-                r->setRootConstantBufferView(static_cast<UINT>(cbvIdx), buf->resource->GetGPUVirtualAddress()
-                                                                            + static_cast<UINT64>(b.offset));
+                const D3D12_GPU_VIRTUAL_ADDRESS cbvVa =
+                    buf->resource->GetGPUVirtualAddress() + static_cast<UINT64>(b.offset);
+                if (cbvVa % 256ULL != 0) {
+                    logAlignmentFail(what, b.offset);
+                    return 0;
+                }
+                r->setRootConstantBufferView(static_cast<UINT>(cbvIdx), cbvVa);
                 ++cbvIdx;
             }
         }
@@ -373,6 +400,11 @@ int32_t MCDR_CALL mcdr_dx12AsyncDescriptorWriteCBV(mcdr_desc_alloc* alloc, int32
     }
     if (slot < 0 || offset < 0 || size < 0) {
         return 0;
+    }
+    // Descriptor-heap CBV, same 256-byte address rule as the root-descriptor paths.
+    if ((buf->resource->GetGPUVirtualAddress() + static_cast<UINT64>(offset)) % 256ULL != 0) {
+        return mcdr::abi::failWith("mcdr_dx12AsyncDescriptorWriteCBV",
+                                   "CBV is not 256-byte aligned (buffer offset=" + std::to_string(offset) + ")");
     }
     return alloc->writeCBV(static_cast<UINT>(slot), buf->resource.Get(), static_cast<UINT64>(offset),
                            static_cast<UINT64>(size))
