@@ -60,7 +60,7 @@
          The project is C++23 (/std:c++latest) on MSVC v145 by requirement; the
          D3D12/DXGI headers are clean at /W3 under it. -->
     <ClCompile>
-      <WarningLevel>Level4</WarningLevel>
+      <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpplatest</LanguageStandard>
