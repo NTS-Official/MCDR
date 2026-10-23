@@ -921,8 +921,11 @@ void destroyPipeline(Dx12Pipeline* pipeline);
 // 光栅器自动做格式转换，无需手动 resolve。
 // ---------------------------------------------------------------------------
 struct BlitPipeline {
-    ComPtr<ID3D12RootSignature> rootSig;  // SRV(t0) + sampler(s0)
-    ComPtr<ID3D12PipelineState> pso;  // noDepth, noBlend, noCull
+    ComPtr<ID3D12RootSignature> rootSig;  // SRV(t0) + sampler(s0) + 32-bit constants(b1)
+    ComPtr<ID3D12PipelineState> pso;  // noDepth, noBlend, noCull —— RTV = R8G8B8A8_UNORM（SDR）
+    // P197：HDR 变体。RTV = R16G16B16A16_FLOAT（scRGB），PS 把 sRGB 采样值解码成线性再乘
+    // SDR 白点权重（SDRWhiteLevel/80）——scRGB 的 1.0 定义为 80 nits。
+    ComPtr<ID3D12PipelineState> psoHdr;
     ComPtr<ID3D12Resource> vertBuf;  // 4 vertices, R32G32 + R32G32
     ComPtr<ID3D12Resource> idxBuf;  // 6 indices, R16_UINT
     D3D12_VERTEX_BUFFER_VIEW vbView{};
@@ -1101,6 +1104,9 @@ struct Dx12Surface {
     UINT width = 1;
     UINT height = 1;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // P197：创建 swapchain 时真正用的格式。ResizeBuffers / 重建都必须传同一个值
+    // （旧代码硬编码 R8G8B8A8_UNORM，HDR 下会用错格式 → DXGI_ERROR_INVALID_CALL）。
+    DXGI_FORMAT swapChainFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
     int presentMode = 2;  // 默认 FIFO
     int currentImageIndex = -1;  // 最近 acquire 的 back buffer
     // P6 诊断：最近一次 blit 写入的 back buffer 下标。present 后 currentImageIndex
@@ -1129,6 +1135,15 @@ struct Dx12Surface {
     // 该 bug 只在重配置瞬间（进入世界、启动加载界面切换）触发，与用户报告的时刻一致。
     std::atomic<bool> bufferHeld{false};
     bool suboptimal = false;
+    // P196：当前 swap chain 是否处于真独占全屏（destroySurface 必须先 SetFullscreenState(FALSE)，
+    // 否则释放链之后显示模式会停在独占状态，其它程序黑屏/分辨率不回退）。
+    bool exclusive = false;
+    // P197（原生 HDR）：本 surface 是否以 scRGB（R16G16B16A16_FLOAT + G10 color space）呈现。
+    // hdrSdrWhiteScale = SDRWhiteLevel(nits)/80（scRGB 里 1.0 = 80 nits），由 blit 的
+    // 根常量喂给像素着色器；hdrMaxLuminance 仅用于日志与 SetHDRMetaData。
+    bool hdrActive = false;
+    float hdrSdrWhiteScale = 1.0f;
+    float hdrMaxLuminance = 0.0f;
     // 临时 OSD / resize 诊断字段（debugReadbackIn、debugDumpAfterMs、debugDumpDone、
     // debugDumpCreateTick）已于 P70 清理（known_bugs.md §5）。需要回读画面时用 ABI 的
     // mcdr_dx12ReadbackSurfacePixels 手动触发，不要再往每帧路径里塞诊断代码。
@@ -1182,7 +1197,22 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd);
 // 取该 surface 支持的 present modes（官方枚举序数数组，MAILBOX 不支持）。
 std::vector<int> surfacePresentModes();
 // ResizeBuffers + 重新取 back buffers + 重建 RTV。
-mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int presentMode);
+// force=true 时即使尺寸没变也重建（P196：进出真独占后必须 ResizeBuffers，
+// 否则 Present 仍返回 S_OK 但 flip 链停在旧帧 —— 用户看到的"独占全屏画面冻结"）。
+mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int presentMode,
+                                    bool force = false);
+
+// P196：真独占全屏开关（Java 侧把 Window.isExclusiveFullscreen() 推过来）。
+mcdr::Result<void> setExclusiveFullscreen(Dx12Surface* s, bool on);
+
+// ---------------------------------------------------------------------------
+// P197（原生 HDR）
+// ---------------------------------------------------------------------------
+// HDR 模式：0 = auto（按 DXGI 输出当前色彩空间判定），1 = 强制开，2 = 强制关。
+// 必须在第一次 createSurface 之前调用（格式在创建 swapchain 时就定了）。
+void setHdrMode(int32_t mode);
+// 最近一次创建的 surface 是否真的以 scRGB 呈现（0/1）。DLSS 的 colorBuffersHDR 用它。
+int32_t hdrActiveFlag();
 // 获取当前 back buffer index（DXGI FLIP 模型下 Present 内部同步）。
 mcdr::Result<void> acquireSurface(Dx12Surface* s);
 // 录制 blit（源纹理 -> back buffer）：在 command list 录制状态下调用；

@@ -30,6 +30,9 @@ module;
 #include "mcdr_dlss_impl.h"
 #include <cstdio>        // P111 探针：_wfopen / fwprintf（诊断文件，绕开尚未接管的日志 sink）
 #include <cwchar>
+// P199c：内存分类采样需要 GetProcessMemoryInfo（psapi）。
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 
 // P111：Streamline（SL）interposer。头文件来自 external\streamline（git 子模块 @v2.14.16），
 // 导入库与运行时 DLL 来自 NVIDIA 的 SDK 压缩包（解到 lib\streamline，git 不记录这些二进制）。
@@ -137,9 +140,20 @@ Dx12Object* takePooledBuffer(D3D12_HEAP_TYPE heapType, UINT64 capacity) {
     return obj;
 }
 
+// P199h：下面的释放路径要改记账，先把声明提到使用点之前（定义在后面）。
+extern std::atomic<long long> gLiveBuf;
+void accountLiveBuffer(D3D12_HEAP_TYPE heapType, long long bytes);
+
 void recyclePooledBuffer(Dx12Object* obj) {
     UINT64 capacity = bufferCapacity(obj);
-    {
+    // P199h（内存泄露根因）：READBACK 堆缓冲**不进池**。它们基本都是「一次性读回」
+    // （典型：vanilla 每秒一次的 Screenshot buffer，1.6MB，MAP_READ|COPY_DST），
+    // 复用一个就必须保证尺寸完全一致，实际几乎从不命中；进池只会让 96MiB 的上限
+    // 被这种大块一次性缓冲占满，池满后每个新块都再分配一张新的（进程 nonLocal/私有
+    // 字节随之线性上涨，旧块只能等池淘汰）。读回缓冲创建频率低、CPU 可见、也不适合
+    // 跨帧复用，直接释放即可。
+    const bool poolable = (obj->heapType != D3D12_HEAP_TYPE_READBACK);
+    if (poolable) {
         std::lock_guard<std::mutex> lk(gFreeBufferMutex);
         if (gFreeBufferBytes + static_cast<size_t>(capacity) <= kMaxFreeBufferBytes) {
             gFreeBuffers.push_back(PooledBuffer{obj});
@@ -147,6 +161,10 @@ void recyclePooledBuffer(Dx12Object* obj) {
             return;
         }
     }
+    // 真正的释放路径：记账必须同步减掉，否则 P199c 的 up/def/rb 三个数只增不减
+    // （之前 lib 计数 bufTotal==liveBuf 恒等就是这么来的）。
+    --gLiveBuf;
+    accountLiveBuffer(obj->heapType, -static_cast<long long>(capacity));
     delete obj;
 }
 
@@ -177,6 +195,27 @@ constexpr UINT kDrawHeapSections = 4;
 constexpr UINT kDrawHeapSize = kDrawHeapPerFrame * kDrawHeapSections;
 
 inline UINT syncRingCapacity() { return gCtx.syncRingReserve > 0 ? gCtx.syncRingReserve : kDrawHeapPerFrame; }
+
+// TEMP-P199d（泄露取证，验证完必须删）：每类 D3D12 创建调用的累计次数。对比相邻两次
+// P199b 采样的差值，就能判断常驻内存上涨是不是"每帧重复创建资源"造成的。计数器放在
+// TU 里（模块单元那侧访问不到），只有诊断用途，不进任何发布路径。
+std::atomic<uint64_t> gStatTexCreate{0};
+std::atomic<uint64_t> gStatBufCreate{0};
+std::atomic<uint64_t> gStatPsoCreate{0};
+// P199d: 存活对象数（create++ / delete--）。P199b 只统计“创建过的总数”，对象泄漏时看不出来。
+std::atomic<long long> gLiveTex{0};
+std::atomic<long long> gLiveBuf{0};
+// P199f: 存活缓冲字节数按堆类型分组（UPLOAD / DEFAULT / READBACK）。泄漏到底是
+// “CPU 可见的上传缓冲”还是“默认堆纹理/网格缓冲”，看这三个数就够。
+std::atomic<long long> gLiveUploadBytes{0};
+std::atomic<long long> gLiveDefaultBytes{0};
+std::atomic<long long> gLiveReadbackBytes{0};
+static void accountLiveBuffer(D3D12_HEAP_TYPE heapType, long long bytes) {
+    if (heapType == D3D12_HEAP_TYPE_UPLOAD) gLiveUploadBytes += bytes;
+    else if (heapType == D3D12_HEAP_TYPE_READBACK) gLiveReadbackBytes += bytes;
+    else gLiveDefaultBytes += bytes;
+}
+std::atomic<uint64_t> gStatEncoderCreate{0};
 
 size_t pendingDeletesCount() {
     std::lock_guard<std::mutex> lk(gPendingMutex);
@@ -394,6 +433,11 @@ void flushPendingDeletes(bool force) {
         if (!force && o->kind == Dx12Object::Kind::Buffer) {
             recyclePooledBuffer(o);
             continue;
+        }
+        if (o->kind == Dx12Object::Kind::Texture) --gLiveTex;
+        else if (o->kind == Dx12Object::Kind::Buffer) {
+            --gLiveBuf;
+            if (o->resource) accountLiveBuffer(o->heapType, -static_cast<long long>(o->resource->GetDesc().Width));
         }
         delete o;
     }
@@ -2574,7 +2618,7 @@ mcdr::Result<void> ensureDevice() {
 }
 
 void destroyDevice() {
-    dbgLogInfo("destroyDevice: enter");
+    dbgLogError("[P184] destroyDevice stage: enter");
     if (gCtx.queueFenceEvent) {
         CloseHandle(gCtx.queueFenceEvent);
         gCtx.queueFenceEvent = nullptr;
@@ -2591,14 +2635,17 @@ void destroyDevice() {
             }
         }
     }
+    dbgLogError("[P184] destroyDevice stage: queue fence wait done");
     flushPendingDeletes(/*force=*/true);
+    dbgLogError("[P184] destroyDevice stage: pending deletes flushed");
     // P108：DLSS 的特征句柄与 scratch/中间纹理必须在**设备还活着**的时候释放，并且 NGX
     // 只能在设备销毁前 Shutdown。放在 gCtx 清零之前。
     mcdr_dlss_shutdown();
+    dbgLogError("[P184] destroyDevice stage: dlss shutdown done");
     gCtx = DeviceContext{};
     // P175：设备级描述符状态不跟着 gCtx 走（见 resetDescriptorAllocationState 的注释）。
     resetDescriptorAllocationState();
-    dbgLogInfo("destroyDevice: done");
+    dbgLogError("[P184] destroyDevice stage: done");
 }
 
 DeviceContext& deviceContext() { return gCtx; }
@@ -2817,12 +2864,14 @@ mcdr::Result<void*> createTexture(int usage, int format, int width, int height, 
 
     auto obj = std::make_unique<Dx12Object>();
     obj->kind = Dx12Object::Kind::Texture;
+    ++gLiveTex;
     obj->usage = usage;
     obj->size = static_cast<long long>(desc.Width) * desc.Height;
     obj->dxgiFormat = dxgi;
-    HRESULT hr =
-        gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
-                                             nullptr, IID_PPV_ARGS(&obj->resource));
+    ++gStatTexCreate;
+    HRESULT hr = gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                  D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                  IID_PPV_ARGS(&obj->resource));
     if (FAILED(hr)) {
         std::string text = "CreateCommittedResource(texture): " + hrText(hr);
         if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET
@@ -2853,10 +2902,16 @@ mcdr::Result<void*> createBuffer(int usage, long long size) {
 
     D3D12_HEAP_TYPE heapType = pickBufferHeapType(usage);
 
-    // P141：usage 位 512（本工程内部约定，Blaze3D 的 Usage 位只用到 256）表示这块缓冲要当
-    // UAV 用（RWByteAddressBuffer），必须带 ALLOW_UNORDERED_ACCESS。这类缓冲不进池 ——
-    // 池键只有 (heapType, 容量)，复用到一块没这个标志的旧缓冲会让 CreateUnorderedAccessView 失败。
-    const bool uavBuffer = (usage & 512) != 0;
+    // P141：usage 位 1024（本工程内部约定）表示这块缓冲要当 UAV 用（RWByteAddressBuffer），
+    // 必须带 ALLOW_UNORDERED_ACCESS。这类缓冲不进池 —— 池键只有 (heapType, 容量)，复用到
+    // 一块没这个标志的旧缓冲会让 CreateUnorderedAccessView 失败。
+    //
+    // 26.3 注意：这里原本用位 512，而 26.3 的 `GpuBuffer.USAGE_INDIRECT_PARAMETERS` 正好是
+    // 512。撞位的后果是 vanilla 的 MappableRingBuffer（MAP_WRITE + INDIRECT_PARAMETERS，
+    // UPLOAD 堆）被我们当成 UAV 缓冲、给 UPLOAD 堆资源加了
+    // D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS —— 该组合非法，
+    // CreateCommittedResource 直接返回 E_INVALIDARG(0x80070057)，世界渲染第一帧就崩。
+    const bool uavBuffer = (usage & 1024) != 0;
 
     // P60：优先复用池中 (heapType, 容量) 完全匹配的空闲 buffer，跳过
     // CreateCommittedResource（D3D12 最小分配粒度 64KB + DEFAULT 堆零初始化）。
@@ -2868,6 +2923,10 @@ mcdr::Result<void*> createBuffer(int usage, long long size) {
             reused->size = size;
             reused->mappedPtr = nullptr;
             DBG_LOG_DEBUG("createBuffer: reused pooled buffer size=%lld usage=0x%x", (long long)size, usage);
+            if (heapType == D3D12_HEAP_TYPE_READBACK) {
+                static std::atomic<int> gRbReuseLog{0};
+                const int n = gRbReuseLog.fetch_add(1);
+            }
             return reused;
         }
     }
@@ -2888,12 +2947,19 @@ mcdr::Result<void*> createBuffer(int usage, long long size) {
 
     auto obj = std::make_unique<Dx12Object>();
     obj->kind = Dx12Object::Kind::Buffer;
+    ++gLiveBuf;
+    accountLiveBuffer(heapType, static_cast<long long>(alignedSize));
+    if (heapType == D3D12_HEAP_TYPE_READBACK) {
+        static std::atomic<int> gRbLog{0};
+        const int rbn = gRbLog.fetch_add(1);
+    }
     obj->usage = usage;
     obj->size = size;
     obj->heapType = heapType;
     // P141：UAV 缓冲（meshlet 包围球）必须显式带 ALLOW_UNORDERED_ACCESS，
     // 否则 CreateUnorderedAccessView 直接失败（缓冲默认 Flags = NONE）。
     if (uavBuffer) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ++gStatBufCreate;
     HRESULT hr = gCtx.device->CreateCommittedResource(
         &heap, D3D12_HEAP_FLAG_NONE, &desc, initialStateFor(heapType), nullptr, IID_PPV_ARGS(&obj->resource));
     if (FAILED(hr)) {
@@ -3025,6 +3091,10 @@ void destroyObject(Dx12Object* obj) {
     // P12 诊断：关闭阶段定位用（destroyCommandEncoder 之后的销毁路径原本
     // 全静默，卡死时无法判断 Java 侧 transientMemory/管线缓存关闭进行到哪）。
     DBG_LOG_DEBUG("destroyObject: kind=%d size=%lld", (int)obj->kind, (long long)obj->size);
+    if (obj->kind == Dx12Object::Kind::Buffer && obj->heapType == D3D12_HEAP_TYPE_READBACK) {
+        static std::atomic<int> gRbDestroyLog{0};
+        const int n = gRbDestroyLog.fetch_add(1);
+    }
     // P6：延迟销毁（官方 VulkanGpuBuffer.close() 的 queueForDestroy 语义）。
     // 若资源正被打开的命令列表引用，立即 delete 会在 Close 时报
     // "deleted prior to closing the command list"（E_INVALIDARG）。登记到
@@ -3427,6 +3497,7 @@ mcdr::Result<void*> createCommandEncoder() {
     DBG_LOG_DEBUG("createCommandEncoder: enter");
     auto ctx = std::make_unique<CommandContext>();
     for (int i = 0; i < 3; ++i) {
+        ++gStatEncoderCreate;
         if (FAILED(gCtx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                        IID_PPV_ARGS(&ctx->allocators[i])))) {
             return mcdr::err("createCommandEncoder", "createCommandEncoder: CreateCommandAllocator failed");
@@ -3783,6 +3854,47 @@ mcdr::Result<void> endCommandList(CommandContext* ctx) {
     return {};
 }
 
+// P199c：内存分类采样。P199b 的对象计数全平但进程内存仍持续上涨，所以必须把
+// “进程私有内存”和 WDDM 的 Local（显存）/NonLocal（共享内存、上传堆）分开看：
+// Local 涨 → 真显存资源泄漏；NonLocal 涨 → CPU 可见的上传/读回堆或驱动 staging。
+static void logMemoryClass(uint64_t frame) {
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),
+                              reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+        return;
+    }
+    const unsigned long long privMB = static_cast<unsigned long long>(pmc.PrivateUsage) >> 20;
+    const unsigned long long wsMB = static_cast<unsigned long long>(pmc.WorkingSetSize) >> 20;
+    DXGI_QUERY_VIDEO_MEMORY_INFO localInfo{};
+    DXGI_QUERY_VIDEO_MEMORY_INFO nonLocalInfo{};
+    bool haveVid = false;
+    if (gCtx.adapter) {
+        ComPtr<IDXGIAdapter3> adapter3;
+        if (SUCCEEDED(gCtx.adapter.As(&adapter3)) && adapter3) {
+            haveVid =
+                SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &localInfo)) &&
+                SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonLocalInfo));
+        }
+    }
+    if (haveVid) {
+        dbgLogInfo("P199c frame=%llu private=%lluMB ws=%lluMB local=%lluMB/%lluMB nonLocal=%lluMB/%lluMB liveTex=%lld liveBuf=%lld bufTotal=%llu upMB=%lld defMB=%lld rbMB=%lld pd=%lld",
+                   static_cast<unsigned long long>(frame), privMB, wsMB,
+                   static_cast<unsigned long long>(localInfo.CurrentUsage >> 20),
+                   static_cast<unsigned long long>(localInfo.Budget >> 20),
+                   static_cast<unsigned long long>(nonLocalInfo.CurrentUsage >> 20),
+                   static_cast<unsigned long long>(nonLocalInfo.Budget >> 20),
+                   static_cast<long long>(gLiveTex.load()), static_cast<long long>(gLiveBuf.load()),
+                   static_cast<unsigned long long>(gStatBufCreate.load()),
+                   static_cast<long long>(gLiveUploadBytes.load() >> 20),
+                   static_cast<long long>(gLiveDefaultBytes.load() >> 20),
+                   static_cast<long long>(gLiveReadbackBytes.load() >> 20),
+                   static_cast<long long>(pendingDeletesCount()));
+    } else {
+        dbgLogInfo("P199c frame=%llu private=%lluMB ws=%lluMB (video memory query unavailable)",
+                   static_cast<unsigned long long>(frame), privMB, wsMB);
+    }
+}
 mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
     if (!ctx) {
         return mcdr::err("submitCommandList", "submitCommandList: null ctx");
@@ -3805,9 +3917,19 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
     UINT64 value = ctx->fenceValue + 1;
     // P15 诊断：每 30 帧打印 submit 摘要（含 fence 值 + queueFence）
     if ((value % 30ULL) == 1) {
-        dbgLogInfo("submitCommandList: frame=%llu ctx=%p queueFence=%llu",
+        dbgLogInfo("submitCommandList: frame=%llu ctx=%p queueFence=%llu | P199b pending=%lld "
+                   "srvSlot=%d samplerSlot=%d openLists=%d tex=%llu buf=%llu pso=%llu enc=%llu",
                    static_cast<unsigned long long>(value), reinterpret_cast<void*>(ctx),
-                   static_cast<unsigned long long>(gCtx.queueFenceValue));
+                   static_cast<unsigned long long>(gCtx.queueFenceValue),
+                   static_cast<long long>(pendingDeletesCount()), static_cast<int>(gNextSrv),
+                   static_cast<int>(gNextSampler), static_cast<int>(gOpenListCount),
+                   static_cast<unsigned long long>(gStatTexCreate.load()),
+                   static_cast<unsigned long long>(gStatBufCreate.load()),
+                   static_cast<unsigned long long>(gStatPsoCreate.load()),
+                   static_cast<unsigned long long>(gStatEncoderCreate.load()));
+    }
+    if ((value % 300ULL) == 1) {
+        logMemoryClass(value);
     }
     DBG_LOG_DEBUG("submit: ExecuteCommandLists enter (v->%llu)", (unsigned long long)value);
     ID3D12CommandList* lists[] = {ctx->commandList};
@@ -5146,15 +5268,22 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
             default: return 4u;  // fallback
         }
     };
-    UINT correctedStride = 0;
+    // P192：逐 slot 的步长必须分开算。26.3 的地形管线把 ChunkPosition/ChunkVisibility
+    // 挪成了逐实例顶点属性（slot 1，stride 16），而同一条管线的 slot 0（Position/Color/
+    // UV0/UV2）是 stride 28。原先这里把所有元素 offset+size 的最大值当成**每个** slot 的
+    // 步长，slot 1 于是被按 28 字节解释 → 每个区块读到的 ChunkPosition 都是错位的字节，
+    // 表现为「几何本身正常，但区块整体位置乱跳」。Java 侧每个元素都带了所属 slot 的
+    // stride，优先用它；没给时退回该 slot 内元素的 offset+size 上界。
+    UINT slotStride[16] = {};
+    bool anyInputSlot = false;
     for (const PipelineDesc::InputElement& el : desc.inputElements) {
-        // 校正步长只按 ordinal 的字节宽度累加（ordinalByteSize）；这里原有一个
-        // DXGI_FORMAT dfmt = toDxgiVertexFormat(el.format) 从未被引用，/W4 报 C4189，已删除。
-        UINT sz = ordinalByteSize(el.format);
-        UINT end = static_cast<UINT>(el.offset) + sz;
-        if (end > correctedStride) correctedStride = end;
+        if (el.binding < 0 || el.binding >= 16) continue;
+        const UINT end = static_cast<UINT>(el.offset) + ordinalByteSize(el.format);
+        const UINT candidate = el.stride > 0 ? static_cast<UINT>(el.stride) : end;
+        if (candidate > slotStride[el.binding]) slotStride[el.binding] = candidate;
+        anyInputSlot = true;
     }
-    if (correctedStride > 0) {
+    if (anyInputSlot) {
         // 重新构建 inputLayout，语义名称从 semanticStore 恢复（避免悬空指针）。
         // 先清空 semanticStore 以便重新填充。
         semanticStore.clear();
@@ -5200,7 +5329,8 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
             char buf[128];
             snprintf(
                 buf, sizeof(buf), "  loc=%d bind=%d fmt=%d off=%d stride=%d step=%d semantic=%s idx=%u\n",
-                el.location, el.binding, el.format, el.offset, correctedStride, el.stepRate,
+                el.location, el.binding, el.format, el.offset,
+                (el.binding >= 0 && el.binding < 16) ? slotStride[el.binding] : 0u, el.stepRate,
                 el.semanticName.empty() ? "(fallback TEXCOORD)" : el.semanticName.c_str(), semanticIndex);
             inputDescStr += buf;
             inputLayout.push_back(ie);
@@ -5251,11 +5381,9 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
     pipeline->rootSignature = rootSig;
     pipeline->topology = desc.topology;
 
-    // 记录 per-slot 修正 stride，供 setVertexBuffer 覆盖 Java 传入的错误值。
-    for (const auto& ie : inputLayout) {
-        int slot = static_cast<int>(ie.InputSlot);
-        if (!pipeline->vertexStrides.count(slot) || correctedStride > pipeline->vertexStrides[slot])
-            pipeline->vertexStrides[slot] = correctedStride;
+    // P192：每个 slot 用自己的步长（详见上面 slotStride 的注释）。
+    for (UINT slot = 0; slot < 16; ++slot) {
+        if (slotStride[slot] != 0) pipeline->vertexStrides[slot] = slotStride[slot];
     }
 
     auto buildPso = [&](DXGI_FORMAT dsvFormat, bool depthEnable, D3D12_DEPTH_WRITE_MASK depthWrite,
@@ -5339,6 +5467,7 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
                 dbgLogDebug(buf);
             }
         }
+        ++gStatPsoCreate;
         HRESULT h = gCtx.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&out));
         if (FAILED(h)) {
             dbgLogDebug("  === D3D12 validation messages ===");
@@ -7058,6 +7187,29 @@ static const char kBlitPS[] = "struct VS_OUT { float4 pos : SV_Position; float2 
                               "    return srcTex.Sample(blitSampler, IN.tc);\n"
                               "}\n";
 
+// P197（HDR）：同一份 blit 几何，像素着色器把 SDR 主渲染目标（RGBA8，内容按 sRGB 编码）
+// 解码成线性、乘上「SDR 白 = 多少 scRGB 单位」，写进 R16G16B16A16_FLOAT 的交换链。
+// scRGB 的 1.0 定义为 80 nits，所以 sdrWhiteScale = SDRWhiteLevel(nits) / 80。
+// hdrEnabled 走 root constants：SDR 呈现时同一个 PSO 传 0 也能用（只是多一次分支）。
+static const char kBlitPSHdr[] =
+    "struct VS_OUT { float4 pos : SV_Position; float2 tc : TEXCOORD0; };\n"
+    "Texture2D<float4> srcTex : register(t0, space0);\n"
+    "SamplerState blitSampler : register(s0, space0);\n"
+    "cbuffer BlitHdrParams : register(b0, space0) {\n"
+    "    float sdrWhiteScale;  // SDR white (nits) / 80\n"
+    "    float hdrEnabled;     // 0 = pass-through, 1 = sRGB->linear\n"
+    "    float2 hdrPadding;\n"
+    "};\n"
+    "float3 srgbToLinear(float3 c) {\n"
+    "    return (c <= 0.04045f) ? (c / 12.92f) : pow((c + 0.055f) / 1.055f, 2.4f);\n"
+    "}\n"
+    "float4 main(VS_OUT IN) : SV_Target {\n"
+    "    float4 c = srcTex.Sample(blitSampler, IN.tc);\n"
+    "    // hdrEnabled=0：float 链但没开 HDR（或色彩空间被拒）→ 原样直通，与 SDR 等价。\n"
+    "    if (hdrEnabled < 0.5f) return c;\n"
+    "    return float4(srgbToLinear(c.rgb) * sdrWhiteScale, c.a);\n"
+    "}\n";
+
 }  // namespace
 
 mcdr::Result<void> initBlitPipeline() {
@@ -7087,6 +7239,17 @@ mcdr::Result<void> initBlitPipeline() {
         param.DescriptorTable = table;
         param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+        // P197：blit 的 HDR 参数（sdrWhiteScale / hdrEnabled）。SDR PSO 不声明这个 cbuffer，
+        // 但根签名里的参数必须一致，所以两个 PSO 共用同一份根签名，SDR 路径设成 (1,0) 即可。
+        D3D12_ROOT_PARAMETER hdrParam{};
+        hdrParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        hdrParam.Constants.ShaderRegister = 0;
+        hdrParam.Constants.RegisterSpace = 0;
+        hdrParam.Constants.Num32BitValues = 4;
+        hdrParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_PARAMETER params[2] = {param, hdrParam};
+
         D3D12_STATIC_SAMPLER_DESC staticSam{};
         staticSam.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         staticSam.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -7103,8 +7266,8 @@ mcdr::Result<void> initBlitPipeline() {
         staticSam.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 1;
-        rsDesc.pParameters = &param;
+        rsDesc.NumParameters = 2;
+        rsDesc.pParameters = params;
         rsDesc.NumStaticSamplers = 1;
         rsDesc.pStaticSamplers = &staticSam;
         rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -7160,9 +7323,29 @@ mcdr::Result<void> initBlitPipeline() {
         psCodeSize = psBlob->GetBufferSize();
     }
 
-    // 创建 PSO
-    ComPtr<ID3D12PipelineState> pso;
-    {
+    // P197：HDR 变体的像素着色器（几何与 VS 不变，只有 RTV 格式和 PS 不同）。
+    std::vector<uint8_t> hdrPsDxil;
+    ComPtr<ID3DBlob> hdrPsBlob;
+    const void* hdrPsCode = nullptr;
+    SIZE_T hdrPsCodeSize = 0;
+    if (!smProfile.empty()) {
+        const std::string hdrSrc(kBlitPSHdr, sizeof(kBlitPSHdr) - 1);
+        if (compileHlslToDxil(hdrSrc, "main", "ps_" + smProfile, hdrPsDxil)) {
+            hdrPsCode = hdrPsDxil.data();
+            hdrPsCodeSize = hdrPsDxil.size();
+        }
+    }
+    if (hdrPsCode == nullptr) {
+        std::vector<uint8_t> hdrBytes(kBlitPSHdr, kBlitPSHdr + sizeof(kBlitPSHdr));
+        auto hdrRes = compileShaderBytecode(hdrBytes, "blit_ps_hdr", "ps_5_1", hdrPsBlob);
+        if (!hdrRes) return mcdr::err("initBlitPipeline", "blit HDR PS: " + errorMessage(hdrRes.error()));
+        hdrPsCode = hdrPsBlob->GetBufferPointer();
+        hdrPsCodeSize = hdrPsBlob->GetBufferSize();
+    }
+
+    // 创建 PSO（P197：SDR 用 RGBA8、HDR 用 RGBA16F，共用同一份根签名与输入布局）
+    auto createBlitPso = [&](const void* pixCode, SIZE_T pixSize, DXGI_FORMAT rtvFormat,
+                             ComPtr<ID3D12PipelineState>& outPso) -> mcdr::Result<void> {
         D3D12_INPUT_ELEMENT_DESC ie[2] = {};
         ie[0].SemanticName = "POSITION";
         ie[0].SemanticIndex = 0;
@@ -7216,11 +7399,11 @@ mcdr::Result<void> initBlitPipeline() {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
         psoDesc.pRootSignature = rootSig.Get();
         psoDesc.VS = {vsCode, vsCodeSize};
-        psoDesc.PS = {psCode, psCodeSize};
+        psoDesc.PS = {pixCode, pixSize};
         psoDesc.InputLayout = {ie, 2};
         psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         psoDesc.NumRenderTargets = 1;
-        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;  // 匹配 backbuffer
+        psoDesc.RTVFormats[0] = rtvFormat;
         psoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
         psoDesc.SampleDesc.Count = 1;
         psoDesc.SampleMask = UINT_MAX;  // P25 fix：漏设 SampleMask → 0 → sample-mask 测试
@@ -7230,11 +7413,23 @@ mcdr::Result<void> initBlitPipeline() {
         psoDesc.DepthStencilState = dsDesc;
         psoDesc.Flags = D3D12_PIPELINE_STATE_FLAGS(0);
 
-        HRESULT hr = gCtx.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pso));
+        ++gStatPsoCreate;
+        const HRESULT hr = gCtx.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&outPso));
         if (FAILED(hr)) {
             return mcdr::err("initBlitPipeline",
-                             "initBlitPipeline: CreateGraphicsPipelineState hr=0x" + hrText(hr));
+                             "initBlitPipeline: CreateGraphicsPipelineState(rtv=" +
+                                 std::to_string(static_cast<int>(rtvFormat)) + ") hr=0x" + hrText(hr));
         }
+        return {};
+    };
+
+    ComPtr<ID3D12PipelineState> pso;
+    if (auto cr = createBlitPso(psCode, psCodeSize, DXGI_FORMAT_R8G8B8A8_UNORM, pso); !cr) {
+        return cr;
+    }
+    ComPtr<ID3D12PipelineState> psoHdr;
+    if (auto cr = createBlitPso(hdrPsCode, hdrPsCodeSize, DXGI_FORMAT_R16G16B16A16_FLOAT, psoHdr); !cr) {
+        return cr;
     }
 
     // 顶点缓冲：4 顶点，R32G32(position) + R32G32(texcoord)，upload heap
@@ -7312,9 +7507,11 @@ mcdr::Result<void> initBlitPipeline() {
 
     bp->rootSig = rootSig;
     bp->pso = pso;
+    bp->psoHdr = psoHdr;
     gCtx.blitPipeline = std::move(bp);
-    dbgLogInfo("initBlitPipeline: done rootSig=%p pso=%p", reinterpret_cast<void*>(rootSig.Get()),
-           reinterpret_cast<void*>(pso.Get()));
+    dbgLogInfo("initBlitPipeline: done rootSig=%p pso=%p psoHdr=%p",
+               reinterpret_cast<void*>(rootSig.Get()), reinterpret_cast<void*>(pso.Get()),
+               reinterpret_cast<void*>(psoHdr.Get()));
     return {};
 }
 
@@ -7503,6 +7700,7 @@ mcdr::Result<void> initSharpenPipeline() {
         psoDesc.RasterizerState = rasterDesc;
         psoDesc.DepthStencilState = dsDesc;
 
+        ++gStatPsoCreate;
         HRESULT hr = gCtx.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pso));
         if (FAILED(hr)) {
             return mcdr::err("initSharpenPipeline",

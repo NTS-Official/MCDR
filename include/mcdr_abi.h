@@ -998,6 +998,9 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12SurfacePresentModes(int32_t* out, int32_t ca
 
 MCDR_API int32_t MCDR_CALL mcdr_dx12ConfigureSurface(mcdr_surface* surface, int32_t width, int32_t height,
                                                      int32_t presentMode);
+// P196：真独占全屏（1 = 进独占，0 = 退回窗口/无边框）。失败返回 0，画面不受影响。
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetExclusiveFullscreen(mcdr_surface* surface, int32_t on);
+
 MCDR_API int32_t MCDR_CALL mcdr_dx12AcquireSurface(mcdr_surface* surface);
 MCDR_API void MCDR_CALL mcdr_dx12BlitSurface(mcdr_command_ctx* ctx, mcdr_surface* surface,
                                              mcdr_object* texture);
@@ -1006,6 +1009,12 @@ MCDR_API void MCDR_CALL mcdr_dx12PresentSurface(mcdr_surface* surface);
 // opaque integer (NOT a mcdr_object* -- the Java side only forwards it).
 MCDR_API uint64_t MCDR_CALL mcdr_dx12GetBackBufferHandle(mcdr_surface* surface);
 MCDR_API int32_t MCDR_CALL mcdr_dx12IsSurfaceSuboptimal(mcdr_surface* surface);
+
+// P197（原生 HDR）：0 = auto（按窗口所在输出的 DXGI 色彩空间判定），1 = 强制开，2 = 强制关。
+// 只改进程状态，真正生效在下次创建/重建交换链时（格式是建链参数，不能原地改）。
+MCDR_API void MCDR_CALL mcdr_dx12SetHdrMode(int32_t mode);
+MCDR_API int32_t MCDR_CALL mcdr_dx12GetHdrAppliedMode(void);
+
 MCDR_API void MCDR_CALL mcdr_dx12DestroySurface(mcdr_surface* surface);
 MCDR_API mcdr_surface* MCDR_CALL mcdr_dx12GetActiveSurfaceHandle(void);
 

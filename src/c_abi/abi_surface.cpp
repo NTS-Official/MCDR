@@ -10,6 +10,7 @@ module;
 module mcdr.abi.common;
 
 #include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
+#include "mcdr_hdr_state.h"  // P198: 建链时实际用掉的 HDR 模式（普通 TU 的 C 状态）
 
 import mcdr.d3d12.device;
 import mcdr.d3d12.mesh;
@@ -215,6 +216,17 @@ int32_t MCDR_CALL mcdr_dx12ConfigureSurface(mcdr_surface* surface, int32_t width
     return 1;
 }
 
+// P196：真独占全屏开关。26.3 的 SDL 独占只改显示模式，DXGI 侧需要显式 SetFullscreenState。
+int32_t MCDR_CALL mcdr_dx12SetExclusiveFullscreen(mcdr_surface* surface, int32_t on) {
+    if (const auto r = setExclusiveFullscreen(surface, on != 0); !r) {
+        // 非致命：驱动/覆盖层拒绝时画面仍可走窗口化，记 WARN 即可，不要升级成 ERROR。
+        d3d12_mc::dbgLogWarn("dx12SetExclusiveFullscreen(%d) failed: %s", on ? 1 : 0,
+                             r.error().message.c_str());
+        return 0;
+    }
+    return 1;
+}
+
 int32_t MCDR_CALL mcdr_dx12AcquireSurface(mcdr_surface* surface) {
     if (const auto r = acquireSurface(surface); !r) {
         return mcdr::abi::failWith("mcdr_dx12AcquireSurface", r.error().message);
@@ -347,6 +359,11 @@ void MCDR_CALL mcdr_dx12DumpTextureToFile(mcdr_object* texture, const char* tag)
 int32_t MCDR_CALL mcdr_dx12IsSurfaceSuboptimal(mcdr_surface* surface) {
     return (surface && surface->suboptimal) ? 1 : 0;
 }
+
+void MCDR_CALL mcdr_dx12SetHdrMode(int32_t mode) { setHdrMode(mode); }
+
+// P198: 建链时实际用掉的 HDR 模式（-1 = 还没建过链），JVM 侧据此提示“需要重启”。
+int32_t MCDR_CALL mcdr_dx12GetHdrAppliedMode(void) { return mcdr_hdr_state_applied_mode(); }
 
 void MCDR_CALL mcdr_dx12DestroySurface(mcdr_surface* surface) { destroySurface(surface); }
 

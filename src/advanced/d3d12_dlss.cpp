@@ -39,7 +39,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstring>
 
 // P112 阶段 1：Streamline 接管 DLSS 的实现选择（默认仍是直连 NGX，行为与 P108 一致）。
 #if __has_include(<sl.h>)
@@ -55,7 +54,7 @@
 // P108: the extern "C" interface shared with the device module. It defines the transition
 // callback types (DlssTransitionFn / DlssQueryStateFn) this unit stores in its state.
 #include "mcdr_dlss_impl.h"
-
+#include "mcdr_hdr_state.h"  // P197：HDR 激活状态（colorBuffersHDR）
 import std;
 
 #include "nvsdk_ngx.h"
@@ -246,6 +245,34 @@ namespace
         UINT depthSnapshotSamples = 0;
         UINT64 depthSnapshotFrame = 0;   // frame counter at the last snapshot
         bool depthSnapshotWarned = false;
+
+        // P199 (user m0412x, "缓慢的内存泄露"): `slDLSSSetOptions` used to be called on EVERY
+        // frame, because `mcdr_dlss_create` runs per frame and the streamline branch has nothing
+        // to create. Streamline re-derives its internal DLSS resources on every call, and the
+        // measured effect was process private bytes growing ~800 MB/min with DLSS on, completely
+        // flat with DLSS off. Options only change when the tier / output size / exposure changes,
+        // so cache the last pushed set here and skip the call when nothing moved. `slOptsApplied`
+        // is cleared whenever the feature is destroyed so the next create re-pushes.
+        bool slOptsApplied = false;
+        int32_t slOptMode = -1;
+        uint32_t slOptOutW = 0;
+        uint32_t slOptOutH = 0;
+        float slOptPreExposure = -1.0f;
+        float slOptExposureScale = -1.0f;
+
+        // P199b: the per-frame evaluate path pushes `slDLSSSetOptions` too (it builds its own
+        // `sl::DLSSOptions` for the tags it just set), so it needs its own memory of what was
+        // last applied. Keeping the two caches separate is deliberate: the create path and the
+        // evaluate path can legitimately disagree in between (a resize lands in the create path
+        // first), and sharing one cache made the options silently never re-apply.
+        bool slEvalOptsValid = false;
+        int32_t slEvalOptMode = -1;
+        uint32_t slEvalOptOutW = 0;
+        uint32_t slEvalOptOutH = 0;
+        float slEvalOptPreExposure = -1.0f;
+        float slEvalOptExposureScale = -1.0f;
+        uint32_t slEvalOptQuality = 0xFFFFFFFFu;
+        bool slEvalOptHdr = false;
 
         ID3D12Resource* mvBuffer = nullptr;      // intermediate for a non-RG16 MV input
         // B4：MV 中间纹理也由设备模块创建（同一入口），这里只留句柄。
@@ -697,9 +724,7 @@ namespace
                               ID3D12Resource** outResource) {
         if (outObject != nullptr) *outObject = nullptr;
         if (outResource != nullptr) *outResource = nullptr;
-        if (outObject == nullptr || outResource == nullptr) {
-            return false;
-        }
+        if (outObject == nullptr || outResource == nullptr) return false;
         if (gCreateTexture == nullptr) {
             static bool s_warned = false;
             if (!s_warned) {
@@ -710,7 +735,7 @@ namespace
             }
             return false;
         }
-        DlssTextureDesc d{};
+        DlssTextureDesc d;
         d.width = width;
         d.height = height;
         d.dxgiFormat = static_cast<uint32_t>(format);
@@ -749,7 +774,7 @@ namespace
         s.scratchBytes = 0;
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC desc{};
+        D3D12_RESOURCE_DESC desc;
         desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
         desc.Alignment = 0;
         desc.Width = bytes;
@@ -978,6 +1003,16 @@ namespace
         opt.preExposure = in.preExposure > 0.0f ? in.preExposure : 1.0f;
         opt.exposureScale = in.exposureScale > 0.0f ? in.exposureScale : 1.0f;
         opt.useAutoExposure = sl::Boolean::eFalse;
+        // P199: this used to run on every frame (the streamline branch of `mcdr_dlss_create`
+        // has nothing else to do). Streamline re-derives its internal DLSS state per call and
+        // the measured cost was ~800 MB/min of process private bytes. Push the options only
+        // when something that actually feeds them changed.
+        const int32_t modeAsInt = static_cast<int32_t>(opt.mode);
+        if (s.slOptsApplied && s.slOptMode == modeAsInt && s.slOptOutW == opt.outputWidth &&
+            s.slOptOutH == opt.outputHeight && s.slOptPreExposure == opt.preExposure &&
+            s.slOptExposureScale == opt.exposureScale) {
+            return 0;
+        }
         const sl::ViewportHandle viewport(0);
         const sl::Result r = fn(viewport, opt);
         if (r != sl::Result::eOk) {
@@ -986,8 +1021,18 @@ namespace
                 static_cast<unsigned>(r), static_cast<int>(opt.mode), opt.outputWidth,
                 opt.outputHeight, static_cast<unsigned>(in.renderWidth),
                 static_cast<unsigned>(in.renderHeight));
+            return static_cast<int32_t>(r);
         }
-        return static_cast<int32_t>(r);
+        s.slOptsApplied = true;
+        s.slOptMode = modeAsInt;
+        s.slOptOutW = opt.outputWidth;
+        s.slOptOutH = opt.outputHeight;
+        s.slOptPreExposure = opt.preExposure;
+        s.slOptExposureScale = opt.exposureScale;
+        logInfo("P199: slDLSSSetOptions applied (mode=%d, out=%ux%u, preExposure=%.3f, "
+                "exposureScale=%.3f; later frames reuse it until one of these changes)",
+                modeAsInt, opt.outputWidth, opt.outputHeight, opt.preExposure, opt.exposureScale);
+        return 0;
     }
 #endif
 
@@ -1201,6 +1246,10 @@ namespace
         }
         s.featureOk = false;
         s.evalOk = false;
+        // P199: the feature is gone, so the next create must re-push the options.
+        s.slOptsApplied = false;
+        // P199b: same for the per-frame evaluate path's own option cache.
+        s.slEvalOptsValid = false;
     }
 
     // Creates (or recreates) the feature. Requires an OPEN command list — NGX records its
@@ -1362,7 +1411,7 @@ namespace
             return false;
         }
 
-        NVSDK_NGX_DLSS_Create_Params cp{};
+        NVSDK_NGX_DLSS_Create_Params cp;
         // P108 (user m11796): DLAA is defined as "no upscaling", so the feature is created at the
         // TARGET resolution. The requested-tier path already refuses DLAA when render != target
         // (ERROR + fall back to Quality), so this is a belt-and-braces pin of the equal-size
@@ -1835,7 +1884,7 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
     tl(tlCtx, reinterpret_cast<void*>(s.depthSnapshot),
        static_cast<int32_t>(D3D12_RESOURCE_STATE_COPY_DEST));
     {
-        D3D12_TEXTURE_COPY_LOCATION src{};
+        D3D12_TEXTURE_COPY_LOCATION src;
         src.pResource = depth;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         src.SubresourceIndex = 0;
@@ -2289,6 +2338,8 @@ sl::FrameToken* gLastFrameToken = nullptr;
             (void)api.setConstants(cnst, *token, viewport);
         }
 
+        // TEMP-P199c（泄露二分，验证完必须删）：0=完整路径，1=跳过 slEvaluateFeature，2=跳过 slSetTagForFrame。
+        constexpr int kLeakArm = 2;
         // 2) 资源 tag（lifecycle 按文档 :143-147：输入/输出 eOnlyValidNow，深度/MV eValidUntilPresent）
         // 只保留输出这一个 barrier：文档 :155 说资源状态由 SL 管理，输入侧的 transition 没必要，
         // 还会和 SMAA/GUI 的既有状态重复切；tag 里仍带上资源当前应有的 state（D3D12 下必填）。
@@ -2311,7 +2362,8 @@ sl::FrameToken* gLastFrameToken = nullptr;
             sl::ResourceTag(&outRes, sl::kBufferTypeScalingOutputColor,
                             sl::ResourceLifecycle::eOnlyValidNow),
         };
-        const sl::Result tagResult = api.setTags(*token, viewport, tags, 4, cmd);
+        const sl::Result tagResult =
+            kLeakArm == 2 ? sl::Result::eOk : api.setTags(*token, viewport, tags, 4, cmd);
 
         // 3) 选项（:170-186：各档 preset + 模式 + 输出尺寸 + 非 HDR/非自动曝光）
         sl::DLSSOptions opt{};
@@ -2331,13 +2383,45 @@ sl::FrameToken* gLastFrameToken = nullptr;
         opt.preExposure = in.preExposure > 0.0f ? in.preExposure : 1.0f;
         opt.exposureScale = in.exposureScale > 0.0f ? in.exposureScale : 1.0f;
         opt.useAutoExposure = sl::Boolean::eFalse;
-        opt.colorBuffersHDR = sl::Boolean::eFalse;
+        // P197：HDR 开启时 colorBuffersHDR 必须是 eTrue。注意我们的内部主渲染目标仍是 SDR，
+        // 线性化与白点换算发生在呈现用的 blit PS 里；这里只是让 Streamline 按 HDR 语义
+        // 处理颜色缓冲（避免它再套一层 sRGB 编解码）。
+        opt.colorBuffersHDR =
+            mcdr_hdr_state_active() != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
         opt.alphaUpscalingEnabled = sl::Boolean::eFalse;
-        const sl::Result optResult = api.setOptions(viewport, opt);
+        // P199：`slDLSSSetOptions` 是"配置变化时"的调用，不是每帧调用。26.3 起我们每帧都会走到
+        // 这里，而 SL 的 DLSS 插件在 SetOptions 里会重建内部资源（实测每帧调用时进程私有提交
+        // 内存约 750 MB/min 线性上涨，关闭 DLSS 则完全平坦）。只在参数真的变了才下发。
+        const bool slOptsChanged = !s.slEvalOptsValid || s.slEvalOptMode != static_cast<int32_t>(opt.mode) ||
+                                   s.slEvalOptOutW != opt.outputWidth ||
+                                   s.slEvalOptOutH != opt.outputHeight ||
+                                   s.slEvalOptPreExposure != opt.preExposure ||
+                                   s.slEvalOptExposureScale != opt.exposureScale ||
+                                   s.slEvalOptQuality != s.qualityValue ||
+                                   s.slEvalOptHdr != (mcdr_hdr_state_active() != 0);
+        sl::Result optResult = sl::Result::eOk;
+        if (slOptsChanged) {
+            optResult = api.setOptions(viewport, opt);
+            if (optResult == sl::Result::eOk) {
+                s.slEvalOptsValid = true;
+                s.slEvalOptMode = static_cast<int32_t>(opt.mode);
+                s.slEvalOptOutW = opt.outputWidth;
+                s.slEvalOptOutH = opt.outputHeight;
+                s.slEvalOptPreExposure = opt.preExposure;
+                s.slEvalOptExposureScale = opt.exposureScale;
+                s.slEvalOptQuality = s.qualityValue;
+                s.slEvalOptHdr = mcdr_hdr_state_active() != 0;
+            }
+        }
 
         // 4) evaluate（文档 :235：inputs 只需要 viewport；资源已经在 tag 里给过）
         const sl::BaseStructure* evalInputs[1] = {&viewport};
-        const sl::Result evalResult = api.evaluate(sl::kFeatureDLSS, *token, evalInputs, 1, cmd);
+        sl::Result evalResult = sl::Result::eOk;
+        if (kLeakArm != 1) {
+            evalResult = api.evaluate(sl::kFeatureDLSS, *token, evalInputs, 1, cmd);
+        } else {
+            logWarn("P199c: leak bisect arm=1 (slEvaluateFeature skipped)");
+        }
         ++s.submitCount;
 
         // 4.5) handover：只有当 SL 写的那张纹理不是 GUI 目标时才需要拷回（同尺寸、同格式）。

@@ -2,6 +2,8 @@ module;
 
 #include "_d3d12_module_prelude.h"
 #include "mcdr_dlss_impl.h"  // P113：mcdr_reflex_before_present
+#include "mcdr_hdr_state.h"  // P197：HDR 模式/激活状态（surface 与 DLSS 两个 TU 共享）
+#include <algorithm>          // P197：std::clamp
 
 module mcdr.d3d12.device;
 
@@ -169,11 +171,11 @@ mcdr::Result<void> initComposition(HWND win, SwapChainBundle& b) {
 
 // 创建 composition swapchain 并把内容绑定到 visual 上。
 mcdr::Result<void> createCompositionSwapChain(IDXGIFactory2* factory2, ID3D12CommandQueue* queue, UINT width,
-                                             UINT height, SwapChainBundle& b) {
+                                             UINT height, DXGI_FORMAT format, SwapChainBundle& b) {
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = width > 0 ? width : 1;
     sd.Height = height > 0 ? height : 1;
-    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.Format = format;
     sd.Stereo = FALSE;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -356,9 +358,111 @@ static void logSwapChainPresentHook(IDXGISwapChain* sc) {
            b[0], b[1], b[2], b[3]);
 }
 
+// P197：查某显示器的「SDR 白」亮度（nits）。DXGI_OUTPUT_DESC1 里没有这个值 ——
+// 它属于 display config（DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL），
+// 单位是 1/1000 nits（Windows HDR 滑块 50% 时约 200000 → 200 nits）。
+// 先按 HMONITOR 取 GDI 设备名，再用 QueryDisplayConfig 把 source 与 target 对上。
+float querySdrWhiteNits(HMONITOR monitor) {
+    if (monitor == nullptr) return 0.0f;
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(monitor, &mi)) return 0.0f;
+
+    UINT32 pathCount = 0;
+    UINT32 modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) {
+        return 0.0f;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(),
+                           nullptr) != ERROR_SUCCESS) {
+        return 0.0f;
+    }
+    for (UINT32 i = 0; i < pathCount; ++i) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
+        src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        src.header.size = sizeof(src);
+        src.header.adapterId = paths[i].sourceInfo.adapterId;
+        src.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS) continue;
+        if (wcscmp(src.viewGdiDeviceName, mi.szDevice) != 0) continue;
+
+        DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
+        white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white.header.size = sizeof(white);
+        white.header.adapterId = paths[i].targetInfo.adapterId;
+        white.header.id = paths[i].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&white.header) != ERROR_SUCCESS) return 0.0f;
+        return static_cast<float>(white.SDRWhiteLevel) / 1000.0f;
+    }
+    return 0.0f;
+}
+
+// P197（原生 HDR）：窗口所在输出的高级颜色状态。
+// 只信 DXGI：SDL 的 `SDL_PROP_WINDOW_HDR_ENABLED` / `SDR_WHITE_LEVEL` 在 Windows 上
+// 也是从同一份 DXGI 输出信息推出来的，而我们本来就要拿 IDXGIOutput6 判 scRGB 支持。
+struct HdrProbe {
+    bool hdrOn = false;      // Windows 高级颜色已开启（输出色彩空间是 PQ/HDR10）
+    float sdrWhiteNits = 200.0f;  // 系统「SDR 内容亮度」，scRGB 换算的分母
+    float maxLuminanceNits = 0.0f;
+    DXGI_COLOR_SPACE_TYPE colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    bool found = false;      // 是否成功定位到输出（false 时上面的值都是默认）
+};
+
+HdrProbe probeHdrForWindow(IDXGIFactory4* factory, HWND win) {
+    HdrProbe probe{};
+    if (factory == nullptr || win == nullptr) return probe;
+
+    // 窗口客户区中心点落在哪块输出上 —— 多显示器下这是"这个窗口现在在哪块屏"的判据。
+    POINT center{0, 0};
+    RECT cr{};
+    if (GetClientRect(win, &cr)) {
+        center.x = (cr.right - cr.left) / 2;
+        center.y = (cr.bottom - cr.top) / 2;
+        ClientToScreen(win, &center);
+    }
+
+    ComPtr<IDXGIOutput> matched;
+    for (UINT a = 0;; ++a) {
+        ComPtr<IDXGIAdapter> adapter;
+        if (FAILED(factory->EnumAdapters(a, adapter.GetAddressOf()))) break;
+        for (UINT o = 0;; ++o) {
+            ComPtr<IDXGIOutput> output;
+            if (FAILED(adapter->EnumOutputs(o, output.GetAddressOf()))) break;
+            DXGI_OUTPUT_DESC desc{};
+            if (FAILED(output->GetDesc(&desc))) continue;
+            const RECT& r = desc.DesktopCoordinates;
+            if (center.x >= r.left && center.x < r.right && center.y >= r.top && center.y < r.bottom) {
+                matched = output;
+                break;
+            }
+        }
+        if (matched) break;
+    }
+    if (!matched) return probe;
+
+    ComPtr<IDXGIOutput6> output6;
+    if (FAILED(matched.As(&output6))) return probe;
+
+    DXGI_OUTPUT_DESC1 desc1{};
+    if (FAILED(output6->GetDesc1(&desc1))) return probe;
+
+    probe.found = true;
+    probe.colorSpace = desc1.ColorSpace;
+    probe.maxLuminanceNits = desc1.MaxLuminance;
+    // SDR 白点来自 display config；查不到时退回 200 nits（Windows HDR 滑块 50% 的默认值）。
+    const float sdrWhite = querySdrWhiteNits(desc1.Monitor);
+    probe.sdrWhiteNits = sdrWhite > 1.0f ? sdrWhite : 200.0f;
+    probe.hdrOn = desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+                  desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
+    return probe;
+}
+
 mcdr::Result<void> createSwapChainForWindow(IDXGIFactory4* factory, ID3D12CommandQueue* queue, HWND win,
                                            HWND presentWin, UINT width, UINT height,
-                                           const SwapChainBundle* reuse, SwapChainBundle& out) {
+                                           const SwapChainBundle* reuse, SwapChainBundle& out,
+                                           DXGI_FORMAT format) {
     static constexpr struct {
         DXGI_SWAP_EFFECT effect;
         UINT flags;
@@ -384,7 +488,7 @@ mcdr::Result<void> createSwapChainForWindow(IDXGIFactory4* factory, ID3D12Comman
         // 但读回 back buffer 尺寸仍是 1x1、颜色恒为 RGBA(24,22,14)）。
         sd.Width = width > 0 ? width : 1;
         sd.Height = height > 0 ? height : 1;
-        sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.Format = format;
         sd.Stereo = FALSE;
         sd.SampleDesc.Count = 1;
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -411,6 +515,17 @@ mcdr::Result<void> createSwapChainForWindow(IDXGIFactory4* factory, ID3D12Comman
                     dbgLogInfo("swapchain OK (tier=%s pass=%d hwnd=%s) — OSD/overlay-capable",
                                tier.label, pass,
                                presentWin != nullptr ? "present-child" : "game-window");
+                    // P195：对齐 26.4-snapshot-5 的 DXGI 封装（DXGIFactory5.makeWindowAssociation(hwnd, 3)）。
+                    // 我们的呈现窗口是自建子窗口，26.3 起全屏由 SDL 改显示模式；若放任 DXGI 自己响应
+                    // Alt+Enter 去对子窗口做 SetFullscreenState，要么失败刷屏、要么把子窗口改成弹窗式
+                    // 全屏盖住父窗口。NO_WINDOW_CHANGES 同时禁掉 DXGI 私自改窗口样式/位置。
+                    // P195/P196：只禁 Alt+Enter。**不能**带 DXGI_MWA_NO_WINDOW_CHANGES ——
+                    // 它禁止 DXGI 改窗口样式/位置，而 SetFullscreenState(TRUE) 正是靠改窗口
+                    // 样式进全屏；带上它会让独占请求直接失败（实测 0x887A0022
+                    // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE）。
+                    const HRESULT assocHr = factory->MakeWindowAssociation(chainWin, DXGI_MWA_NO_ALT_ENTER);
+                    dbgLog("MakeWindowAssociation(hwnd, NO_ALT_ENTER) hr=%08X",
+                           static_cast<unsigned>(assocHr));
                     logSwapChainPresentHook(out.swapChain.Get());
                     break;
                 }
@@ -450,7 +565,7 @@ mcdr::Result<void> createSwapChainForWindow(IDXGIFactory4* factory, ID3D12Comman
                                  comp.error().message);
         }
     }
-    auto created = createCompositionSwapChain(factory2.Get(), queue, width, height, out);
+    auto created = createCompositionSwapChain(factory2.Get(), queue, width, height, format, out);
     if (!created) {
         return mcdr::err("createSwapChainForWindow",
                          "swapchain HWND tiers failed; composition fallback failed: " +
@@ -509,25 +624,50 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
         }
     }
 
-    // P33：CreateSwapChainForHwnd 在部分环境（Issue #11：NVIDIA 独显 + Intel 核显
-    // 笔记本，所有 tier 返回 E_ACCESSDENIED 0x80070005）会被拒绝。先多 tier + 重试，
-    // 仍失败则回退 CreateSwapChainForComposition + DirectComposition（不绑定 HWND）。
-    // RTSS/OSD 修复：给呈现单独建一个子窗口（原因见 createPresentationWindow 注释）。
-    // 它只用于 HWND swapchain；composition 回退时会把它销毁，避免黑窗口盖住合成画面。
-    HWND presentChild = createPresentationWindow(win, initW, initH);
-    if (presentChild != nullptr) {
-        dbgLogDebug("createSurface: presentation child hwnd=%p (%ux%u)",
-                    reinterpret_cast<void*>(presentChild), initW, initH);
-    } else if (win != nullptr) {
-        dbgLog(
-            "createSurface: presentation child window creation failed (err=%lu); "
-            "falling back to the GL window HWND",
-            static_cast<unsigned long>(GetLastError()));
-    }
+    // P197：HDR 判定必须发生在建链之前 —— 格式是 CreateSwapChainForHwnd 的参数。
+    // 只信 DXGI 输出（Windows 高级颜色开启时输出色彩空间就是 PQ/HDR10）；配置只有
+    // auto/on/off 三态，on 用于在系统未开 HDR 时做管线自检。
+    const int hdrMode = mcdr_hdr_state_mode();
+    const HdrProbe probe = probeHdrForWindow(factory.Get(), win);
+    const bool wantHdr = hdrMode == 1 || (hdrMode == 0 && probe.hdrOn);
+    // 记录“真正用掉的”模式：JVM 侧拿它和当前选项比较，决定视频设置里要不要提示重启。
+    mcdr_hdr_state_set_applied_mode(hdrMode);
+    // scRGB：R16G16B16A16_FLOAT + DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709（1.0 = 80 nits）。
+    // 选它而不是 HDR10(PQ) 的原因：线性、可直接输出 >1.0 的亮度，不需要在像素着色器里
+    // 做 PQ 编码，也不会把 SDR 内容压进 10bit 的 PQ 曲线里。
+    const DXGI_FORMAT chainFormat =
+        wantHdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    dbgLogInfo("[P197] HDR probe: mode=%d found=%d hdrOn=%d colorSpace=%d sdrWhite=%.1f nits "
+               "max=%.1f nits -> wantHdr=%d chainFormat=%d",
+               hdrMode, probe.found ? 1 : 0, probe.hdrOn ? 1 : 0, static_cast<int>(probe.colorSpace),
+               probe.sdrWhiteNits, probe.maxLuminanceNits, wantHdr ? 1 : 0,
+               static_cast<int>(chainFormat));
+
+    // P196：present 链优先建在 SDL 顶层窗口（game window）上。26.3 起窗口由 SDL 创建、
+    // 不再被 GL 呈过，26.2 那条「GL 用过的 HWND 被 DXGI 永久拒绝（E_ACCESSDENIED）」
+    // 的前提已消失（实测 run30 建链成功且持续出画）。更重要的是：只有呈现窗口就是顶层
+    // 窗口时，DXGI 才可能进入真独占全屏 —— 子窗口永远只是父窗口里的一个子表面，
+    // SetFullscreenState 会失败或把界面变成弹窗式（见 createSwapChainForWindow 注释）。
+    // 呈现子窗口因此降级为回退：顶层窗口建链失败时才创建它再试一次。
+    HWND presentChild = nullptr;
 
     SwapChainBundle bundle;
-    auto swapChainRes = createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, presentChild, initW,
-                                                 initH, nullptr, bundle);
+    auto swapChainRes = createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, nullptr, initW,
+                                                 initH, nullptr, bundle, chainFormat);
+    if (!swapChainRes && win != nullptr) {
+        dbgLog("createSurface: chain on game window failed (%s); retrying with presentation child",
+               swapChainRes.error().message.c_str());
+        presentChild = createPresentationWindow(win, initW, initH);
+        if (presentChild != nullptr) {
+            dbgLogDebug("createSurface: presentation child hwnd=%p (%ux%u)",
+                        reinterpret_cast<void*>(presentChild), initW, initH);
+            swapChainRes = createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, presentChild,
+                                                    initW, initH, nullptr, bundle, chainFormat);
+        } else {
+            dbgLog("createSurface: presentation child window creation failed (err=%lu)",
+                   static_cast<unsigned long>(GetLastError()));
+        }
+    }
     if (!swapChainRes) {
         // 打印调试层消息辅助诊断
         if (ctx.infoQueue) {
@@ -570,6 +710,27 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
         return mcdr::err("createSurface", "swapchain does not support IDXGISwapChain3");
     }
 
+    // P197：把链切到 scRGB。CheckColorSpaceSupport 必须先过 —— 少数驱动/覆盖层会拒绝，
+    // 拒绝时不重建链（float 链在 G22 色彩空间下就是普通的 SDR 呈现，画面与 RGBA8 等价）。
+    bool hdrActive = false;
+    if (wantHdr) {
+        UINT support = 0;
+        const HRESULT csHr = swapChain3->CheckColorSpaceSupport(
+            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &support);
+        const bool canPresent =
+            SUCCEEDED(csHr) && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0;
+        const HRESULT setHr = canPresent
+            ? swapChain3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)
+            : E_FAIL;
+        if (SUCCEEDED(setHr)) {
+            hdrActive = true;
+        } else {
+            dbgLogWarn("[P197] scRGB color space rejected (check=0x%08X support=0x%X set=0x%08X) — "
+                       "presenting SDR through the float chain",
+                       static_cast<unsigned>(csHr), support, static_cast<unsigned>(setHr));
+        }
+    }
+
     Dx12Surface* s = new Dx12Surface();
     s->hwnd = hwnd;
     s->presentWindow = presentChild;  // 非空 = swapchain 建在自建子窗口上（HWND 路径）
@@ -580,9 +741,78 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
     s->dcompVisual = bundle.dcompVisual;
     // P65：记录实际创建是否带 ALLOW_TEARING（composition swapchain 不支持 tearing）。
     s->allowTearing = bundle.allowTearing;
+    // P197：HDR 状态与 blit 需要的换算系数。scRGB 的 1.0 = 80 nits，而系统「SDR 白」
+    // 通常是 200 nits 左右，所以 SDR 内容要乘 SDRWhiteLevel/80 才是正确的亮度。
+    s->format = chainFormat;
+    s->swapChainFormat = chainFormat;
+    s->hdrActive = hdrActive;
+    s->hdrMaxLuminance = probe.maxLuminanceNits;
+    s->hdrSdrWhiteScale = hdrActive ? std::clamp(probe.sdrWhiteNits / 80.0f, 1.0f, 10.0f) : 1.0f;
+    mcdr_hdr_state_set_active(hdrActive ? 1 : 0);
+    if (hdrActive) {
+        dbgLogInfo("[P197] HDR active: scRGB (R16G16B16A16_FLOAT + G10), SDR white %.1f nits "
+                   "(scale %.3f), max luminance %.1f nits, presentation window %s",
+                   probe.sdrWhiteNits, s->hdrSdrWhiteScale, probe.maxLuminanceNits,
+                   presentChild ? "present-child" : "game-window");
+    } else {
+        dbgLogInfo("[P197] HDR inactive: SDR presentation (format=%d)",
+                   static_cast<int>(chainFormat));
+    }
     // 注意：不在此处 setActiveSurface！surface 必须在 configureSurface 完成后
     // 才设为 active，否则渲染线程会在 backBuffers 为空时尝试 acquire 导致无限循环。
     return static_cast<void*>(s);
+}
+
+// P196：真独占全屏。26.3 的 Window.applyExclusiveFullscreen() 只调 SDL 改显示模式
+// （SDL_SetWindowFullscreenMode + SDL_SetWindowFullscreen），DXGI 的 swap chain 从不进入
+// fullscreen state —— 于是画面永远停留在 DWM 合成窗口，用户看到的"独占全屏"只是窗口铺满
+// 屏幕、分辨率/刷新率换了个值。这里由 Java 侧把 Window.isExclusiveFullscreen() 推进来，
+// 真正调 SetFullscreenState：
+//   ON  → TRUE ：链取得 output 所有权、DWM 让位（FLIP 模型下同样合法，tearing 标志在
+//                全屏下被忽略）
+//   OFF → FALSE：退回桌面组合
+// 失败不致命（驱动/多显示器/覆盖层注入器都可能拒绝），只记 WARN，画面照旧走窗口化路径。
+mcdr::Result<void> setExclusiveFullscreen(Dx12Surface* s, bool on) {
+    if (s == nullptr) return mcdr::err("setExclusiveFullscreen", "surface is null");
+    if (!s->swapChain) return mcdr::err("setExclusiveFullscreen", "surface has no swap chain");
+    if (s->compositionMode) {
+        return mcdr::err("setExclusiveFullscreen",
+                         "composition swap chain cannot enter exclusive fullscreen");
+    }
+    const BOOL want = on ? TRUE : FALSE;
+    const HRESULT hr = s->swapChain->SetFullscreenState(want, nullptr);
+    BOOL actual = FALSE;
+    s->swapChain->GetFullscreenState(&actual, nullptr);
+    if (FAILED(hr)) {
+        dbgLogWarn("P196 setExclusiveFullscreen(%d): SetFullscreenState hr=0x%08X "
+                   "(fullscreenState=%d) — staying windowed",
+                   on ? 1 : 0, static_cast<unsigned>(hr), actual ? 1 : 0);
+        return mcdr::err("setExclusiveFullscreen", "SetFullscreenState failed: " + hrText(hr));
+    }
+    s->exclusive = on;
+    // P196b：真独占下 DXGI 要求链的窗口是前台窗口；我们绕过 SDL 直接改状态，SDL 不会替我们
+    // 把窗口提到前台，窗口留在别的程序后面时 Present 会被 DWM 丢弃 —— 实测表现为"画面冻结"
+    // （presented 计数不再前进、acquire 超时）。显式提到前台。
+    if (on && s->hwnd != 0) {
+        HWND hwnd = reinterpret_cast<HWND>(s->hwnd);
+        ShowWindow(hwnd, SW_SHOW);
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+    }
+    // P196：SetFullscreenState 之后必须重建 back buffer —— DXGI 把链交给 output 时旧的
+    // flip 序列作废，继续 Present 会返回 S_OK 但不再翻页（画面冻结在进全屏前那一帧）。
+    // 同步做完再返回，避免调用方随后就往作废的序列上 present。
+    if (s->width > 0 && s->height > 0) {
+        auto resized = configureSurface(s, static_cast<int>(s->width), static_cast<int>(s->height),
+                                        s->presentMode, /*force=*/true);
+        if (!resized) {
+            dbgLogWarn("P196 setExclusiveFullscreen(%d): forced ResizeBuffers failed: %s", on ? 1 : 0,
+                       resized.error().message.c_str());
+        }
+    }
+    dbgLogInfo("P196 setExclusiveFullscreen(%d): ok, fullscreenState=%d presentWindow=%p",
+               on ? 1 : 0, actual ? 1 : 0, reinterpret_cast<void*>(s->presentWindow));
+    return {};
 }
 
 std::vector<int> surfacePresentModes() {
@@ -590,7 +820,7 @@ std::vector<int> surfacePresentModes() {
     return {0, 2, 3};
 }
 
-mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int presentMode) {
+mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int presentMode, bool force) {
     DeviceContext& ctx = deviceContext();
     // P98 诊断（用户报告：加载屏幕弹出瞬间帧时间骤增、启动加载界面进度条冻结）：
     // 把 configureSurface 各段耗时量出来，定位主线程停顿发生在哪一步。
@@ -627,7 +857,10 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
 
     // 新尺寸与当前 swapchain 一致时，无需 ResizeBuffers（避免已重建的 swapchain
     // 被错误尺寸锁死后再调 ResizeBuffers 仍报 INVALID_CALL）。
-    if (static_cast<UINT>(width) == s->width && static_cast<UINT>(height) == s->height) {
+    // P196：进出真独占时尺寸不变，但必须重建 back buffer —— DXGI 在 SetFullscreenState
+    // 之后把链交给 output，旧的 flip 序列作废；不重建的话 Present 返回 S_OK 却不再翻页，
+    // 画面停在进全屏前那一帧（用户报的"独占全屏后画面冻结"）。此时由 force 绕过跳过。
+    if (!force && static_cast<UINT>(width) == s->width && static_cast<UINT>(height) == s->height) {
         dbgLogInfo("configureSurface: size unchanged %dx%d, skip ResizeBuffers (P98 total=%.1f ms)", width, height,
                nowMs() - p98t0);
         return {};
@@ -698,9 +931,9 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
         if (bb) bb.Reset();
     }
     s->backBuffers.clear();
-    // 使用 swap chain 创建时的格式，而非 s->format（后者可能因内存损坏/误用而变为无效值，
-    // 导致 ResizeBuffers 以 0x887A0001 (DXGI_ERROR_INVALID_CALL) 失败）。
-    const DXGI_FORMAT scFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // P197：用建链时真正的格式（HDR 下是 R16G16B16A16_FLOAT）。旧代码硬编码
+    // R8G8B8A8_UNORM —— 与链格式不符时 ResizeBuffers 固定返回 DXGI_ERROR_INVALID_CALL。
+    const DXGI_FORMAT scFmt = s->swapChainFormat;
     // P70（resize 噪音根因）：ResizeBuffers 的 flags 必须与创建 swapchain 时一致。
     // 这里曾无条件传 DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING；而 createSwapChainForWindow
     // 的多 tier 重试中，"不带 TEARING" 的 tier 成功时 s->allowTearing == false，
@@ -787,7 +1020,8 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
         auto recreated = createSwapChainForWindow(factory.Get(), ctx.queue.Get(),
                                                   reinterpret_cast<HWND>(s->hwnd), s->presentWindow,
                                                   static_cast<UINT>(width), static_cast<UINT>(height),
-                                                  s->compositionMode ? &reuse : nullptr, bundle);
+                                                  s->compositionMode ? &reuse : nullptr, bundle,
+                                                  s->swapChainFormat);
         if (!recreated) {
             return mcdr::err("configureSurface", recreated.error().message + " (recreate)");
         }
@@ -1101,9 +1335,17 @@ mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* 
         // 整帧（世界 + GUI）会被一起柔化，界面就发虚了 —— 也就是用户报告的 GUI 柔化问题。
         {
             cmd->SetGraphicsRootSignature(bp->rootSig.Get());
-            cmd->SetPipelineState(bp->pso.Get());
-            dbgLogDebug("blitSurface: set blit rootSig=%p pso=%p", reinterpret_cast<void*>(bp->rootSig.Get()),
-                        reinterpret_cast<void*>(bp->pso.Get()));
+            // P197：HDR 开启时用 RGBA16F 的 PSO，并把 sRGB→线性 + SDR 白系数交给根常量 b0；
+            // SDR 路径也显式设成 (1,0,0,0)，根常量未设置时读到的内容是未定义的。
+            const bool hdr = s->hdrActive;
+            ID3D12PipelineState* presentPso = (hdr && bp->psoHdr) ? bp->psoHdr.Get() : bp->pso.Get();
+            cmd->SetPipelineState(presentPso);
+            const float hdrParams[4] = {hdr ? s->hdrSdrWhiteScale : 1.0f, hdr ? 1.0f : 0.0f, 0.0f, 0.0f};
+            cmd->SetGraphicsRoot32BitConstants(1, 4, hdrParams, 0);
+            dbgLogDebug("blitSurface: set blit rootSig=%p pso=%p hdr=%d scale=%.3f",
+                        reinterpret_cast<void*>(bp->rootSig.Get()),
+                        reinterpret_cast<void*>(presentPso), hdr ? 1 : 0,
+                        static_cast<double>(hdrParams[0]));
 
             // 3+4. 源纹理过渡 + SRV 分配 + 根描述符表绑定（一步完成）
             auto blitBind = blitBindSourceTexture(ctx, srcTex, cmd);
@@ -1207,7 +1449,9 @@ mcdr::Result<void> blitTextureToTexture(CommandContext* ctx, Dx12Object* src, Dx
 
     cmd->SetGraphicsRootSignature(bp->rootSig.Get());
     cmd->SetPipelineState(bp->pso.Get());
-    // 源过渡 + SRV 分配 + 根描述符表绑定（一步完成，与 blitSurface 同一条路径）。
+    // P197：这条路径恒定是 SDR→SDR（内部纹理之间拷贝），显式关掉 HDR 变换。
+    const float sdrHdrParams[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    cmd->SetGraphicsRoot32BitConstants(1, 4, sdrHdrParams, 0);
     auto bind = blitBindSourceTexture(ctx, src, cmd);
     if (!bind) {
         return mcdr::err("blitTextureToTexture", "blitTextureToTexture: " + bind.error().message);
@@ -1331,8 +1575,14 @@ void presentSurface(Dx12Surface* s) {
     // Present 立即返回（~0.15ms）故无此问题。传入 ALLOW_TEARING 后全屏不再同步到
     // vblank（等价官方 Vulkan 的 IMMEDIATE present，实测官方全屏 1022FPS）。
     // 前提：swapchain 创建时带 ALLOW_TEARING（s->allowTearing），且 syncInterval==0。
-    UINT syncInterval = (s->presentMode == 0) ? 0 : 1;
-    UINT flags = (s->presentMode == 0 && s->allowTearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    // P196（独占全屏冻结）：真独占下 swap chain 的所有权交给 output，DXGI 明确禁止在
+    // fullscreen 时传 DXGI_PRESENT_ALLOW_TEARING（看起来 Present 仍返回 S_OK，但画面停在
+    // 进全屏前那一帧 —— 用户报告的"应用独占全屏后画面冻结"）。全屏时一律 flags=0 且
+    // syncInterval=1，交回 vsync 驱动翻转。
+    const UINT syncInterval = (s->presentMode == 0 && !s->exclusive) ? 0 : 1;
+    const UINT flags = (s->presentMode == 0 && s->allowTearing && !s->exclusive)
+                           ? DXGI_PRESENT_ALLOW_TEARING
+                           : 0;
     // P95：打印门从 `(currentImageIndex + 1) % 30 == 0` 改为"真实 present 计数"。
     // 旧门在 idx==-1 时恒真（每帧都打）、在健康的 3-buffer 链上恒假（从不打），语义正好
     // 反了：它只记录"没有 back buffer"的异常帧，正常帧一次也不记录。
@@ -1358,6 +1608,19 @@ void presentSurface(Dx12Surface* s) {
     if (logThisPresent) {
         dbgLogInfo("presentSurface: idx=%d sync=%u flags=%u tearing=%d suboptimal=%d", s->currentImageIndex,
                    syncInterval, flags, static_cast<int>(s->allowTearing), static_cast<int>(s->suboptimal));
+        // P196 诊断：独占全屏后画面冻结时，先看链是否真在 fullscreen、窗口尺寸/可见性是否正确。
+        if (s->hwnd != 0) {
+            BOOL fs = FALSE;
+            s->swapChain->GetFullscreenState(&fs, nullptr);
+            RECT wr{}, cr{};
+            GetWindowRect(reinterpret_cast<HWND>(s->hwnd), &wr);
+            GetClientRect(reinterpret_cast<HWND>(s->hwnd), &cr);
+            dbgLogInfo("presentSurface: state fs=%d win=(%ld,%ld %ldx%ld) client=%ldx%ld visible=%d",
+                       fs ? 1 : 0, static_cast<long>(wr.left), static_cast<long>(wr.top),
+                       static_cast<long>(wr.right - wr.left), static_cast<long>(wr.bottom - wr.top),
+                       static_cast<long>(cr.right - cr.left), static_cast<long>(cr.bottom - cr.top),
+                       IsWindowVisible(reinterpret_cast<HWND>(s->hwnd)) ? 1 : 0);
+        }
     }
     // P113：Reflex 要求 Present 之前 sleep（文档 ProgrammingGuideReflex.md §5）。
     mcdr_reflex_before_present();
@@ -1394,29 +1657,54 @@ void presentSurface(Dx12Surface* s) {
     }
 }
 
+// P197：HDR 模式切换（0 = auto / 1 = 强制开 / 2 = 强制关）。只写进程级状态，
+// 真正生效在下次建链/重建链时 —— 换格式必须重建交换链，不能原地改。
+void setHdrMode(int32_t mode) {
+    mcdr_hdr_state_set_mode(mode);
+    dbgLogInfo("[P197] HDR mode set to %d (applies on next swapchain creation)", mode);
+}
+
+int32_t hdrActiveFlag() { return mcdr_hdr_state_active(); }
+
 void destroySurface(Dx12Surface* s) {
     if (!s) return;
     dbgLogDebug("destroySurface: enter surface=%p", reinterpret_cast<void*>(s));
+    dbgLogError("[P184] destroySurface stage: enter");
+    // P196：独占全屏必须在释放链之前退出，否则显示模式会停在独占状态（桌面黑屏 / 分辨率不回退）。
+    if (s->swapChain && s->exclusive) {
+        const HRESULT fsHr = s->swapChain->SetFullscreenState(FALSE, nullptr);
+        s->exclusive = false;
+        dbgLogInfo("destroySurface: left exclusive fullscreen hr=0x%08X", static_cast<unsigned>(fsHr));
+    }
     // P33 修复：async render thread 可能在 destroySurface 期间仍在操作同一 swapchain。
     // 先等待渲染线程完成当前帧（仅同步，不销毁线程），再等 GPU 空闲，
     // 避免 deviceWaitIdle → queue->Signal 与渲染线程的 Present 并发访问 swapchain 导致崩溃。
     waitForRenderThreadSubmit();
+    dbgLogError("[P184] destroySurface stage: waited render thread");
     (void)deviceWaitIdle();
+    dbgLogError("[P184] destroySurface stage: device idle");
+    // P96/P183：先立刻把父窗口刷黑 —— 退出时窗口消失前会短暂露出父窗口客户区，
+    // 早一步上色就少一帧灰/白幕；刷黑只动 GDI，不依赖下面的 fence 等待。
+    HWND presentChild = s->presentWindow;
+    paintParentBlackBeforeDestroy(presentChild);
+    dbgLogError("[P184] destroySurface stage: parent painted");
     // P33 fix：等待 per-surface present fence，确保 Display Controller 已完成
     // flip 并释放 backbuffer 引用。IMMEDIATE 模式 + FLIP_DISCARD 下，deviceWaitIdle
     // 不等待 display controller，backbuffer 仍可能被 DWM 异步读取。
+    // P183：前面已经 deviceWaitIdle，绝大多数情况下 fence 早就完成了 —— 先走快路径
+    // 直接查 GetCompletedValue，避免每次退出都白等满 5 秒（表现为"窗口先灰几秒"）。
     if (!s->surfacePresentFences.empty()) {
         UINT64 pv = 0;
         for (UINT64 v : s->surfacePresentFences)
             if (v > pv) pv = v;
         if (pv > 0) {
             DeviceContext& dc = deviceContext();
-            if (dc.queueFence) {
+            if (dc.queueFence && dc.queueFence->GetCompletedValue() < pv) {
                 HANDLE hEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
                 if (hEvt) {
                     HRESULT hr = dc.queueFence->SetEventOnCompletion(pv, hEvt);
                     if (SUCCEEDED(hr)) {
-                        WaitForSingleObject(hEvt, 5000);
+                        WaitForSingleObject(hEvt, 250);
                     }
                     CloseHandle(hEvt);
                 }
@@ -1426,18 +1714,20 @@ void destroySurface(Dx12Surface* s) {
     // P33 fix：present fence 等 GPU 完成所有命令（含 present），此时再 flush
     // 延迟删除对象，确保不在 GPU 仍引用资源时释放它们（消除 PreSwapInfoQueue
     // CORRUPTION 警告的根本原因）。
+    dbgLogError("[P184] destroySurface stage: fence wait done");
     flushPendingDeletes();
+    dbgLogError("[P184] destroySurface stage: pending deletes flushed");
     if (getActiveSurface() == s) setActiveSurface(nullptr);
     // 先释放 swapchain（delete s），再销毁它的呈现宿主窗口，顺序不能反：
     // 窗口还活着时 DWM 仍持有该窗口的呈现资源引用。
-    HWND presentChild = s->presentWindow;
+    // presentChild 已在 fence 等待之前取出（P183），这里只清字段。
     s->presentWindow = nullptr;
+    dbgLogError("[P184] destroySurface stage: deleting surface");
     delete s;
-    // P96：子窗口销毁后父窗口（GLFW）客户区会暴露出来，而它从未被绘制过（白色）——
-    // 先把父窗口刷黑，退出过程看到的是黑幕而不是"画幅尺寸为启动时窗口尺寸的白幕"。
+    dbgLogError("[P184] destroySurface stage: surface deleted");
+    // P96：父窗口早在上面的 fence 等待之前就刷黑了（P183），这里只补日志与销毁子窗口。
     logWindowState("destroySurface child(before)", presentChild);
     logWindowState("destroySurface parent(before)", presentChild ? GetParent(presentChild) : nullptr);
-    paintParentBlackBeforeDestroy(presentChild);
     if (presentChild != nullptr) DestroyWindow(presentChild);
     logWindowState("destroySurface parent(after)", presentChild ? GetParent(presentChild) : nullptr);
     dbgLogDebug("destroySurface: done surface=%p", reinterpret_cast<void*>(s));
@@ -1449,7 +1739,9 @@ void destroySurfaceNoWaitIdle(Dx12Surface* s) {
     if (getActiveSurface() == s) setActiveSurface(nullptr);
     HWND presentChild = s->presentWindow;
     s->presentWindow = nullptr;
+    dbgLogError("[P184] destroySurface stage: deleting surface");
     delete s;
+    dbgLogError("[P184] destroySurface stage: surface deleted");
     // P96：同 destroySurface —— 先刷黑父窗口再销毁子窗口（见该处说明）。
     paintParentBlackBeforeDestroy(presentChild);
     if (presentChild != nullptr) DestroyWindow(presentChild);

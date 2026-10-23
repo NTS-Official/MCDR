@@ -282,7 +282,7 @@ namespace
 
     NVSDK_NGX_FeatureDiscoveryInfo makeDiscovery(NVSDK_NGX_Feature feature)
     {
-        NVSDK_NGX_FeatureDiscoveryInfo info = {};
+        NVSDK_NGX_FeatureDiscoveryInfo info;
         // P108: NOT NVSDK_NGX_Version_API. The SDK header pins that to 0x0000015
         // (NGX_VERSION_DOT 1.5.0), but the shipped runtime is 310.9.1 and gate-checks the
         // API struct version: with 0x15 BOTH NVSDK_NGX_D3D12_Init_with_ProjectID and
