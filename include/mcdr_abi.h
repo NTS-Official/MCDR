@@ -643,6 +643,9 @@ MCDR_API void MCDR_CALL mcdr_dx12ReflexMarker(int32_t marker);
 // P122：NVIDIA Reflex 模式（0=off 1=on 2=on+boost）与可用性（1=可用）。
 MCDR_API void MCDR_CALL mcdr_dx12SetReflexMode(int32_t mode);
 MCDR_API int32_t MCDR_CALL mcdr_dx12ReflexAvailable(void);
+// P208: 1 = DLSS 可用（Streamline 的 DLSS 插件已加载，或非 Streamline 路径未探测到失败）。
+// 0 = 明确探测到 Streamline 的 DLSS 插件没有初始化（NGX 版本不匹配时），界面据此置灰。
+MCDR_API int32_t MCDR_CALL mcdr_dx12DlssAvailable(void);
 
 // P131：Reflex 自己的限帧器（微秒/帧，0 = 关闭）。配置项 [dlss] reflexFrameLimitUs 的唯一入口。
 MCDR_API void MCDR_CALL mcdr_dx12SetReflexFrameLimit(int32_t micros);
@@ -1014,6 +1017,9 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12IsSurfaceSuboptimal(mcdr_surface* surface);
 // 只改进程状态，真正生效在下次创建/重建交换链时（格式是建链参数，不能原地改）。
 MCDR_API void MCDR_CALL mcdr_dx12SetHdrMode(int32_t mode);
 MCDR_API int32_t MCDR_CALL mcdr_dx12GetHdrAppliedMode(void);
+
+// P117: 光追可见性分层总开关（0=off, 1=ao, 2=ao_shadows, 3=full）；不支持的设备上记下但不生效。
+MCDR_API void MCDR_CALL mcdr_dx12SetRaytracingMode(int32_t mode);
 
 MCDR_API void MCDR_CALL mcdr_dx12DestroySurface(mcdr_surface* surface);
 MCDR_API mcdr_surface* MCDR_CALL mcdr_dx12GetActiveSurfaceHandle(void);

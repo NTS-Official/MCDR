@@ -1,6 +1,7 @@
 module;
 
 #include "_d3d12_module_prelude.h"
+#include "mcdr_rt_state.h"  // P117: 光追模式（创建期日志/后续 G-Buffer 都要读）
 
 // RTX（DLSS/NRD）可用性探测接口。和 dxcapi.h 同理必须放在全局模块片段里，
 // 否则 MSVC 报 C5244（模块 purview 内不得文本包含头文件）。探测实现在
@@ -2021,13 +2022,14 @@ void queryDeviceCapabilities(ID3D12Device* device, DeviceContext::Capabilities& 
 std::string capabilitiesText(const DeviceContext::Capabilities& caps) {
     char buf[512] = {};
     std::snprintf(buf, sizeof(buf),
-                  "FL=%s SM=%s(0x%02X)/eff=%s mesh=%d samplerFeedback=%d rt=%d "
+                  "FL=%s SM=%s(0x%02X)/eff=%s mesh=%d samplerFeedback=%d rt=%d rtMode=%d"
                   "vrs=%d(tile=%u,extra=%d) binding=%d enhancedBarriers=%d",
                   featureLevelName(caps.featureLevel), shaderModelName(caps.shaderModel),
                   static_cast<unsigned>(caps.shaderModel),
                   shaderModelProfileSuffix(effectiveShaderModel(caps)),
                   static_cast<int>(caps.meshShaderTier), static_cast<int>(caps.samplerFeedbackTier),
-                  static_cast<int>(caps.raytracingTier), static_cast<int>(caps.shadingRateTier),
+                  static_cast<int>(caps.raytracingTier), mcdr_rt_state_mode(),
+                  static_cast<int>(caps.shadingRateTier),
                   caps.shadingRateImageTileSize, caps.additionalShadingRates ? 1 : 0,
                   static_cast<int>(caps.resourceBindingTier), caps.enhancedBarriers ? 1 : 0);
     std::string text(buf);
@@ -2356,6 +2358,15 @@ void applyStreamline(ID3D12Device* device) {
         fwprintf(probe, L"setDevice=0x%X load=0x%X dlssLoaded=%s\n",
                  static_cast<unsigned>(deviceResult), static_cast<unsigned>(loadResult),
                  loaded ? L"yes" : L"no");
+    }
+    mcdr_dlss_note_sl_loaded(loaded ? 1 : 0);
+    if (!loaded) {
+        // P208：插件没加载 ⇒ 后面每帧 evaluate 都会被 native 跳过。历史上这条只打 P111 的
+        // `dlssLoaded=no`，容易被当成噪音忽略；这里给一句能照着办的说明。
+        dbgLogError("[P208] Streamline is up but the DLSS plugin did NOT initialize. Look for "
+                    "'NGXInitValidateSnippets' in sl.log next to MCDR.dll: the installed NGX "
+                    "runtime is older than the bundled nvngx_dlss.dll. DLSS stays off and "
+                    "sub-pixel jitter is suppressed, so the image is stable instead of vibrating.");
     }
     dbgLogWarn("P111 streamline: slIsFeatureSupported(DLSS)=%d setDevice=0x%X load=0x%X dlssLoaded=%s", slSupport,
                static_cast<unsigned>(deviceResult), static_cast<unsigned>(loadResult),
@@ -9075,7 +9086,7 @@ int setDlssOutput(mcdr_object* tex) {
 // CreateFeature 的输入，不能只在 Evaluate 参数上改。
 // 越界返回 -1 且不改变现状；返回归一化后的档位。
 int setDlssQuality(int tier) {
-    if (tier < 0 || tier > 3) {
+    if (tier < 0 || tier > 4) {
         dbgLogError("P108: invalid DLSS quality tier %d (valid: 0=Performance 1=Balanced "
                     "2=Quality 3=DLAA)",
                     tier);

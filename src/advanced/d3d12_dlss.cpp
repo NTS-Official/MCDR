@@ -1275,8 +1275,9 @@ namespace
         // `effectiveQuality` now stores the ACCEPTED TIER (0..3, -1 = ratio-chosen), so the
         // downgrade becomes this round's baseline and is not re-detected every frame.
         int resolvedTier = s.requestedQuality;  // -1 = no explicit tier: ratio-chosen
+        // Tier 4 = DLAA（2026-10-24：插入 Ultra Performance 之后 DLAA 从 3 挪到 4）。
         const bool dlaaMismatch =
-            (resolvedTier == 3) && (in.renderWidth != in.targetWidth ||
+            (resolvedTier == 4) && (in.renderWidth != in.targetWidth ||
                                     in.renderHeight != in.targetHeight);
         if (dlaaMismatch) {
             resolvedTier = 2;
@@ -1330,16 +1331,23 @@ namespace
             // The old note here said the jitter was frozen to 0 because injection "collapsed the
             // frame"; that diagnosis was built on byte-swapped matrix data (see known_bugs.md D.25)
             // and no longer applies.
-            static const uint32_t kTierToNgx[4] = {
+            // P112 (2026-10-24, user m07529): five tiers — Ultra Performance is now the first
+            // entry of `QUALITY_NAMES` on the Java side, so the table order must match that list,
+            // not NGX's enum order. 4 is still DLAA (reached through the AA mode, not the list).
+            static const uint32_t kTierToNgx[5] = {
+                static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_UltraPerformance),
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_MaxPerf),
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_Balanced),
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_MaxQuality),
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_DLAA),
             };
-            // `resolvedTier` is already 0..3 and has the DLAA 1:1 restriction applied above;
+            // `resolvedTier` is already 0..4 and has the DLAA 1:1 restriction applied above;
             // a rejected DLAA was turned into Quality *before* the rebuild decision, so the
             // accepted tier is the one remembered below.
             const int tier = resolvedTier;
+            if (tier < 0 || tier > 4) {
+                return false;
+            }
             s.qualityValue = kTierToNgx[tier];
             s.qualityIsExplicit = true;
             // The optimal-settings query also yields the sharpness the SDK recommends for this
@@ -1529,6 +1537,12 @@ namespace
 
 // P118：给设备/交换链模块用的决策出口（外部链接；实现走上面的 dlssImplStreamline）。
 int32_t mcdr_dlss_streamline_requested(void) { return dlssImplStreamline() ? 1 : 0; }
+
+// P208：-1 = 还没探测（非 Streamline 路径或 slIsFeatureLoaded 未跑），0 = 探测到未加载，1 = 已加载。
+// 只在“明确探测到未加载”时报不可用，避免把非 Streamline 的 NGX 路径误判成坏。
+namespace { std::atomic<int32_t> gSlDlssLoaded{-1}; }
+void mcdr_dlss_note_sl_loaded(int32_t loaded) { gSlDlssLoaded.store(loaded ? 1 : 0); }
+int32_t mcdr_dlss_available(void) { return gSlDlssLoaded.load() == 0 ? 0 : 1; }
 
 // ---------------------------------------------------------------------------
 // C interface for the device module. Every string crosses as a (char*, cap) buffer,
@@ -2338,8 +2352,6 @@ sl::FrameToken* gLastFrameToken = nullptr;
             (void)api.setConstants(cnst, *token, viewport);
         }
 
-        // TEMP-P199c（泄露二分，验证完必须删）：0=完整路径，1=跳过 slEvaluateFeature，2=跳过 slSetTagForFrame。
-        constexpr int kLeakArm = 2;
         // 2) 资源 tag（lifecycle 按文档 :143-147：输入/输出 eOnlyValidNow，深度/MV eValidUntilPresent）
         // 只保留输出这一个 barrier：文档 :155 说资源状态由 SL 管理，输入侧的 transition 没必要，
         // 还会和 SMAA/GUI 的既有状态重复切；tag 里仍带上资源当前应有的 state（D3D12 下必填）。
@@ -2362,8 +2374,18 @@ sl::FrameToken* gLastFrameToken = nullptr;
             sl::ResourceTag(&outRes, sl::kBufferTypeScalingOutputColor,
                             sl::ResourceLifecycle::eOnlyValidNow),
         };
-        const sl::Result tagResult =
-            kLeakArm == 2 ? sl::Result::eOk : api.setTags(*token, viewport, tags, 4, cmd);
+        const sl::Result tagResult = api.setTags(*token, viewport, tags, 4, cmd);
+        if (tagResult != sl::Result::eOk) {
+            // 只在第一次失败时打一行：每帧打会把日志刷爆（P210 时吃过这个亏）。
+            static bool warnedTag = false;
+            if (!warnedTag) {
+                warnedTag = true;
+                logWarn("P210: slSetTagForFrame failed=0x%X (frame=%u, color=%p depth=%p mv=%p out=%p)",
+                        static_cast<unsigned>(tagResult), s.submitCount,
+                        static_cast<void*>(color), static_cast<void*>(depth),
+                        static_cast<void*>(mv), static_cast<void*>(outResource));
+            }
+        }
 
         // 3) 选项（:170-186：各档 preset + 模式 + 输出尺寸 + 非 HDR/非自动曝光）
         sl::DLSSOptions opt{};
@@ -2417,11 +2439,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
         // 4) evaluate（文档 :235：inputs 只需要 viewport；资源已经在 tag 里给过）
         const sl::BaseStructure* evalInputs[1] = {&viewport};
         sl::Result evalResult = sl::Result::eOk;
-        if (kLeakArm != 1) {
-            evalResult = api.evaluate(sl::kFeatureDLSS, *token, evalInputs, 1, cmd);
-        } else {
-            logWarn("P199c: leak bisect arm=1 (slEvaluateFeature skipped)");
-        }
+        evalResult = api.evaluate(sl::kFeatureDLSS, *token, evalInputs, 1, cmd);
         ++s.submitCount;
 
         // 4.5) handover：只有当 SL 写的那张纹理不是 GUI 目标时才需要拷回（同尺寸、同格式）。
@@ -2684,7 +2702,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // the next frame (PerfQualityValue is a CreateFeature input); -1 restores the "closest to the
     // render:target ratio" behaviour for old DLL/old JVM combinations.
     int32_t mcdr_dlss_request_quality(int32_t tier) {
-    const int normalised = (tier < 0) ? -1 : (tier > 3 ? 3 : tier);
+    const int normalised = (tier < 0) ? -1 : (tier > 4 ? 4 : tier);
     if (normalised != s.requestedQuality) {
         s.requestedQuality = normalised;
         // Allow a rebuild even if a previous create failed, so switching tiers can recover.
@@ -2694,11 +2712,11 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
             logInfo("P108: DLSS quality tier request: %d (%s) — the feature will be rebuilt",
                     normalised,
                     normalised < 0 ? "unset -> closest to the render:target ratio"
-                                   : (normalised == 0 ? "Performance"
-                                                      : (normalised == 1 ? "Balanced"
-                                                                         : (normalised == 2
-                                                                                ? "Quality"
-                                                                                : "DLAA"))));
+                                   : (normalised == 1 ? "Performance"
+                                                      : (normalised == 2 ? "Balanced"
+                                                                         : (normalised == 3 ? "Quality"
+                                                                                            : (normalised == 4 ? "DLAA"
+                                                                                                               : "Ultra Performance")))));
         }
     }
     return normalised;

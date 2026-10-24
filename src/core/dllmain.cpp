@@ -1,4 +1,4 @@
-// DLL 入口点。
+// DLL 入口点
 extern "C" {
 
 #include <windows.h>

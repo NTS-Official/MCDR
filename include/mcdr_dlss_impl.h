@@ -89,6 +89,13 @@ void mcdr_reflex_after_present(void);
 // P118：当前是否启用 Streamline 路径（默认 auto：运行库存在即启用；`MCDR_DLSS_IMPL=ngx` 可强制回退）。
 int32_t mcdr_dlss_streamline_requested(void);
 
+// P208：Streamline 模式下 DLSS 插件是否真的加载成功。`applyStreamline` 在 `slIsFeatureLoaded`
+// 之后记账；`mcdr_dlss_available()` 据此对 Java 侧报“不可用”。为什么要问这个：NGX 拒绝初始化时
+// （典型日志 `NGXInitValidateSnippets: installed NGX API is older than ...`）DLSS 会静默退化成
+// “开关亮着、每帧被 native 跳过”，界面和日志都看不出问题 —— 实测就是用户看到的“开了 DLSS 画面在晃”。
+void mcdr_dlss_note_sl_loaded(int32_t loaded);
+int32_t mcdr_dlss_available(void);
+
 // P122：Reflex 模式（0=off 1=eLowLatency 2=eLowLatencyWithBoost）与可用性查询。
 void mcdr_reflex_set_mode(int32_t mode);
 int32_t mcdr_reflex_available(void);

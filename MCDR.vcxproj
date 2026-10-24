@@ -250,6 +250,7 @@
     <!-- P197：HDR 状态单元。普通 TU（surface 是模块单元、DLSS 是普通 TU，
          模块 purview 里的定义无法被普通 TU 链接，故状态单拎出来）。 -->
     <ClCompile Include="src\core\d3d12_hdr_state.cpp" />
+    <ClCompile Include="src\core\d3d12_rt_state.cpp" />
     <ClCompile Include="src\core\d3d12_async_descriptor.cpp" />
     <ClCompile Include="src\core\d3d12_async_fence.cpp" />
     <ClCompile Include="src\advanced\d3d12_rtx_probe.cpp" />

@@ -287,6 +287,8 @@ void MCDR_CALL mcdr_dx12ReflexMarker(int32_t marker) { mcdr_reflex_marker(marker
 void MCDR_CALL mcdr_dx12SetReflexMode(int32_t mode) { mcdr_reflex_set_mode(mode); }
 
 int32_t MCDR_CALL mcdr_dx12ReflexAvailable(void) { return mcdr_reflex_available(); }
+// P208：Streamline 的 DLSS 插件加载状态（见 mcdr_dlss_available 的注释）。
+int32_t MCDR_CALL mcdr_dx12DlssAvailable(void) { return mcdr_dlss_available(); }
 
 void MCDR_CALL mcdr_dx12SetReflexFrameLimit(int32_t micros) {
     mcdr_reflex_set_frame_limit(static_cast<uint32_t>(micros < 0 ? 0 : micros));

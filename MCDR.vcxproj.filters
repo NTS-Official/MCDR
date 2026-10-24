@@ -200,5 +200,8 @@
     <ClCompile Include="src\advanced\d3d12_rtx_probe.cpp">
       <Filter>源文件\Advanced</Filter>
     </ClCompile>
+    <ClCompile Include="src\core\d3d12_hdr_state.cpp">
+      <Filter>源文件\Core</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

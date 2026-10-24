@@ -11,6 +11,7 @@ module mcdr.abi.common;
 
 #include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
 #include "mcdr_hdr_state.h"  // P198: 建链时实际用掉的 HDR 模式（普通 TU 的 C 状态）
+#include "mcdr_rt_state.h"  // P117: 光追可见性分层总开关（普通 TU 的 C 状态）
 
 import mcdr.d3d12.device;
 import mcdr.d3d12.mesh;
@@ -361,6 +362,12 @@ int32_t MCDR_CALL mcdr_dx12IsSurfaceSuboptimal(mcdr_surface* surface) {
 }
 
 void MCDR_CALL mcdr_dx12SetHdrMode(int32_t mode) { setHdrMode(mode); }
+
+// P117: 光追可见性分层总开关。此刻只做状态存储与日志，G-Buffer/采样的创建在 device 侧。
+void MCDR_CALL mcdr_dx12SetRaytracingMode(int32_t mode) {
+    mcdr_rt_state_set_mode(mode);
+    dbgLog("[P117] raytracing mode=%d (0=off 1=ao 2=ao_shadows 3=full)", static_cast<int>(mode));
+}
 
 // P198: 建链时实际用掉的 HDR 模式（-1 = 还没建过链），JVM 侧据此提示“需要重启”。
 int32_t MCDR_CALL mcdr_dx12GetHdrAppliedMode(void) { return mcdr_hdr_state_applied_mode(); }
