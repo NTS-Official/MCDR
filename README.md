@@ -4,16 +4,20 @@
 <div align="center">
 
 <img src="https://img.shields.io/github/actions/workflow/status/NTS-Official/MCDR/msbuild.yml?style=for-the-badge">
-<img src="https://img.shields.io/badge/Powered%20by%20Kotlin-Java%20FFM%20API-orange?style=for-the-badge&logo=kotlin">
-<img src="https://img.shields.io/badge/DirectX%2012-grey?style=for-the-badge&logo=cplusplus&label=C%2B%2B23&labelColor=blue">
-<img src="https://img.shields.io/badge/Powered%20by%20Streamline-green?style=for-the-badge&logo=nvidia&labelColor=grey">
-<img src="https://img.shields.io/badge/Powered%20by%20Fidelity%20FX-grey?style=for-the-badge&logo=amd&labelColor=red">
-<img src="https://img.shields.io/badge/Powered%20by%20XeSS-grey?style=for-the-badge&logo=intel&labelColor=blue">
 
 </div>
 
 ## Introduction
 MCDR is the Direct3D 12 native library part of the project DXRMC.
+
+The native library portion of DirectXMod has been modernized, along with a set of build system changes:
+
+- The CMake build system was replaced with MSBuild, so it fits the Visual Studio IDE and the Windows target platform perfectly.
+- External libraries are now accessed through Project Panama bindings instead of JNI/JNA.
+- C++17 was replaced with `/std:c++latest` of MSVC v145 (that is, C++23 plus a small number of C++26 features).
+- The latest Agility SDK is used, upgrading SM5.1 to SM6.8.
+- Various small utility packages were added, such as nlohmann-json for conveniently assembling JSON.
+- …
 
 # Acknowledgments
 This is the acknowledgements part of the project DXRMC.
