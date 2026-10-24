@@ -408,6 +408,12 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12SnapshotDlssDepth(mcdr_command_ctx* ctx, mcd
 // is 2 (Quality), which is what the previous ratio-based selection picked on the 640x360 -> 854x480
 // configuration, so behaviour is unchanged until the Java side sets a tier.
 MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssQuality(int32_t tier);
+// P213：帧生成（DLSS-G）。mode: 0=off 1=on（固定倍率） 2=dynamic；numFrames 1..5（见 slDLSSGGetState）。
+// 选项在渲染线程的下一次 present 生效；Reflex 必须开启，否则 status 会带 eFailReflexNotDetectedAtRuntime。
+MCDR_API void MCDR_CALL mcdr_dx12SetDlssgMode(int32_t mode, int32_t numFrames);
+
+/* P213c：上一次 Present 真正提交的帧数（1 = 没插帧）。F3 的 output 用它累积。 */
+MCDR_API int32_t MCDR_CALL mcdr_dx12GetDlssgPresented(void);
 
 // P108ac (user m08033): the DLSS *model*, exposed as NGX's "render preset" hint.
 //

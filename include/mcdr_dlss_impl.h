@@ -96,6 +96,13 @@ int32_t mcdr_dlss_streamline_requested(void);
 void mcdr_dlss_note_sl_loaded(int32_t loaded);
 int32_t mcdr_dlss_available(void);
 
+// P213：帧生成（DLSS-G）的开关。0 = off，1 = on（固定倍率），2 = dynamic。
+// 只写状态；slDLSSGSetOptions 由渲染线程在 evaluate 里下发（那里才有 frame token/viewport）。
+void mcdr_dlss_set_fg_mode(int32_t mode, int32_t numFrames);
+
+// P213c：上一次 Present 真正提交的帧数（1 = 没插帧），F3 的 output 用。
+int32_t mcdr_dlss_fg_presented(void);
+
 // P122：Reflex 模式（0=off 1=eLowLatency 2=eLowLatencyWithBoost）与可用性查询。
 void mcdr_reflex_set_mode(int32_t mode);
 int32_t mcdr_reflex_available(void);

@@ -290,6 +290,17 @@ int32_t MCDR_CALL mcdr_dx12ReflexAvailable(void) { return mcdr_reflex_available(
 // P208：Streamline 的 DLSS 插件加载状态（见 mcdr_dlss_available 的注释）。
 int32_t MCDR_CALL mcdr_dx12DlssAvailable(void) { return mcdr_dlss_available(); }
 
+// P213：帧生成（DLSS-G）的开关。0 = off，1 = on（固定倍率），2 = dynamic。
+// 这里只存状态；真正的 slDLSSGSetOptions 在渲染线程的 evaluate 里下发（见 d3d12_dlss.cpp）。
+void MCDR_CALL mcdr_dx12SetDlssgMode(int32_t mode, int32_t numFrames) {
+    mcdr_dlss_set_fg_mode(mode, numFrames);
+}
+
+// P213c：上一次 Present 真正提交的帧数，给 JVM 的 F3 帧率行用。
+int32_t MCDR_CALL mcdr_dx12GetDlssgPresented(void) {
+    return mcdr_dlss_fg_presented();
+}
+
 void MCDR_CALL mcdr_dx12SetReflexFrameLimit(int32_t micros) {
     mcdr_reflex_set_frame_limit(static_cast<uint32_t>(micros < 0 ? 0 : micros));
 }

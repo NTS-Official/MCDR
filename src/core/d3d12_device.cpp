@@ -42,6 +42,7 @@ module;
 #if __has_include(<sl.h>)
 #include <sl.h>
 #include <sl_dlss.h>   // P112：sl::DLSSMode / sl::DLSSOptions（sl.h 只含 core）
+#include <sl_dlss_g.h> // P213：sl::DLSSGOptions / sl::DLSSGState（帧生成）
 #define MCDR_HAVE_STREAMLINE 1
 #else
 #define MCDR_HAVE_STREAMLINE 0
@@ -2306,7 +2307,10 @@ void streamlineInitEarly() {
     const wchar_t* paths[1] = { gSlDir.c_str() };
     // P113：同时请求 Reflex（低延迟），插件才会加载。
     // P113：DLSS + Reflex（低延迟）+ PCL（延迟统计的标记通道，文档 ProgrammingGuidePCL.md:115）。
-    sl::Feature features[3] = { sl::kFeatureDLSS, sl::kFeatureReflex, sl::kFeaturePCL };
+    // P213：加上 DLSS-G（帧生成）。featuresToLoad 里的插件缺一个，SL 只会记一条日志，
+    // 不会让 slInit 整体失败——所以 P213 的探针要单独核对 DLSS_G 的 supported/loaded。
+    sl::Feature features[4] = { sl::kFeatureDLSS, sl::kFeatureReflex, sl::kFeaturePCL,
+                               sl::kFeatureDLSS_G };
     sl::Preferences pref{};
     pref.engine = sl::EngineType::eCustom;
     pref.engineVersion = "1.0.0";
@@ -2318,7 +2322,7 @@ void streamlineInitEarly() {
     pref.numPathsToPlugins = 1;
     // 必须预声明 featuresToLoad（ProgrammingGuide.md:231）：为空时 SL 不加载任何插件。
     pref.featuresToLoad = features;
-    pref.numFeaturesToLoad = 3;
+    pref.numFeaturesToLoad = 4;
     pref.pathToLogsAndData = gSlDir.c_str();
     pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
                 sl::PreferenceFlags::eDisableDebugText |
@@ -2401,6 +2405,57 @@ void applyStreamline(ID3D12Device* device) {
     }
     dbgLogWarn("P111 streamline: slDLSSSetOptions probe getFn=0x%X result=0x%X", getFnResult,
                static_cast<unsigned>(optResult));
+
+    // P213：DLSS-G（帧生成）的支持性/加载状态探针。这一阶段**只回答三个问题**，不改任何渲染路径：
+    //   supported —— 这台机器/驱动支不支持帧生成（需要适配器 LUID）；
+    //   loaded    —— interposer 有没有真的把 sl.dlss_g.dll 拉起来（缺文件时 supported 仍可能是 1）；
+    //   state     —— 让 SL 自己报一次状态：最小尺寸、最多能生成几帧、预估显存占用。
+    // 这三行日志就是 Phase A 之前唯一需要的验收证据。
+    {
+        bool gLoaded = false;
+        unsigned gLoad = 0xFFFFFFFFu;
+        if (gSlIsLoaded != nullptr) {
+            gLoad = static_cast<unsigned>((*gSlIsLoaded)(sl::kFeatureDLSS_G, gLoaded));
+        }
+        int gSupported = -1;
+        if (device != nullptr) {
+            using PFn_IsSupported = sl::Result (*)(sl::Feature, const sl::AdapterInfo&);
+            auto isSupported = reinterpret_cast<PFn_IsSupported>(
+                ::GetProcAddress(gSlModule, "slIsFeatureSupported"));
+            if (isSupported != nullptr) {
+                const LUID gLuid = device->GetAdapterLuid();
+                sl::AdapterInfo gInfo{};
+                gInfo.deviceLUID = reinterpret_cast<uint8_t*>(const_cast<LUID*>(&gLuid));
+                gInfo.deviceLUIDSizeInBytes = sizeof(LUID);
+                gSupported = static_cast<int>(isSupported(sl::kFeatureDLSS_G, gInfo));
+            }
+        }
+        unsigned gStateResult = 0xFFFFFFFFu;
+        unsigned gStatus = 0;
+        unsigned gMinDim = 0;
+        unsigned gMaxFrames = 0;
+        unsigned long long gVramBytes = 0;
+        if (getFeatureFunction != nullptr && gLoaded) {
+            void* raw = nullptr;
+            if (getFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState", raw) == sl::Result::eOk
+                && raw != nullptr) {
+                using PFn_GetState = sl::Result (*)(const sl::ViewportHandle&, sl::DLSSGState&,
+                                                    const sl::DLSSGOptions*);
+                auto getState = reinterpret_cast<PFn_GetState>(raw);
+                sl::DLSSGState state{};
+                const sl::ViewportHandle viewport(0);
+                gStateResult = static_cast<unsigned>(getState(viewport, state, nullptr));
+                gStatus = static_cast<unsigned>(state.status);
+                gMinDim = state.minWidthOrHeight;
+                gMaxFrames = state.numFramesToGenerateMax;
+                gVramBytes = state.estimatedVRAMUsageInBytes;
+            }
+        }
+        dbgLogWarn("[P213] DLSS-G probe: supported=%d loaded=%s load=0x%X getState=0x%X status=0x%X "
+                   "minDim=%u maxFrames=%u vram=%lluMB",
+                   gSupported, gLoaded ? "yes" : "no", gLoad, gStateResult, gStatus, gMinDim,
+                   static_cast<unsigned>(gMaxFrames), gVramBytes / (1024ull * 1024ull));
+    }
 }
 #endif
 

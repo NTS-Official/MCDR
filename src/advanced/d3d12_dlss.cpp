@@ -45,6 +45,7 @@
 #include <sl.h>
 #include <sl_dlss.h>   // sl::DLSSMode / sl::DLSSOptions（sl.h 只含 core）
 #include <sl_reflex.h>  // P113：sl::ReflexOptions / sl::ReflexMode
+#include <sl_dlss_g.h>  // P213：sl::DLSSGOptions / sl::DLSSGMode（帧生成）
 #define MCDR_DLSS_HAVE_STREAMLINE 1
 #else
 #define MCDR_DLSS_HAVE_STREAMLINE 0
@@ -1927,11 +1928,15 @@ sl::FrameToken* gLastFrameToken = nullptr;
 
     // P113/P115：Reflex 低延迟 + PCL 延迟标记 + 帧率限制器。
     // 文档：ProgrammingGuideReflex.md §4（选项）/§5（Present 前 sleep）、ProgrammingGuidePCL.md（标记）。
+    // 定义在文件后部的帧生成状态；Reflex 的“FG 必须开 Reflex”联动要用它。
+    extern std::atomic<int32_t> gDlssgMode;
+
     using PFn_SetReflexOptions = sl::Result (*)(const sl::ReflexOptions&);
     using PFn_ReflexSleep = sl::Result (*)(const sl::FrameToken&);
     using PFn_PCLSetMarker = sl::Result (*)(sl::PCLMarker, const sl::FrameToken&);
 
     namespace {
+
         struct ReflexApi {
             PFn_SetReflexOptions setOptions = nullptr;
             PFn_ReflexSleep sleep = nullptr;
@@ -1945,6 +1950,9 @@ sl::FrameToken* gLastFrameToken = nullptr;
             bool optionsApplied = false;
             uint32_t frameLimitUs = 0;
             uint32_t markerFailures = 0;
+            // P213d：上一次真正下发的生效模式与限帧，用来判断“要不要重发”。
+            int32_t appliedMode = -1;
+            uint32_t appliedFrameLimitUs = 0;
         };
         ReflexApi gReflex;
         bool reflexEnabled() {
@@ -1972,7 +1980,8 @@ sl::FrameToken* gLastFrameToken = nullptr;
             auto gff = reinterpret_cast<PFn_GetFeatureFunction>(::GetProcAddress(sl, "slGetFeatureFunction"));
             if (gff == nullptr) return;
             void* raw = nullptr;
-            if (gff(sl::kFeatureReflex, "slReflexSetOptions", raw) == sl::Result::eOk) {
+            const sl::Result setOptsResult = gff(sl::kFeatureReflex, "slReflexSetOptions", raw);
+            if (setOptsResult == sl::Result::eOk) {
                 gReflex.setOptions = reinterpret_cast<PFn_SetReflexOptions>(raw);
             }
             raw = nullptr;
@@ -1994,18 +2003,30 @@ sl::FrameToken* gLastFrameToken = nullptr;
             }
         }
         void applyReflexOptions() {
-            if (gReflex.setOptions == nullptr || gReflex.optionsApplied) return;
-            gReflex.optionsApplied = true;
+            if (gReflex.setOptions == nullptr) return;
+            // P213d：帧生成必须开 Reflex —— Reflex 关闭时 Streamline 直接拒绝插帧
+            // （sl.log 里是 "DLSS-G disabled"）。用户选的 OFF 在 FG 打开期间按 ON 生效，
+            // FG 关掉后自动回到用户原值。
+            const int32_t fgMode = gDlssgMode.load();
+            int32_t effective = gReflex.mode;
+            if (fgMode != 0 && effective == 0) {
+                effective = 1;
+            }
+            if (gReflex.optionsApplied && effective == gReflex.appliedMode &&
+                gReflex.frameLimitUs == gReflex.appliedFrameLimitUs) {
+                return;
+            }
             sl::ReflexOptions opt{};
-            opt.mode = gReflex.mode == 2 ? sl::ReflexMode::eLowLatencyWithBoost
-                                        : (gReflex.mode == 1 ? sl::ReflexMode::eLowLatency
-                                                             : sl::ReflexMode::eOff);
+            opt.mode = effective == 2 ? sl::ReflexMode::eLowLatencyWithBoost
+                                      : (effective == 1 ? sl::ReflexMode::eLowLatency
+                                                        : sl::ReflexMode::eOff);
             opt.frameLimitUs = gReflex.frameLimitUs;  // 0 = 不限帧（文档：与 mode 独立）
             const sl::Result r = gReflex.setOptions(opt);
-            if (r != sl::Result::eOk) {
-                logWarn("P113 reflex: slReflexSetOptions(mode=%d, frameLimitUs=%u) result=0x%X",
-                        gReflex.mode, gReflex.frameLimitUs, static_cast<unsigned>(r));
-            }
+            gReflex.optionsApplied = true;
+            gReflex.appliedMode = effective;
+            gReflex.appliedFrameLimitUs = gReflex.frameLimitUs;
+            logWarn("P213d reflex: effective mode=%d (user=%d fg=%d frameLimitUs=%u) result=0x%X",
+                    effective, gReflex.mode, fgMode, gReflex.frameLimitUs, static_cast<unsigned>(r));
         }
         void emitMarker(sl::PCLMarker marker) {
             if (gReflex.marker == nullptr || gLastFrameToken == nullptr) return;
@@ -2112,23 +2133,40 @@ sl::FrameToken* gLastFrameToken = nullptr;
     // ProgrammingGuide.md §2.11.1：slSetConstants(constants, frame, viewport)
     using PFn_slSetConstants = sl::Result (*)(const sl::Constants&, const sl::FrameToken&,
                                              const sl::ViewportHandle&);
+    // P213：帧生成的选项入口（ProgrammingGuideDLSS_G.md §6.0）。
+    using PFn_SlDLSSGSetOptions = sl::Result (*)(const sl::ViewportHandle&, const sl::DLSSGOptions&);
+    // P213：帧生成的状态查询（读 numFramesActuallyPresented / status，用来验证是否真的在插帧）。
+    using PFn_SlDLSSGGetState = sl::Result (*)(const sl::ViewportHandle&, sl::DLSSGState&, const sl::BaseStructure**);
+
+    // P213 阶段 2：帧生成的开关状态。0 = off，1 = on（固定倍率），2 = dynamic。
+    // 由 ABI `mcdr_dx12SetDlssgMode` 写入，渲染线程每帧读取。
+    std::atomic<int32_t> gDlssgMode{0};
+    std::atomic<int32_t> gDlssgFrames{1};
+    // P213c：最近一次 Present 真正提交了几帧（1 = 只有应用帧，2+ = 插帧生效）。给 F3 的 output 用。
+    std::atomic<int32_t> gFgPresented{1};
 
     // P112 阶段 2：Streamline 的每帧调用面（全部运行时解析，不引入静态导入）。
     struct StreamlineEvalApi {
         PFn_SlDLSSSetOptions setOptions = nullptr;
+        PFn_SlDLSSGSetOptions setFgOptions = nullptr;
+        PFn_SlDLSSGGetState getFgState = nullptr;
         PFn_slGetNewFrameToken newFrameToken = nullptr;
         PFn_slSetTagForFrame setTags = nullptr;
         PFn_slSetConstants setConstants = nullptr;
         PFn_slEvaluateFeature evaluate = nullptr;
     };
 
-    const StreamlineEvalApi& streamlineEvalApi() {
-        static const StreamlineEvalApi api = []() -> StreamlineEvalApi {
+    // P213：DLSS-G 插件可能比 DLSS 晚加载，所以解析要能重试（见 refreshFgApi）。
+    HMODULE gSlInterposer = nullptr;
+
+    StreamlineEvalApi& streamlineEvalApi() {
+        static StreamlineEvalApi api = []() -> StreamlineEvalApi {
             StreamlineEvalApi a{};
             const std::wstring dir = dlssModuleDirectory();
             if (dir.empty()) return a;
             HMODULE sl = ::LoadLibraryW((dir + L"sl.interposer.dll").c_str());
             if (sl == nullptr) return a;
+            gSlInterposer = sl;
             a.newFrameToken = reinterpret_cast<PFn_slGetNewFrameToken>(
                 ::GetProcAddress(sl, "slGetNewFrameToken"));
             a.setTags = reinterpret_cast<PFn_slSetTagForFrame>(
@@ -2144,6 +2182,15 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 void* raw = nullptr;
                 if (gff(sl::kFeatureDLSS, "slDLSSSetOptions", raw) == sl::Result::eOk) {
                     a.setOptions = reinterpret_cast<PFn_SlDLSSSetOptions>(raw);
+                }
+                // P213：帧生成的选项函数在 DLSS-G 插件里，插件没加载时这里就是 nullptr。
+                raw = nullptr;
+                if (gff(sl::kFeatureDLSS_G, "slDLSSGSetOptions", raw) == sl::Result::eOk) {
+                    a.setFgOptions = reinterpret_cast<PFn_SlDLSSGSetOptions>(raw);
+                }
+                raw = nullptr;
+                if (gff(sl::kFeatureDLSS_G, "slDLSSGGetState", raw) == sl::Result::eOk) {
+                    a.getFgState = reinterpret_cast<PFn_SlDLSSGGetState>(raw);
                 }
             }
             return a;
@@ -2199,11 +2246,44 @@ sl::FrameToken* gLastFrameToken = nullptr;
     }
     // SL 的 DLSS 评价：按 ProgrammingGuideDLSS.md 的顺序 —— tag 资源 → 设选项 → evaluate。
     // eDisableCLStateTracking 下资源状态由我们负责（这里沿用 NGX 路径的同一组状态）。
+    // P213：DLSS-G 的函数指针是延迟解析的。插件在第一次 evaluate 之后才 load 时，
+    // 之前的 nullptr 会被永久缓存，帧生成就此静默失效——这里按 500ms 节奏重试。
+    void refreshFgApi(StreamlineEvalApi& a) {
+        if (a.setFgOptions != nullptr && a.getFgState != nullptr) return;
+        if (gSlInterposer == nullptr) return;
+        static uint64_t lastTry = 0;
+        const uint64_t now = ::GetTickCount64();
+        if (now - lastTry < 500) return;
+        lastTry = now;
+        using PFn_GetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
+        auto gff = reinterpret_cast<PFn_GetFeatureFunction>(
+            ::GetProcAddress(gSlInterposer, "slGetFeatureFunction"));
+        if (gff == nullptr) return;
+        void* raw = nullptr;
+        if (gff(sl::kFeatureDLSS_G, "slDLSSGSetOptions", raw) == sl::Result::eOk && raw != nullptr) {
+            a.setFgOptions = reinterpret_cast<PFn_SlDLSSGSetOptions>(raw);
+        }
+        raw = nullptr;
+        if (gff(sl::kFeatureDLSS_G, "slDLSSGGetState", raw) == sl::Result::eOk && raw != nullptr) {
+            a.getFgState = reinterpret_cast<PFn_SlDLSSGGetState>(raw);
+        }
+        logWarn("[P213] DLSS-G api refresh: setOptions=%s getState=%s",
+                a.setFgOptions != nullptr ? "ok" : "null",
+                a.getFgState != nullptr ? "ok" : "null");
+    }
+
     int32_t streamlineEvaluate(void* commandList, const mcdr_dlss_input& in, DlssTransitionFn tl,
                                void* tlCtx) {
         auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
         if (cmd == nullptr) return 0;
-        const StreamlineEvalApi& api = streamlineEvalApi();
+        StreamlineEvalApi& api = streamlineEvalApi();
+        if (gDlssgMode.load() != 0) {
+            refreshFgApi(api);
+            static uint32_t fgMissingLog = 0;
+            if (api.setFgOptions == nullptr && (++fgMissingLog % 300u) == 1u) {
+                logWarn("[P213] DLSS-G requested but slDLSSGSetOptions is null (plugin not loaded?)");
+            }
+        }
         auto* color = reinterpret_cast<ID3D12Resource*>(in.pInColor);
         auto* depth = reinterpret_cast<ID3D12Resource*>(in.pInDepth);
         auto* mv = reinterpret_cast<ID3D12Resource*>(in.pInMotionVectors);
@@ -2364,7 +2444,17 @@ sl::FrameToken* gLastFrameToken = nullptr;
                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         sl::Resource outRes(sl::ResourceType::eTex2d, outResource,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        sl::ResourceTag tags[4] = {
+        // P213：HUD-less 必须和其余 tag 在**同一次** slSetTagForFrame 里给出。分成两次调用会让
+        // 后一次覆盖前一次，SL 随后就再也找不到 depth/MV（实测日志：“Failed to find global tag
+        // 'kBufferTypeDepth'”，插帧因此一直不工作）。
+        // HUD-less 用 SR 的输出（窗口尺寸、此后不会被 GUI 写到）；outResource == out 时那张会叠上
+        // UI，不满足“UI 之前”的要求，于是干脆不开 FG。
+        const int32_t fgModeEarly = gDlssgMode.load();
+        const bool wantFg = (fgModeEarly != 0) && (outResource != out) && (api.setFgOptions != nullptr);
+        sl::Resource hudlessRes(sl::ResourceType::eTex2d, outResource,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        sl::ResourceTag tags[5] = {
             sl::ResourceTag(&colorRes, sl::kBufferTypeScalingInputColor,
                             sl::ResourceLifecycle::eOnlyValidNow),
             sl::ResourceTag(&depthRes, sl::kBufferTypeDepth,
@@ -2373,8 +2463,11 @@ sl::FrameToken* gLastFrameToken = nullptr;
                             sl::ResourceLifecycle::eValidUntilPresent),
             sl::ResourceTag(&outRes, sl::kBufferTypeScalingOutputColor,
                             sl::ResourceLifecycle::eOnlyValidNow),
+            sl::ResourceTag(&hudlessRes, sl::kBufferTypeHUDLessColor,
+                            sl::ResourceLifecycle::eValidUntilPresent),
         };
-        const sl::Result tagResult = api.setTags(*token, viewport, tags, 4, cmd);
+        const uint32_t tagCount = wantFg ? 5u : 4u;
+        const sl::Result tagResult = api.setTags(*token, viewport, tags, tagCount, cmd);
         if (tagResult != sl::Result::eOk) {
             // 只在第一次失败时打一行：每帧打会把日志刷爆（P210 时吃过这个亏）。
             static bool warnedTag = false;
@@ -2452,6 +2545,120 @@ sl::FrameToken* gLastFrameToken = nullptr;
         // 5) 宿主负责恢复（:242-253 + eDisableCLStateTracking）：只恢复输出到 RT。
         // 输入侧我们不再改状态，所以也没有要恢复的 barrier。
         transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        // 5.5) P213：帧生成（DLSS-G）。
+        // - HUD-less 必须“UI 之前、与 backbuffer 同尺寸”的画面（ProgrammingGuideDLSS_G.md §5.0）。
+        //   我们这里只有 SR 的输出（`outResource`）满足：它是窗口尺寸、且此后只有 GUI 合成会
+        //   写到 `out`，不会再碰 `outResource`。`outResource == out` 时不满足（那张会叠上 UI），
+        //   所以那种情形直接不开 FG。
+        // - §5.2：tag 的资源在 Present 时才被消费，用 eValidUntilPresent。
+        // - §6.0：slDLSSGSetOptions 要在呈现线程调用、下一次 Present 生效 —— 本函数就在渲染线程，
+        //   紧随其后的 present 就是它要影响的那一次。
+        const int32_t fgMode = fgModeEarly;
+        if (wantFg) {
+            // 上一步的拷贝把 outResource 留在了 COPY_SOURCE；tag 里声明的是 UNORDERED_ACCESS，
+            // 所以这里要把它切回去（Present 时状态必须与 tag 一致）。
+            transition(outResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            // 选项只在“期望状态变了”时下发：每帧调会拖慢 Present 线程（文档 §6.0 也不建议）。
+            static int32_t appliedFgMode = -1;
+            static int32_t appliedFgFrames = -1;
+            // P213f：交换链重建（ResizeBuffers）之后 SL 侧必须重新拿到 options，否则 FG 会停在
+            // 旧尺寸上不再插帧。用“输出尺寸”当代理：尺寸变了就重发一次。
+            static uint32_t appliedFgW = 0;
+            static uint32_t appliedFgH = 0;
+            // P225（Phase D）：动态多帧。
+            // 模式 DYNAMIC 时不再把决定权交给 SL（eDynamic 的 dynamicTargetFrameRate 只跟显示器
+            // 刷新率，完全无视我们的 Reflex 帧限），而是自己按“上帧时长 : 帧限”的比值算要插几帧，
+            // 再用 eOn + 显式 numFramesToGenerate 下发 —— 这样“Reflex 限帧”就是目标呈现率。
+            const int32_t maxFrames = std::clamp<int32_t>(gDlssgFrames.load(), 1, 5);
+            static uint64_t lastFgQpc = 0;
+            static int32_t dynFrames = 1;
+            static int32_t dynTick = 0;
+            int32_t wantFrames = maxFrames;
+            if (fgMode == 2) {
+                LARGE_INTEGER qpc{};
+                LARGE_INTEGER freq{};
+                QueryPerformanceFrequency(&freq);
+                QueryPerformanceCounter(&qpc);
+                const uint64_t nowUs = static_cast<uint64_t>(qpc.QuadPart) * 1000000ull /
+                                       static_cast<uint64_t>(freq.QuadPart);
+                if (lastFgQpc != 0 && nowUs > lastFgQpc) {
+                    const uint32_t renderUs = static_cast<uint32_t>(nowUs - lastFgQpc);
+                    const uint32_t targetUs = gReflex.frameLimitUs;  // 0 = 不限帧
+                    if (targetUs > 0 && renderUs > 0) {
+                        int32_t need = static_cast<int32_t>(targetUs / renderUs) - 1;
+                        need = std::clamp(need, 1, maxFrames);
+                        // 一次只走一帧，避免抖动；上限由“生成帧数”配置决定。
+                        if (need > dynFrames) {
+                            dynFrames += 1;
+                        } else if (need < dynFrames) {
+                            dynFrames -= 1;
+                        }
+                        dynFrames = std::clamp(dynFrames, 1, maxFrames);
+                    } else {
+                        dynFrames = 1;
+                    }
+                }
+                lastFgQpc = nowUs;
+                wantFrames = dynFrames;
+                if (++dynTick % 120 == 0) {
+                    logWarn("[P225] fg dynamic: frames=%d max=%d target=%uus",
+                            wantFrames, maxFrames, gReflex.frameLimitUs);
+                }
+            }
+            if (appliedFgMode != fgMode || appliedFgFrames != wantFrames ||
+                appliedFgW != in.targetWidth || appliedFgH != in.targetHeight) {
+                sl::DLSSGOptions fg{};
+                fg.mode = sl::DLSSGMode::eOn;  // P225：动态也走显式帧数（见上）
+                fg.numFramesToGenerate = static_cast<uint32_t>(wantFrames);
+
+                const sl::Result fgOptResult = api.setFgOptions(viewport, fg);
+                if (fgOptResult == sl::Result::eOk) {
+                    appliedFgMode = fgMode;
+                    appliedFgFrames = wantFrames;
+                    appliedFgW = in.targetWidth;
+                    appliedFgH = in.targetHeight;
+                    logWarn("[P213] DLSS-G on: mode=%d frames=%d (hudless=%ux%u)",
+                            fgMode, wantFrames, in.targetWidth, in.targetHeight);
+                } else {
+                    static bool warnedFgOpt = false;
+                    if (!warnedFgOpt) {
+                        warnedFgOpt = true;
+                        logWarn("P213: slDLSSGSetOptions failed=0x%X (mode=%d frames=%d)",
+                                static_cast<unsigned>(fgOptResult), fgMode, wantFrames);
+                    }
+                }
+            }
+            // P213c：每帧问一次（只在 FG 开着时）presented 数，F3 的 output 要用它累积。
+            if (api.getFgState != nullptr) {
+                sl::DLSSGState stFrame{};
+                if (api.getFgState(viewport, stFrame, nullptr) == sl::Result::eOk) {
+                    gFgPresented.store(static_cast<int32_t>(stFrame.numFramesActuallyPresented));
+                }
+            }
+            // P213b：每 120 帧问一次 Streamline 到底插了多少帧。没有这行就只能靠肉眼猜。
+            if (api.getFgState != nullptr && (s.submitCount % 120u) == 0u) {
+                sl::DLSSGState st{};
+                const sl::Result stResult = api.getFgState(viewport, st, nullptr);
+                logInfo("[P213b] DLSS-G state r=0x%X status=0x%X presented=%u max=%u dyn=%d vram=%uMB",
+                        static_cast<unsigned>(stResult), static_cast<unsigned>(st.status),
+                        st.numFramesActuallyPresented, st.numFramesToGenerateMax,
+                        static_cast<int>(st.bIsDynamicMFGSupported),
+                        static_cast<unsigned>(st.estimatedVRAMUsageInBytes / (1024u * 1024u)));
+            }
+        } else if (fgMode == 0 && api.setFgOptions != nullptr) {
+            // 关闭只需要下发一次 eOff；之后 Streamline 自己保持这个状态。
+            static bool fgOffSent = false;
+            if (!fgOffSent) {
+                sl::DLSSGOptions fg{};
+                fg.mode = sl::DLSSGMode::eOff;
+                if (api.setFgOptions(viewport, fg) == sl::Result::eOk) {
+                    fgOffSent = true;
+                    logWarn("[P213] DLSS-G off");
+                }
+            }
+        }
 
         if (evalResult != sl::Result::eOk) {
             logWarn("P112: streamline evaluate tags=0x%X options=0x%X evaluate=0x%X "
@@ -2822,4 +3029,21 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
 
 
 }  // mcdr_dlss_shutdown
-    }  // extern "C"
+
+
+}  // extern "C"
+
+// P213：帧生成的开关（C++ 链接，与 mcdr_dlss_impl.h 的声明一致）。
+// P213：帧生成的开关。0 = off，1 = on（固定倍率），2 = dynamic（多帧，驱动 ≥ 595.41）。
+// 真正的下发在 streamlineEvaluate() 里（那里才有 frame token 与 viewport，且必须在呈现线程上调用）。
+void mcdr_dlss_set_fg_mode(int32_t mode, int32_t numFrames) {
+    gDlssgMode.store(mode);
+    gDlssgFrames.store(numFrames < 1 ? 1 : numFrames);
+    // P213e：JVM 侧真正把开关推过来时留一行，方便判断“没插帧”是没人下发还是 SL 拒绝。
+    logWarn("[P213e] set_fg_mode(mode=%d frames=%d)", mode, numFrames);
+}
+// P213c：上一次 Present 真正提交的帧数（1 = 没插帧）。JVM 的 F3 用它把 output 累加成
+// “presented fps”，否则一次 slPresent 只被 JVM 看到一次，两个数字永远相等。
+int32_t mcdr_dlss_fg_presented(void) {
+    return gFgPresented.load();
+}
