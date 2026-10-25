@@ -103,6 +103,18 @@ mcdr_object* MCDR_CALL mcdr_dx12CreateSampler(int32_t addressU, int32_t addressV
     return static_cast<d3d12_mc::Dx12Object*>(*r);
 }
 
+mcdr_object* MCDR_CALL mcdr_dx12CreateSamplerWithMipBias(int32_t addressU, int32_t addressV, int32_t minFilter,
+                                                         int32_t magFilter, int32_t maxAnisotropy,
+                                                         float maxLod, float mipLodBias) {
+    const auto r = d3d12_mc::createSamplerWithMipBias(addressU, addressV, minFilter, magFilter, maxAnisotropy,
+                                                      maxLod, mipLodBias);
+    if (!r) {
+        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateSamplerWithMipBias",
+                                                            r.error().message);
+    }
+    return static_cast<d3d12_mc::Dx12Object*>(*r);
+}
+
 mcdr_object* MCDR_CALL mcdr_dx12CreateTextureView(mcdr_object* texture, int32_t baseMipLevel,
                                                   int32_t mipLevels) {
     const auto r = d3d12_mc::createTextureView(texture, baseMipLevel, mipLevels);

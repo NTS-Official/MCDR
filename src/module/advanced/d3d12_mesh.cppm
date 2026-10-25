@@ -1,6 +1,6 @@
 // dx12_mesh.h — P72：mesh shader（amplification / mesh）管线基础
 // ---------------------------------------------------------------------------
-// 与 dx12_device.cpp 里的图形管线（D3DCompile vs_5_1/ps_5_1 + D3D12_GRAPHICS_
+// 与 dx12_device.cpp 里的图形管线（DXC vs_6_9/ps_6_9 + D3D12_GRAPHICS_
 // PIPELINE_STATE_DESC）刻意分开：
 //   * mesh 管线只能由 DXC 产出的 DXIL（as_6_x / ms_6_x）经
 //     D3D12_PIPELINE_STATE_STREAM_DESC + ID3D12Device2::CreatePipelineState 创建；
@@ -70,15 +70,13 @@ mcdr::Result<void*> createMeshPipeline(const MeshPipelineDesc& desc);
 // 传入的是 ID3D12RootSignature* 的地址值；本模块不导出 D3D12 类型，故用 uint64_t。
 mcdr::Result<void*> createMeshPipeline(const MeshPipelineDesc& desc, uint64_t externalRootSignature);
 
-// P129：按绑定点布局建一个根签名并交出裸指针（地址值，调用方用 releaseMeshRootSignature 释放）。
-// meshExtras=true 时在地形绑定之后追加三个 mesh 专用尾参：
-//   [N]   root CBV  b8  —— 段表（每段 firstIndex/indexCount/baseVertex）
-//   [N+1] descriptor table，含 t14（顶点 ByteAddressBuffer）、t15（索引 Buffer<uint>）
-// 这样地形 PSO 与 mesh PSO 能共用同一套 draw 绑定，只是 mesh 变体多三个槽位。
-// P140：meshletCull=true（需同时 meshExtras）时再追加两样，
-//   [N+2] 同表的第 4 个 range t17（meshlet 包围球）与 [N+3] root 32 位常量 b9（28 dword）。
+// P129/P217：按绑定点布局建一个根签名并交出裸指针（地址值，调用方用 releaseMeshRootSignature 释放）。
+// meshExtras=true 时在地形绑定之后追加两个 mesh 专用尾参：
+//   [N]   root CBV  b8  —— 小常量（meshletCount）或段表基址
+//   [N+1] descriptor table，含 t14（顶点 ByteAddressBuffer）、t15（段表）、t16（meshlet 表）
+// 这样地形 PSO 与 mesh PSO 能共用同一套 draw 绑定，只是 mesh 变体多两个槽位。
 mcdr::Result<uint64_t> createMeshRootSignature(const std::vector<PipelineDesc::Binding>& bindings,
-                                               bool meshExtras, bool meshletCull);
+                                               bool meshExtras);
 // 释放 createMeshRootSignature 交出的签名（传 0 安全）。
 void releaseMeshRootSignature(uint64_t rootSignature);
 
@@ -89,17 +87,6 @@ bool meshPipelineSupported(std::string* why);
 // DispatchMesh：x/y/z = 线程组数量（ctx 为 mcdr_command_ctx 句柄）。要求当前已
 // setPipeline 一个 mesh 管线。
 mcdr::Result<void> dispatchMesh(void* ctx, int x, int y, int z);
-
-// P141：meshlet 包围球 GPU 生成（compute pass）的根签名。
-// 参数布局：0 = root CBV b8（段表，与图形侧同一份 32 B/组数据）、
-//           1 = 描述符表 { SRV t14 顶点, SRV t15 索引, UAV u0 包围球 }。
-// 交出裸 ID3D12RootSignature* 地址值，用 releaseMeshRootSignature 释放（不进段派发注册表）。
-mcdr::Result<uint64_t> createMeshBoundsRootSignature();
-
-// P141：用上面那份签名建 cs_6_0 的 compute PSO。成功交出 Dx12Pipeline 句柄
-// （withDepth 字段承载 CS PSO），由 JVM 持有并交给 buildMeshletBounds；
-// 销毁仍走 D3D12DestroyPipeline。rootSignature 为 0 或字节码为空时失败。
-mcdr::Result<void*> createMeshBoundsPipeline(const void* csDxil, int32_t csLen, uint64_t rootSignature);
 
 }  // export namespace d3d12_mc —— 导出接口到此为止
 

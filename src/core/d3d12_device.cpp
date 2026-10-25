@@ -462,6 +462,11 @@ double nowMs() {
 // before the device is created, so this value only covers the window in between.
 static int gLogLevel = 0;
 
+// P184 补记：关停/初始化这类"进度标记"是否**恒定输出**（true = 无视 gLogLevel；false = 当普通
+// INFO，被 logLevel 过滤）。由配置项 `[logging] shutdownTrace` 经 `mcdrSetShutdownTraceAlways`
+// 推进来。默认 true：destroyDevice/destroySurface 一旦卡住，这些行是唯一线索。
+static bool gShutdownTraceAlways = true;
+
 static void mirrorLogToFile(const char* line) {
     static FILE* s_mirrorFile = nullptr;
     const char* path = std::getenv("DX12_NATIVE_LOG_FILE");
@@ -539,6 +544,20 @@ void dbgLogInfo(const char* fmt, ...) {
     va_end(ap);
     emitLogLine("INFO", line);
 }
+// P184 补记：进度标记（关停/初始化这类）。按 **INFO** 标注 —— 以前借用 dbgLogError，于是每次
+// 正常退出都会刷一串 `[ERROR]`，既误导用户，也让真正要找 ERROR 的人被噪音淹掉。
+// 输出策略由配置 `[logging] shutdownTrace` 决定（`mcdrSetShutdownTraceAlways`）：
+//   true （默认）：无视 gLogLevel 恒定输出 —— 退出路径卡死时这是唯一线索；
+//   false        ：等同普通 INFO，被 logLevel 过滤掉。
+void dbgLogProgress(const char* fmt, ...) {
+    if (!gShutdownTraceAlways && gLogLevel < 2) return; // INFO=2
+    char line[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    emitLogLine("INFO", line);
+}
 void dbgLogDebug(const char* fmt, ...) {
     if (gLogLevel < 3) return; // DEBUG=3
     char line[2048];
@@ -549,6 +568,8 @@ void dbgLogDebug(const char* fmt, ...) {
     emitLogLine("DEBUG", line);
 }
 void setLogLevel(int level) { gLogLevel = (level < 0) ? 0 : (level > 3) ? 3 : level; }
+// P184 补记：配置项 [logging] shutdownTrace → 进度标记是否恒定输出（见 dbgLogProgress）。
+void setShutdownTraceAlways(bool always) { gShutdownTraceAlways = always; }
 
 static DWORD gInfoQueueCookie = 0;
 static void CALLBACK dx12DebugMessageCallback(D3D12_MESSAGE_CATEGORY /*category*/,
@@ -1473,8 +1494,9 @@ std::wstring findDxcDirectory() {
     // 为什么需要它：`MCDR_DXC_DIR` 只是**追加一个候选**，不是权威覆盖 —— 即便把它指向空目录，
     // 模块目录与 Windows SDK 那两站照样能把 dxcompiler.dll 供上（实测：把 `run\dxrmc\` 里两个
     // DLL 改名后，客户端仍从 `C:\Program Files (x86)\Windows Kits\10\bin\…\dxcompiler.dll`
-    // 拿到，`dxc=yes` 依旧）。系统目录不能改，所以"找不到 DXC ⇒ 回退 D3DCompile(SM5.1) 且不变砖"
-    // 这条路径只能靠一个显式开关来验证：把它整体短路掉，才谈得上"确实找不到"。
+    // 拿到，`dxc=yes` 依旧）。系统目录不能改，所以"确实找不到 DXC"这种现场只能靠一个显式
+    // 开关来验证 —— 2026-10-25 起找不到 DXC 不再回退 D3DCompile(5.1)，而是图形管线直接报错，
+    // 这条开关的用途就变成"验证失败路径本身"。
     //
     // 只认完全等于 "1" 的值；未设置、空串、其它值一律照旧 —— 验收专用，不是产品行为开关。
     if (const wchar_t* off = _wgetenv(L"MCDR_DXC_DISABLE");
@@ -1778,8 +1800,8 @@ void probeDxc(DeviceContext::Capabilities& caps) {
         if (const wchar_t* off = _wgetenv(L"MCDR_DXC_DISABLE");
             off != nullptr && off[0] == L'1' && off[1] == L'\0') {
             dbgLogInfo("P66: DXC discovery was short-circuited by MCDR_DXC_DISABLE=1 — this is the "
-                       "acceptance switch for the \"no DXC, fall back to D3DCompile (SM5.1)\" path, "
-                       "not a missing-SDK condition");
+                       "acceptance switch for the \"no DXC\" path (graphics pipelines now fail "
+                       "instead of falling back to D3DCompile SM5.1), not a missing-SDK condition");
         }
         return;
     }
@@ -1806,16 +1828,12 @@ void probeDxc(DeviceContext::Capabilities& caps) {
     }
     caps.dxcAvailable = true;
 
-    // 冒烟编译目标：设备真实可用的最高 SM，但 mesh shader 下限是 6_6，而本机 DXC 1.8
-    // 只认到 6_8（6_9/6_10 会报 invalid profile），所以夹在 [6_6, 6_8]。
-    D3D_SHADER_MODEL model = effectiveShaderModel(caps);
-    if (model < D3D_SHADER_MODEL_6_6) {
-        model = D3D_SHADER_MODEL_6_6;
-    }
-    if (model > D3D_SHADER_MODEL_6_8) {
-        model = D3D_SHADER_MODEL_6_8;
-    }
-    const std::string profile = std::string("ms_") + shaderModelProfileSuffix(model);
+    // 冒烟编译目标：**固定 ms_6_9**（2026-10-25 起图形管线硬要求 SM 6.9，没有 5.1 兜底）。
+    // 这里只回答"DXC 能不能产出 6_9 的 DXIL"，与设备能力无关 —— 设备那一半由
+    // graphicsShaderModelProfile() 查 caps.shaderModel 单独把关。
+    // 实测 DXC 1.9.2602.17 接受 vs/ps/as_6_9；1.8 及更早对 6_9 报 invalid profile
+    // （6_10 至今没有 DXC 认，所以 6_9 就是天花板）。
+    const std::string profile = "ms_6_9";
     caps.dxcProfile = profile;
 
     std::vector<uint8_t> dxil;
@@ -1874,7 +1892,8 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
             if (const wchar_t* off = _wgetenv(L"MCDR_DXC_DISABLE");
                 off != nullptr && off[0] == L'1' && off[1] == L'\0') {
                 dbgLogInfo("P66: DXC discovery was short-circuited by MCDR_DXC_DISABLE=1 (acceptance "
-                           "switch for the D3DCompile fallback path)");
+                           "switch for the no-DXC path; graphics pipelines now fail instead of "
+                           "falling back to D3DCompile SM5.1)");
             }
         } else {
             const std::wstring dllPath = dir + L"\\dxcompiler.dll";
@@ -2103,7 +2122,7 @@ std::string capabilitiesJson(const DeviceContext::Capabilities& caps) {
 }
 
 // ---------------------------------------------------------------------------
-// P110：Agility SDK（D3D12Core.dll 1.619）opt-in —— 只为自检，默认关闭
+// P110：Agility SDK（D3D12Core.dll 1.619）opt-in —— 2026-10-25 起**默认开启**
 // ---------------------------------------------------------------------------
 // 机制（2026-10 核实，出处见 known_bugs.md §D.12）：
 //   * 官方推荐的两符号（D3D12SDKVersion / D3D12SDKPath）只对**进程主 exe** 生效：
@@ -2131,13 +2150,7 @@ struct AgilityAttempt {
 
 AgilityAttempt gAgility;
 
-bool envIsOne(const char* name) {
-    const char* v = std::getenv(name);
-    return v && v[0] == '1' && v[1] == '\0';
-}
-
-std::wstring ownModuleDir() {
-    HMODULE mod = nullptr;
+std::wstring ownModuleDir() {    HMODULE mod = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
                                 | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             reinterpret_cast<LPCWSTR>(&ownModuleDir), &mod)
@@ -2155,9 +2168,13 @@ std::wstring ownModuleDir() {
 // ensureDevice() 在设备就绪后仍会被逐帧调用，所以这里必须幂等：只在第一次进入时
 // 真正执行（否则每次调用都会重新 CreateDeviceFactory + ApplyToGlobalState，
 // 实测刷出 32k 行日志，也让全局 core 被反复"改配置"）。
+// 2026-10-25：**不再由 MCDR_AGILITY 环境变量门控**。图形管线硬要求 SM 6.9，而 6.9
+// 只有 Agility 619 的 core 才会报（inbox D3D12Core 最高 6.8），所以"要跑 D3D12 后端"
+// 与"启用 agility"现在是同一件事。D3D12Core.dll 不在 MCDR.dll 同目录时下面会 WARN
+// 并跳过，随后 6.9 前置检查（graphicsShaderModelProfile / sm69RequirementText）报错
+// —— 不会静默降级。
 void applyAgilitySdk() {
     if (gAgility.requested) return;
-    if (!envIsOne("MCDR_AGILITY")) return;
     gAgility.requested = true;
     const std::wstring dir = ownModuleDir();
     if (dir.empty()) {
@@ -2406,57 +2423,7 @@ void applyStreamline(ID3D12Device* device) {
     dbgLogWarn("P111 streamline: slDLSSSetOptions probe getFn=0x%X result=0x%X", getFnResult,
                static_cast<unsigned>(optResult));
 
-    // P213：DLSS-G（帧生成）的支持性/加载状态探针。这一阶段**只回答三个问题**，不改任何渲染路径：
-    //   supported —— 这台机器/驱动支不支持帧生成（需要适配器 LUID）；
-    //   loaded    —— interposer 有没有真的把 sl.dlss_g.dll 拉起来（缺文件时 supported 仍可能是 1）；
-    //   state     —— 让 SL 自己报一次状态：最小尺寸、最多能生成几帧、预估显存占用。
-    // 这三行日志就是 Phase A 之前唯一需要的验收证据。
-    {
-        bool gLoaded = false;
-        unsigned gLoad = 0xFFFFFFFFu;
-        if (gSlIsLoaded != nullptr) {
-            gLoad = static_cast<unsigned>((*gSlIsLoaded)(sl::kFeatureDLSS_G, gLoaded));
-        }
-        int gSupported = -1;
-        if (device != nullptr) {
-            using PFn_IsSupported = sl::Result (*)(sl::Feature, const sl::AdapterInfo&);
-            auto isSupported = reinterpret_cast<PFn_IsSupported>(
-                ::GetProcAddress(gSlModule, "slIsFeatureSupported"));
-            if (isSupported != nullptr) {
-                const LUID gLuid = device->GetAdapterLuid();
-                sl::AdapterInfo gInfo{};
-                gInfo.deviceLUID = reinterpret_cast<uint8_t*>(const_cast<LUID*>(&gLuid));
-                gInfo.deviceLUIDSizeInBytes = sizeof(LUID);
-                gSupported = static_cast<int>(isSupported(sl::kFeatureDLSS_G, gInfo));
-            }
-        }
-        unsigned gStateResult = 0xFFFFFFFFu;
-        unsigned gStatus = 0;
-        unsigned gMinDim = 0;
-        unsigned gMaxFrames = 0;
-        unsigned long long gVramBytes = 0;
-        if (getFeatureFunction != nullptr && gLoaded) {
-            void* raw = nullptr;
-            if (getFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState", raw) == sl::Result::eOk
-                && raw != nullptr) {
-                using PFn_GetState = sl::Result (*)(const sl::ViewportHandle&, sl::DLSSGState&,
-                                                    const sl::DLSSGOptions*);
-                auto getState = reinterpret_cast<PFn_GetState>(raw);
-                sl::DLSSGState state{};
-                const sl::ViewportHandle viewport(0);
-                gStateResult = static_cast<unsigned>(getState(viewport, state, nullptr));
-                gStatus = static_cast<unsigned>(state.status);
-                gMinDim = state.minWidthOrHeight;
-                gMaxFrames = state.numFramesToGenerateMax;
-                gVramBytes = state.estimatedVRAMUsageInBytes;
-            }
-        }
-        dbgLogWarn("[P213] DLSS-G probe: supported=%d loaded=%s load=0x%X getState=0x%X status=0x%X "
-                   "minDim=%u maxFrames=%u vram=%lluMB",
-                   gSupported, gLoaded ? "yes" : "no", gLoad, gStateResult, gStatus, gMinDim,
-                   static_cast<unsigned>(gMaxFrames), gVramBytes / (1024ull * 1024ull));
     }
-}
 #endif
 
 // P175：描述符游标与空闲表是文件级全局，不在 DeviceContext 里，所以 `gCtx = DeviceContext{}`
@@ -2476,7 +2443,6 @@ void resetDescriptorAllocationState() {
 // P175：完成判据必须和慢路径真正建出来的东西一致。原来只查 device + 7 个 heap，而 queue /
 // queueFence / 两个间接绘制签名都是之后才建的：签名创建失败时函数只返回一次错误，之后每次
 // 调用却都命中快速路径返回成功，设备永远缺签名（间接绘制每帧报错）。
-// cmdSigMesh 不参与：它是尽力而为、允许缺失的（CREATE 处有注释说明）。
 bool deviceReady() {
     return gCtx.device && gCtx.queue && gCtx.queueFence && gCtx.srvHeap && gCtx.srvCpuHeap && gCtx.rtvHeap
         && gCtx.frameRtvHeap && gCtx.dsvHeap && gCtx.samplerHeap && gCtx.drawHeap && gCtx.cmdSigIndexed
@@ -2491,7 +2457,7 @@ thread_local bool t_deviceInitInProgress = false;
 mcdr::Result<void> ensureDevice() {
     // P112：SL 必须在任何 DXGI/D3D12 调用之前初始化（ProgrammingGuideDLSS.md:14）。
     streamlineInitEarly();
-    // P110 自检：MCDR_AGILITY=1 时在任何设备创建之前把全局 core 换成 619；默认空操作。
+    // P110：在任何设备创建之前把全局 core 换成 619（SM 6.9 的唯一来源，2026-10-25 起无条件尝试）。
     applyAgilitySdk();
     // PIX 捕获层必须在任何 D3D12CreateDevice（含适配器探测）之前载入；未请求时空操作。
     ensurePixCapturerLoaded();
@@ -2666,25 +2632,12 @@ mcdr::Result<void> ensureDevice() {
         if (FAILED(device->CreateCommandSignature(&cs, nullptr, IID_PPV_ARGS(&gCtx.cmdSigNonIndexed)))) {
             return mcdr::err("ensureDevice", "CreateCommandSignature(non-indexed) failed");
         }
-        // P139：mesh 派发的 indirect 版本（每命令 12 B = ThreadGroupCountX/Y/Z）。只有
-        // 12_2 + mesh tier 1 的设备才允许 DISPATCH_MESH，所以这里是尽力而为：建不出来就
-        // 留空，drawMeshSegmentsIndirect 会报"签名不可用"，JVM 侧回退到 direct 派发，
-        // 绝不能让设备创建失败。
-        arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
-        cs.ByteStride = 12;
-        const HRESULT sigHr = device->CreateCommandSignature(&cs, nullptr, IID_PPV_ARGS(&gCtx.cmdSigMesh));
-        if (FAILED(sigHr)) {
-            gCtx.cmdSigMesh.Reset();
-            dbgLogInfo("ensureDevice: CreateCommandSignature(dispatch_mesh) failed hr=0x%s, mesh indirect "
-                       "dispatch disabled\n",
-                       hrText(sigHr).c_str());
-        }
     }
     return {};
 }
 
 void destroyDevice() {
-    dbgLogError("[P184] destroyDevice stage: enter");
+    dbgLogProgress("[P184] destroyDevice stage: enter");
     if (gCtx.queueFenceEvent) {
         CloseHandle(gCtx.queueFenceEvent);
         gCtx.queueFenceEvent = nullptr;
@@ -2701,17 +2654,17 @@ void destroyDevice() {
             }
         }
     }
-    dbgLogError("[P184] destroyDevice stage: queue fence wait done");
+    dbgLogProgress("[P184] destroyDevice stage: queue fence wait done");
     flushPendingDeletes(/*force=*/true);
-    dbgLogError("[P184] destroyDevice stage: pending deletes flushed");
+    dbgLogProgress("[P184] destroyDevice stage: pending deletes flushed");
     // P108：DLSS 的特征句柄与 scratch/中间纹理必须在**设备还活着**的时候释放，并且 NGX
     // 只能在设备销毁前 Shutdown。放在 gCtx 清零之前。
     mcdr_dlss_shutdown();
-    dbgLogError("[P184] destroyDevice stage: dlss shutdown done");
+    dbgLogProgress("[P184] destroyDevice stage: dlss shutdown done");
     gCtx = DeviceContext{};
     // P175：设备级描述符状态不跟着 gCtx 走（见 resetDescriptorAllocationState 的注释）。
     resetDescriptorAllocationState();
-    dbgLogError("[P184] destroyDevice stage: done");
+    dbgLogProgress("[P184] destroyDevice stage: done");
 }
 
 DeviceContext& deviceContext() { return gCtx; }
@@ -3041,6 +2994,11 @@ mcdr::Result<void*> createBuffer(int usage, long long size) {
 
 mcdr::Result<void*> createSampler(int addressU, int addressV, int minFilter, int magFilter,
                                   int maxAnisotropy, float maxLod) {
+    return createSamplerWithMipBias(addressU, addressV, minFilter, magFilter, maxAnisotropy, maxLod, 0.0f);
+}
+
+mcdr::Result<void*> createSamplerWithMipBias(int addressU, int addressV, int minFilter, int magFilter,
+                                             int maxAnisotropy, float maxLod, float mipLodBias) {
     if (auto d = ensureDevice(); !d) return mcdr::err("createSampler", errorMessage(d.error()));
 
     D3D12_SAMPLER_DESC desc{};
@@ -3049,6 +3007,11 @@ mcdr::Result<void*> createSampler(int addressU, int addressV, int minFilter, int
     desc.AddressV = (addressV == 0) ? D3D12_TEXTURE_ADDRESS_MODE_WRAP : D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    // P220：超分专用 mip bias（只在 D3D12TerrainSampler 里按 DLSS/DLAA 状态计算）。
+    // 非超分时调用方传 0；NaN/越界一律回 0，避免一个坏值把采样器打成全糊。
+    float bias = mipLodBias;
+    if (!(bias >= -16.0f && bias <= 15.99f)) bias = 0.0f;
+    desc.MipLODBias = bias;
     desc.MinLOD = 0.0f;
     desc.MaxLOD = maxLod > 0.0f ? maxLod : 16.0f;
     if (maxAnisotropy > 1) {
@@ -4996,43 +4959,38 @@ D3D12_PRIMITIVE_TOPOLOGY toPrimitiveTopology(int t) {
     }
 }
 
-mcdr::Result<void> compileShaderBytecode(const std::vector<uint8_t>& src, const char* stageName,
-                                         const char* target, ComPtr<ID3DBlob>& out) {
-    ComPtr<ID3DBlob> errBlob;
-    HRESULT hr =
-        D3DCompile(src.data(), src.size(), stageName, nullptr, nullptr, "main", target, 0, 0, &out, &errBlob);
-    if (FAILED(hr)) {
-        std::string msg;
-        if (errBlob && errBlob->GetBufferSize() > 0) {
-            const char* m = static_cast<const char*>(errBlob->GetBufferPointer());
-            msg.assign(m, errBlob->GetBufferSize());
-        }
-        return mcdr::err("compileShaderBytecode",
-                         std::string("D3DCompile(") + target + ") hr=0x" + hrText(hr)
-                             + (msg.empty() ? "" : "\n" + msg));
-    }
-    return {};
-}
-
 }  // namespace
 
-// P84：主图形管线的着色器模型策略。返回 DXIL profile 后缀（"6_8"/"6_7"/…）；
-// 空串表示"继续走 D3DCompile 的 SM 5.1（DXBC）路径"。门控三条：
-//   1) DXC 可用（probeDxc 已确认能产出 DXIL，见 caps.dxcAvailable）；
-//   2) 设备上报的 SM >= 6.0（DXC 不提供 5.x 的图形 profile）；
-//   3) 环境变量 DX12_GRAPHICS_SM 没有显式要求退回（值 "5.1" 或 "51"）。
-// DXC 1.8/1.9 只认到 6_8（6_9/6_10 会报 invalid profile），故上限夹在 6_8。
+// P84 / 2026-10-25：图形管线的着色器模型现在是**硬要求 SM 6.9**。
+// 用户明确要求删掉 SM 5.1(DXBC) 兜底、不留回退路径，所以这里只有两种结果：
+//   "6_9" —— 可以继续建 PSO；
+//   ""    —— 不满足，调用方必须报错（sm69RequirementText 说清缺哪一条）。
+// 两个前置条件，缺一不可：
+//   1) 这台 DXC 能产出 6_9 的 DXIL（caps.dxcSupportsSm69()，probeDxc 的 ms_6_9 冒烟）；
+//   2) 设备自己报 HighestShaderModel >= 6.9 —— 只有 Agility SDK 1.619 的 core 才有，
+//      inbox D3D12Core 最高 6.8（P110 / known_bugs §D.18）。这种情况下 D3D12 后端
+//      直接报错，而不是偷偷降级。
 static std::string graphicsShaderModelProfile() {
-    static const std::string forced = [] {
-        const char* v = std::getenv("DX12_GRAPHICS_SM");
-        return v == nullptr ? std::string() : std::string(v);
-    }();
-    if (forced == "5.1" || forced == "51") return {};
-    if (!gCtx.caps.dxcAvailable) return {};
-    D3D_SHADER_MODEL model = effectiveShaderModel(gCtx.caps);
-    if (model < D3D_SHADER_MODEL_6_0) return {};
-    if (model > D3D_SHADER_MODEL_6_8) model = D3D_SHADER_MODEL_6_8;
-    return std::string(shaderModelProfileSuffix(model));
+    if (!gCtx.caps.dxcAvailable || !gCtx.caps.dxcSupportsSm69()) return {};
+    if (effectiveShaderModel(gCtx.caps) < D3D_SHADER_MODEL_6_9) return {};
+    return "6_9";
+}
+
+// 6.9 硬要求满足不了时的统一说明：把"缺 DXC / DXC 不认 6.9 / 设备只到 6.x"分开说清楚，
+// 否则现场只剩一句 CreatePipelineState 失败，排查要重新走一遍 P84 那套。
+static std::string sm69RequirementText() {
+    if (!gCtx.caps.dxcAvailable) {
+        return "shader model 6.9 is required and there is no SM 5.1 fallback any more, but "
+               "dxcompiler.dll was not found (MCDR_DXC_DIR / MCDR.dll dir / Windows SDK)";
+    }
+    if (!gCtx.caps.dxcSupportsSm69()) {
+        return "shader model 6.9 is required and there is no SM 5.1 fallback any more, but this "
+               "dxcompiler.dll cannot compile 6_9 (profile probe: " + gCtx.caps.dxcProfile +
+               "; needs DXC 1.9.2502 or newer)";
+    }
+    return "shader model 6.9 is required and there is no SM 5.1 fallback any more, but the device "
+           "reports SM " + std::string(shaderModelName(gCtx.caps.shaderModel)) +
+           " (Agility SDK 619's D3D12Core.dll must sit next to MCDR.dll and be opted in)";
 }
 
 mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
@@ -5053,52 +5011,36 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
             dbgLogDebug("=== HLSL #%d ps (%zuB) ===\n%s", hlslDump, psBytes.size(), psStr.c_str());
         }
     }
-    // 1) HLSL -> 字节码。P84：主图形管线优先走 DXC + SM 6.x（DXIL）；DXC 不可用、
-    //    设备 SM < 6.0，或 vs/ps 任一编译失败时，退回 D3DCompile + SM 5.1（DXBC，既有行为）
-    //    并记一行 WARN。两条路径产出的字节码在 PSO 里同构，故下面统一成裸指针 + 长度。
-    std::vector<uint8_t> vsDxil, psDxil;
-    ComPtr<ID3DBlob> vsBlob, psBlob;
-    const void* vsCode = nullptr;
-    SIZE_T vsCodeSize = 0;
-    const void* psCode = nullptr;
-    SIZE_T psCodeSize = 0;
+    // 1) HLSL -> DXIL。2026-10-25 起图形管线硬要求 SM 6.9，**没有 D3DCompile/SM 5.1 兜底**：
+    //    前置条件不满足就直接报错（不再降级成 DXBC）。DXIL 与旧 DXBC 在 PSO 里同构，
+    //    所以下面仍统一成裸指针 + 长度。
     const std::string smProfile = graphicsShaderModelProfile();
-    bool compiledViaDxc = false;
-    if (!smProfile.empty()) {
-        const std::string vsSrc(reinterpret_cast<const char*>(vsBytes.data()), vsBytes.size());
-        const std::string psSrc(reinterpret_cast<const char*>(psBytes.data()), psBytes.size());
-        {
-            auto vsDxc = compileHlslToDxil(vsSrc, "main", "vs_" + smProfile, vsDxil);
-            auto psDxc = vsDxc ? compileHlslToDxil(psSrc, "main", "ps_" + smProfile, psDxil) : vsDxc;
-            if (vsDxc && psDxc) {
-                compiledViaDxc = true;
-                vsCode = vsDxil.data();
-                vsCodeSize = vsDxil.size();
-                psCode = psDxil.data();
-                psCodeSize = psDxil.size();
-                // 只在第一条管线时记一行，避免每个 PSO 都刷屏（管线创建可达上千次）。
-                static bool loggedDxcGraphics = false;
-                if (!loggedDxcGraphics) {
-                    loggedDxcGraphics = true;
-                    dbgLogInfo("createGraphicsPipeline: main graphics pipeline compiled with DXC SM %s (DXIL vs=%zuB ps=%zuB)",
-                               smProfile.c_str(), vsDxil.size(), psDxil.size());
-                }
-            } else {
-                dbgLogWarn("createGraphicsPipeline: DXC vs_%s/ps_%s compilation failed; falling back to D3DCompile 5.1: %s",
-                           smProfile.c_str(), smProfile.c_str(),
-                           firstLine((!vsDxc ? vsDxc : psDxc).error().message).c_str());
-            }
-        }
+    if (smProfile.empty()) {
+        return mcdr::err("createGraphicsPipeline", "createGraphicsPipeline: " + sm69RequirementText());
     }
-    if (!compiledViaDxc) {
-        auto vsBlobRes = compileShaderBytecode(vsBytes, "vertex", "vs_5_1", vsBlob);
-        if (!vsBlobRes) return mcdr::err("createGraphicsPipeline", errorMessage(vsBlobRes.error()));
-        auto psBlobRes = compileShaderBytecode(psBytes, "fragment", "ps_5_1", psBlob);
-        if (!psBlobRes) return mcdr::err("createGraphicsPipeline", errorMessage(psBlobRes.error()));
-        vsCode = vsBlob->GetBufferPointer();
-        vsCodeSize = vsBlob->GetBufferSize();
-        psCode = psBlob->GetBufferPointer();
-        psCodeSize = psBlob->GetBufferSize();
+    std::vector<uint8_t> vsDxil, psDxil;
+    const std::string vsSrc(reinterpret_cast<const char*>(vsBytes.data()), vsBytes.size());
+    const std::string psSrc(reinterpret_cast<const char*>(psBytes.data()), psBytes.size());
+    auto vsDxc = compileHlslToDxil(vsSrc, "main", "vs_" + smProfile, vsDxil);
+    if (!vsDxc) {
+        return mcdr::err("createGraphicsPipeline",
+                         "vs_" + smProfile + " (DXC): " + firstLine(vsDxc.error().message));
+    }
+    auto psDxc = compileHlslToDxil(psSrc, "main", "ps_" + smProfile, psDxil);
+    if (!psDxc) {
+        return mcdr::err("createGraphicsPipeline",
+                         "ps_" + smProfile + " (DXC): " + firstLine(psDxc.error().message));
+    }
+    const void* vsCode = vsDxil.data();
+    SIZE_T vsCodeSize = vsDxil.size();
+    const void* psCode = psDxil.data();
+    SIZE_T psCodeSize = psDxil.size();
+    // 只在第一条管线时记一行，避免每个 PSO 都刷屏（管线创建可达上千次）。
+    static bool loggedDxcGraphics = false;
+    if (!loggedDxcGraphics) {
+        loggedDxcGraphics = true;
+        dbgLogInfo("createGraphicsPipeline: main graphics pipeline compiled with DXC SM %s (DXIL vs=%zuB ps=%zuB)",
+                   smProfile.c_str(), vsDxil.size(), psDxil.size());
     }
 
     // 2) root signature：CBV 走 root descriptor（每 draw 直接
@@ -6004,13 +5946,13 @@ mcdr::Result<void> writeBufferSRVToDrawHeap(UINT slot, Dx12Object* buf, long lon
 }
 
 // ---------------------------------------------------------------------------
-// P137：RAW 缓冲 SRV（R32_TYPELESS + D3D12_BUFFER_SRV_FLAG_RAW）
+// P217：RAW 缓冲 SRV（R32_TYPELESS + D3D12_BUFFER_SRV_FLAG_RAW）
 // ---------------------------------------------------------------------------
-// 生成的 mesh HLSL 用 ByteAddressBuffer 读顶点/索引/区块数据（t14/t15/t16）。而
+// 生成的 mesh HLSL 用 ByteAddressBuffer 读顶点/段表/meshlet 表（t14/t15/t16）。而
 // writeBufferSRVToDrawHeap 只能按 texelFormat 建**类型化** SRV，类型化视图喂给
 // ByteAddressBuffer 是非法的（调试层报 view format mismatch）；RAW 视图忽略格式，
 // 首元素与元素数一律按 4 字节计，正是 ByteAddressBuffer.Load 的寻址语义。
-// 不导出：只有本 TU 的 drawMeshSegments 用。
+// 不导出：只有本 TU 的 drawMeshlets 用。
 namespace {
 
 void writeRawBufferSRV(const D3D12_CPU_DESCRIPTOR_HANDLE& dst, Dx12Object* buf, long long offset,
@@ -6031,30 +5973,13 @@ long long remainingToEnd(const Dx12Object* buf, long long offset) {
     return buf->size - offset;
 }
 
-// P141：RAW UAV（RWByteAddressBuffer）。首元素/元素数按 4 字节计，与 HLSL 的
-// meshletBounds.Store4(index*16, ...) 寻址语义一致。
-// 资源必须是用 usage 位 512（ALLOW_UNORDERED_ACCESS）建的，否则 CreateUnorderedAccessView 失败。
-// P141 续四：RAW 标志下 Format **必须**是 DXGI_FORMAT_R32_TYPELESS —— 不是 UNKNOWN。写成
-// UNKNOWN 时 CreateUnorderedAccessView 不返回失败码，调试层报 CREATEUAV_INVALIDFORMAT，GPU 拿到
-// 一张解不出来的描述符，第一次写就整设备移除（0x887A0005）。SRV 侧一直是对的（见上）。
-void writeRawBufferUAV(const D3D12_CPU_DESCRIPTOR_HANDLE& dst, Dx12Object* buf, long long offset,
-                       long long length) {
-    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-    uav.Format = DXGI_FORMAT_R32_TYPELESS;
-    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    uav.Buffer.FirstElement = static_cast<UINT>(static_cast<UINT64>(offset) / 4ull);
-    uav.Buffer.NumElements = static_cast<UINT>(static_cast<UINT64>(length) / 4ull);
-    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-    gCtx.device->CreateUnorderedAccessView(buf->resource.Get(), nullptr, &uav, dst);
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// P137：mesh 段派发（一次 DispatchMesh 覆盖一批地形段）
+// P217：meshlet 地形派发（一次 DispatchMesh 覆盖整批 meshlet）
 // ---------------------------------------------------------------------------
 // 与 drawIndexedInstanced 的分工：普通绑定（地形 CBV + 纹理表）已经由
-// pushDescriptors 推好，这里只补 mesh 尾参 —— b8 段表（root CBV）与 t14/t15/t16
+// pushDescriptors 推好，这里只补 mesh 尾参 —— b8 小常量（root CBV）与 t14/t15/t16
 // 的 3 连描述符表（根签名里就是 3 个 DESCRIPTOR_RANGE_OFFSET_APPEND 的范围，
 // 所以三个 SRV 描述符必须连续写在同一个 draw 槽位窗口里）。
 namespace {
@@ -6063,135 +5988,6 @@ namespace {
 // 发过渡（调试层直接报错），而 GENERIC_READ 本身就允许被读。
 void prepareMeshBuffer(CommandContext* ctx, Dx12Object* obj, D3D12_RESOURCE_STATES state) {
     if (obj->heapType != D3D12_HEAP_TYPE_UPLOAD) transitionBufferTo(ctx, obj, state);
-}
-
-// P137/P139：段派发的公共前半段 —— 参数校验、t14/t15/t16 三个 RAW SRV 写进 drawHeap、
-// 绑定几何描述符表。返回段表（b8 root CBV）的 GPU 虚拟地址。
-mcdr::Result<D3D12_GPU_VIRTUAL_ADDRESS> bindMeshSegmentResources(
-    CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset, Dx12Object* indexBuffer,
-    long long indexOffset, Dx12Object* sections, long long sectionsOffset, long long sectionsLength,
-    Dx12Object* segments, long long segmentsOffset, int groupCount, const char* api,
-    Dx12Object* meshletBounds = nullptr, long long meshletBoundsOffset = 0) {
-    if (ctx && ctx->currentPipeline && ctx->currentPipeline->isMesh) {
-        static int sParamLogCount = 0;
-        const UINT segParam = ctx->currentPipeline->segmentParam;
-        const UINT geoParam = ctx->currentPipeline->geometryParam;
-        if (segParam == 0u || geoParam == 0u) {
-            dbgLogWarn("meshDispatch: BAD pipeline params segParam=%u geoParam=%u cullParam=%u hasAs=%d\n",
-                       segParam, geoParam, ctx->currentPipeline->cullParam,
-                       ctx->currentPipeline->hasAs ? 1 : 0);
-        } else if (sParamLogCount < 6) {
-            ++sParamLogCount;
-            dbgLogWarn("meshDispatch: pipeline params segParam=%u geoParam=%u cullParam=%u hasAs=%d\n",
-                       segParam, geoParam, ctx->currentPipeline->cullParam,
-                       ctx->currentPipeline->hasAs ? 1 : 0);
-        }
-    }
-
-    if (!ctx || !ctx->listOpen) {
-        return mcdr::err(api, "meshDispatch: no open command list");
-    }
-    if (!ctx->inRenderPass) {
-        return mcdr::err(api, "meshDispatch: no open render pass");
-    }
-    if (!ctx->currentPipeline || !ctx->currentPipeline->isMesh || ctx->currentPipeline->geometryParam == 0) {
-        return mcdr::err(api, "meshDispatch: current pipeline is not a mesh PSO with mesh extras "
-                              "(bind the mesh variant through setPipeline first)");
-    }
-    if (groupCount <= 0) {
-        return mcdr::err(api, "meshDispatch: groupCount must be positive");
-    }
-    for (const Dx12Object* buf : {vertexBuffer, indexBuffer, sections, segments}) {
-        if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) {
-            return mcdr::err(api, "meshDispatch: invalid buffer handle");
-        }
-    }
-    const long long vbBytes = remainingToEnd(vertexBuffer, vertexOffset);
-    const long long ibBytes = remainingToEnd(indexBuffer, indexOffset);
-    const long long secBytes = sectionsLength > 0 ? sectionsLength : remainingToEnd(sections, sectionsOffset);
-    if (vbBytes < 4 || ibBytes < 4 || secBytes < 4) {
-        return mcdr::err(api, "meshDispatch: empty vertex/index/section buffer range");
-    }
-    if (sectionsLength > 0 && sectionsLength > remainingToEnd(sections, sectionsOffset)) {
-        return mcdr::err(api, "meshDispatch: sections range overflow (" + std::to_string(sectionsLength) + " > "
-                                  + std::to_string(remainingToEnd(sections, sectionsOffset)) + ")");
-    }
-    if (segmentsOffset < 0 || segmentsOffset + static_cast<long long>(groupCount) * 32LL > segments->size) {
-        return mcdr::err(api, "meshDispatch: segments range overflow (groups=" + std::to_string(groupCount)
-                                  + " offset=" + std::to_string(segmentsOffset) + " size="
-                                  + std::to_string(segments->size) + ")");
-    }
-    // P140/P141：剔除路径的包围球表（t17）。P141 起它由 compute pass 生成，
-    // 索引是**段表内**的组号（与 segmentsOffset 无关：每张段表各自从 0 开始填）。
-    if (meshletBounds) {
-        if (meshletBounds->kind != Dx12Object::Kind::Buffer || !meshletBounds->resource) {
-            return mcdr::err(api, "meshDispatch: invalid meshlet bounds buffer handle");
-        }
-        const long long needed = meshletBoundsOffset + static_cast<long long>(groupCount) * 16LL;
-        if (meshletBoundsOffset < 0 || needed > meshletBounds->size) {
-            return mcdr::err(api, "meshDispatch: meshlet bounds range overflow (need=" + std::to_string(needed)
-                                      + " size=" + std::to_string(meshletBounds->size) + ")");
-        }
-    }
-    // P140：带 amplification shader 的 PSO 的根签名里 t17 是固定第 4 个 range，描述符表必须
-    // 填满 4 个槽位；拿不到包围球表时把顶点缓冲自身再写一份进去当占位（AS 会走"自算包围球"
-    // 分支，见 cullData[26] 的 boundsMode）。
-    const bool wantsBoundsTable = meshletBounds != nullptr;
-    const bool cullLayout = wantsBoundsTable
-        || (ctx->currentPipeline != nullptr && ctx->currentPipeline->hasAs);
-    const UINT slotCount = cullLayout ? 4u : 3u;
-    if (ctx->nextDrawSlot + slotCount > syncRingCapacity()) {
-        return mcdr::err(api, "meshDispatch: draw descriptor heap exhausted for this frame ("
-                                  + std::to_string(ctx->nextDrawSlot) + " + "
-                                  + std::to_string(slotCount) + " > "
-                                  + std::to_string(syncRingCapacity()) + ")");
-    }
-
-    prepareMeshBuffer(ctx, vertexBuffer,
-                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    prepareMeshBuffer(ctx, indexBuffer,
-                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    prepareMeshBuffer(ctx, sections,
-                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    prepareMeshBuffer(ctx, segments, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-
-    const UINT slot = ctx->drawHeapSlotBase + ctx->nextDrawSlot;
-    const SIZE_T base = static_cast<SIZE_T>(slot) * gCtx.drawInc;
-    D3D12_CPU_DESCRIPTOR_HANDLE cpuRoot = gCtx.drawHeap->GetCPUDescriptorHandleForHeapStart();
-    cpuRoot.ptr += base;
-    writeRawBufferSRV(cpuRoot, vertexBuffer, vertexOffset, vbBytes);
-    cpuRoot.ptr += gCtx.drawInc;
-    writeRawBufferSRV(cpuRoot, indexBuffer, indexOffset, ibBytes);
-    cpuRoot.ptr += gCtx.drawInc;
-    writeRawBufferSRV(cpuRoot, sections, sectionsOffset, secBytes);
-    // P140：meshlet 包围球表是描述符表里的第 4 个 range（t17），必须紧跟在前三个之后。
-    if (cullLayout) {
-        cpuRoot.ptr += gCtx.drawInc;
-        if (wantsBoundsTable) {
-            writeRawBufferSRV(cpuRoot, meshletBounds, meshletBoundsOffset,
-                              remainingToEnd(meshletBounds, meshletBoundsOffset));
-        } else {
-            // 占位：AS 的 boundsMode=1 时不读它，但描述符必须是合法的 SRV。
-            writeRawBufferSRV(cpuRoot, vertexBuffer, vertexOffset, vbBytes);
-        }
-    }
-    ctx->nextDrawSlot += slotCount;
-
-    D3D12_GPU_DESCRIPTOR_HANDLE gpuRoot = gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
-    gpuRoot.ptr += base;
-    ctx->commandList->SetGraphicsRootDescriptorTable(ctx->currentPipeline->geometryParam, gpuRoot);
-
-    const D3D12_GPU_VIRTUAL_ADDRESS segVA =
-        segments->resource->GetGPUVirtualAddress() + static_cast<UINT64>(segmentsOffset);
-    // 段表（b8）走 root CBV，同样受 256 字节对齐约束。`drawMeshSegments` 按 1024 组一批
-    // （1024 × 32 B = 32 KB）推进偏移，批内偏移因此天然对齐；能破坏约束的只有 JVM 传进来的
-    // `segmentsOffset`，所以在这里挡一次。
-    if (segVA % 256ULL != 0) {
-        return mcdr::err(api, std::string("meshDispatch: segment table root CBV is not 256-byte aligned"
-                                          " (segments offset=") +
-                                  std::to_string(segmentsOffset) + ")");
-    }
-    return segVA;
 }
 
 // 与 drawIndexedInstanced 一致：标记所有 color target 已写入（render pass 结束时的
@@ -6205,205 +6001,58 @@ void markMeshColorTargets(CommandContext* ctx) {
 
 }  // namespace
 
-mcdr::Result<void> drawMeshSegments(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
-                                    Dx12Object* indexBuffer, long long indexOffset, Dx12Object* sections,
-                                    long long sectionsOffset, long long sectionsLength, Dx12Object* segments,
-                                    long long segmentsOffset, int groupCount) {
-    constexpr const char* kApi = "drawMeshSegments";
-    auto bound = bindMeshSegmentResources(ctx, vertexBuffer, vertexOffset, indexBuffer, indexOffset, sections,
-                                          sectionsOffset, sectionsLength, segments, segmentsOffset, groupCount, kApi);
-    if (!bound) return std::unexpected(bound.error());
-    const D3D12_GPU_VIRTUAL_ADDRESS segVA = *bound;
-
-    ComPtr<ID3D12GraphicsCommandList6> list6;
-    if (FAILED(ctx->commandList->QueryInterface(IID_PPV_ARGS(&list6))) || !list6) {
-        return mcdr::err(kApi, "meshDispatch: ID3D12GraphicsCommandList6 is not available on this command list");
+// P217：meshlet 版地形派发。
+//   * 不绑索引缓冲（MS 算术展开 quad 索引）；
+//   * 段表换成 32 B 的 SectionDesc 表、另加 32 B 的 MeshletDesc 表（t15/t16）；
+//   * b8 放的是 256 B 对齐的小常量（meshlet 总数），不是段表基址。
+// 三个 SRV 的顺序必须与 createMeshRootSignature 的 extras 一致：t14 顶点、t15 段、t16 meshlet。
+mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
+                                Dx12Object* sections, long long sectionsOffset, long long sectionsLength,
+                                Dx12Object* meshlets, long long meshletsOffset, long long meshletsLength,
+                                Dx12Object* globals, long long globalsOffset, int meshletCount) {
+    constexpr const char* kApi = "drawMeshlets";
+    if (!ctx || !ctx->listOpen) {
+        return mcdr::err(kApi, "meshletDispatch: no open command list");
     }
-
-    // b8：段表按批重设偏移（root CBV 要求 256 字节对齐 => 每批 1024 组 x 32 B = 32 KB）。
-    constexpr int kGroupsPerBatch = 1024;
-    constexpr long long kSegmentBytes = 32;
-    int batches = 0;
-    for (int first = 0; first < groupCount; first += kGroupsPerBatch) {
-        const int batch = std::min(kGroupsPerBatch, groupCount - first);
-        const D3D12_GPU_VIRTUAL_ADDRESS batchVA =
-            segVA + static_cast<UINT64>(first) * static_cast<UINT64>(kSegmentBytes);
-        ctx->commandList->SetGraphicsRootConstantBufferView(ctx->currentPipeline->segmentParam, batchVA);
-        list6->DispatchMesh(static_cast<UINT>(batch), 1, 1);
-        ++batches;
+    if (!ctx->inRenderPass) {
+        return mcdr::err(kApi, "meshletDispatch: no open render pass");
     }
-
-    markMeshColorTargets(ctx);
-    dbgLogInfo("drawMeshSegments: groups=%d batches=%d vbOff=%lld ibOff=%lld secOff=%lld/%lld segOff=%lld\n",
-               groupCount, batches, vertexOffset, indexOffset, sectionsOffset, sectionsLength, segmentsOffset);
-    return {};
-}
-
-// P140：带 meshlet 剔除的段派发。与 drawMeshSegments 的差别：
-//   1. t14/t15/t16 之外再绑 t17（包围球表）；
-//   2. b9 root 常量里放视锥平面 + 本批的 meshletBase/meshletCount；
-//   3. 线程组数按 AS 折算：ceil(组数 / kMeshletsPerAsGroup)，AS 再把存活组压成实际的 mesh 组。
-mcdr::Result<void> drawMeshSegmentsCulled(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
-                                          Dx12Object* indexBuffer, long long indexOffset, Dx12Object* sections,
-                                          long long sectionsOffset, long long sectionsLength, Dx12Object* segments,
-                                          long long segmentsOffset, Dx12Object* meshletBounds,
-                                          long long meshletBoundsOffset, const float* frustumPlanes, int cullPlanes,
-                                          int groupCount) {
-    constexpr const char* kApi = "drawMeshSegmentsCulled";
-    constexpr int kMeshletsPerAsGroup = 128;
-    if (!frustumPlanes) {
-        return mcdr::err(kApi, "meshDispatchCulled: frustumPlanes must not be null");
+    if (!ctx->currentPipeline || !ctx->currentPipeline->isMesh || ctx->currentPipeline->geometryParam == 0) {
+        return mcdr::err(kApi, "meshletDispatch: current pipeline is not a mesh PSO with mesh extras");
     }
-    if (cullPlanes <= 0 || cullPlanes > 6) {
-        return mcdr::err(kApi, "meshDispatchCulled: cullPlanes must be in [1, 6]");
+    if (meshletCount <= 0) {
+        return mcdr::err(kApi, "meshletDispatch: meshletCount must be positive");
     }
-    auto bound = bindMeshSegmentResources(ctx, vertexBuffer, vertexOffset, indexBuffer, indexOffset, sections,
-                                          sectionsOffset, sectionsLength, segments, segmentsOffset, groupCount, kApi,
-                                          meshletBounds, meshletBoundsOffset);
-    if (!bound) return std::unexpected(bound.error());
-    const D3D12_GPU_VIRTUAL_ADDRESS segVA = *bound;
-    if (ctx->currentPipeline->cullParam == 0 || !ctx->currentPipeline->hasAs) {
-        return mcdr::err(kApi, "meshDispatchCulled: current pipeline has no amplification shader "
-                               "(meshlet culling needs the cull root signature + AS bytecode)");
+    for (const Dx12Object* buf : {vertexBuffer, sections, meshlets, globals}) {
+        if (!buf || buf->kind != Dx12Object::Kind::Buffer || !buf->resource) {
+            return mcdr::err(kApi, "meshletDispatch: invalid buffer handle");
+        }
     }
-
-    ComPtr<ID3D12GraphicsCommandList6> list6;
-    if (FAILED(ctx->commandList->QueryInterface(IID_PPV_ARGS(&list6))) || !list6) {
-        return mcdr::err(kApi, "meshDispatchCulled: ID3D12GraphicsCommandList6 is not available on this command list");
-    }
-
-    // b9：先整块写一次（6 个 float4 平面 + 占位），循环里只改 dword 24/25（base / count）。
-    // 结构体布局必须与 HLSL 的 `cbuffer MeshCull` 完全一致：float4 planes[6]; uint base; uint count; uint2 pad;
-    float cullData[28] = {};
-    for (int i = 0; i < cullPlanes; ++i) {
-        cullData[i * 4 + 0] = frustumPlanes[i * 4 + 0];
-        cullData[i * 4 + 1] = frustumPlanes[i * 4 + 1];
-        cullData[i * 4 + 2] = frustumPlanes[i * 4 + 2];
-        cullData[i * 4 + 3] = frustumPlanes[i * 4 + 3];
-    }
-    constexpr long long kSegmentBytes = 32;
-    // meshCullPad.x = 包围球来源：0 读 t17 包围球表；1 由 AS 从 t14 顶点流自算（此时 t17 是占位）。
-    const UINT boundsMode = meshletBounds != nullptr ? 0u : 1u;
-    std::memcpy(&cullData[26], &boundsMode, sizeof(UINT));
-    constexpr int kGroupsPerBatch = 1024;
-    int batches = 0;
-    for (int first = 0; first < groupCount; first += kGroupsPerBatch) {
-        const int batch = std::min(kGroupsPerBatch, groupCount - first);
-        const D3D12_GPU_VIRTUAL_ADDRESS batchVA =
-            segVA + static_cast<UINT64>(first) * static_cast<UINT64>(kSegmentBytes);
-        ctx->commandList->SetGraphicsRootConstantBufferView(ctx->currentPipeline->segmentParam, batchVA);
-        // P141：包围球表是"段表内"索引（compute pass 按 1024 组一批写入，
-        // 第 i 组落在 boundsOffset + i*16），所以基址 = boundsOffset/16 + 本批首组号。
-        const UINT globalBase = static_cast<UINT>((meshletBoundsOffset / 16LL) + first);
-        std::memcpy(&cullData[24], &globalBase, sizeof(UINT));
-        const UINT batchCount = static_cast<UINT>(batch);
-        std::memcpy(&cullData[25], &batchCount, sizeof(UINT));
-        ctx->commandList->SetGraphicsRoot32BitConstants(ctx->currentPipeline->cullParam, 28, cullData, 0);
-        const UINT asGroups = static_cast<UINT>((batch + kMeshletsPerAsGroup - 1) / kMeshletsPerAsGroup);
-        list6->DispatchMesh(asGroups, 1, 1);
-        ++batches;
-    }
-
-    markMeshColorTargets(ctx);
-    dbgLogInfo("drawMeshSegmentsCulled: groups=%d batches=%d planes=%d vbOff=%lld secOff=%lld segOff=%lld "
-               "boundsOff=%lld\n",
-               groupCount, batches, cullPlanes, vertexOffset, sectionsOffset, segmentsOffset, meshletBoundsOffset);
-    return {};
-}
-
-// P139：indirect 版。语义与 drawMeshSegments 相同，只是线程组数由 args 缓冲给出
-// （每命令 12 B：ThreadGroupCountX/Y/Z）。b8 段表基址由 segmentsOffset 给出，所以
-// 一次调用只覆盖一段连续的组（<=1024 组，超过就按批多次调用）。
-mcdr::Result<void> drawMeshSegmentsIndirect(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
-                                            Dx12Object* indexBuffer, long long indexOffset, Dx12Object* sections,
-                                            long long sectionsOffset, long long sectionsLength, Dx12Object* segments,
-                                            long long segmentsOffset, Dx12Object* args, long long argsOffset,
-                                            int maxCommandCount) {
-    constexpr const char* kApi = "drawMeshSegmentsIndirect";
-    if (!args || args->kind != Dx12Object::Kind::Buffer || !args->resource) {
-        return mcdr::err(kApi, "meshDispatchIndirect: invalid args buffer");
-    }
-    if (maxCommandCount <= 0) {
-        return mcdr::err(kApi, "meshDispatchIndirect: maxCommandCount must be positive");
-    }
-    if (argsOffset < 0 || argsOffset + static_cast<long long>(maxCommandCount) * 12LL > args->size) {
-        return mcdr::err(kApi, "meshDispatchIndirect: args range overflow (commands="
-                                  + std::to_string(maxCommandCount) + " offset=" + std::to_string(argsOffset)
-                                  + " size=" + std::to_string(args->size) + ")");
-    }
-    if (!gCtx.cmdSigMesh) {
-        return mcdr::err(kApi, "meshDispatchIndirect: DISPATCH_MESH command signature is not available");
-    }
-    // groupCount 只用于段表范围校验：indirect 的线程组数由 args 决定，这里按 args 的
-    // 上限（每命令最多 1024 组）估一个保守值。
-    const int groupLimit = std::min(maxCommandCount * 1024, 1024);
-    auto bound = bindMeshSegmentResources(ctx, vertexBuffer, vertexOffset, indexBuffer, indexOffset, sections,
-                                          sectionsOffset, sectionsLength, segments, segmentsOffset, groupLimit, kApi);
-    if (!bound) return std::unexpected(bound.error());
-
-    prepareMeshBuffer(ctx, args, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    ctx->commandList->SetGraphicsRootConstantBufferView(ctx->currentPipeline->segmentParam, *bound);
-    ctx->commandList->ExecuteIndirect(gCtx.cmdSigMesh.Get(), static_cast<UINT>(maxCommandCount),
-                                      args->resource.Get(), static_cast<UINT64>(argsOffset), nullptr, 0);
-
-    markMeshColorTargets(ctx);
-    dbgLogInfo("drawMeshSegmentsIndirect: commands=%d vbOff=%lld ibOff=%lld secOff=%lld/%lld segOff=%lld\n",
-               maxCommandCount, vertexOffset, indexOffset, sectionsOffset, sectionsLength, segmentsOffset);
-    return {};
-}
-
-// ---------------------------------------------------------------------------
-// P141：meshlet 包围球 —— compute 生成
-// ---------------------------------------------------------------------------
-// 为什么放在这个 TU：只有这里能碰 gCtx.drawHeap / transitionBufferTo / syncRingCapacity，
-// 而 PSO 与根签名（需要 D3D12_PIPELINE_STATE_STREAM_DESC 那套工具）在 mesh 模块里建。
-mcdr::Result<void> buildMeshletBounds(CommandContext* ctx, Dx12Pipeline* pipeline, Dx12Object* vertexBuffer,
-                                      long long vertexOffset, Dx12Object* indexBuffer, long long indexOffset,
-                                      Dx12Object* segments, long long segmentsOffset, Dx12Object* bounds,
-                                      long long boundsOffset, int groupCount) {
-    constexpr const char* kApi = "buildMeshletBounds";
-    if (!ctx || !ctx->listOpen) return mcdr::err(kApi, "no open command list");
-    // P141 续四：compute dispatch 不允许录进已打开的 render pass —— D3D12 会在 ExecuteCommandLists
-    // 时直接移除设备（0x887A0005），而且这里（Dispatch 当下）完全不报错。上一版 JVM 侧把 flush
-    // 放在 BeginRenderPass 之后，于是"pre-pass bounds built"照打、设备照掉。挡在这里让它变成
-    // 一条可读的错误，而不是一次静默的设备移除。
-    if (ctx->inRenderPass) return mcdr::err(kApi, "compute dispatch must be recorded outside a render pass");
-    if (!pipeline || !pipeline->withDepth || !pipeline->rootSignature)
-        return mcdr::err(kApi, "compute pipeline is not ready");
-    if (!vertexBuffer || vertexBuffer->kind != Dx12Object::Kind::Buffer || !vertexBuffer->resource)
-        return mcdr::err(kApi, "invalid vertex buffer");
-    if (!indexBuffer || indexBuffer->kind != Dx12Object::Kind::Buffer || !indexBuffer->resource)
-        return mcdr::err(kApi, "invalid index buffer");
-    if (!segments || segments->kind != Dx12Object::Kind::Buffer || !segments->resource)
-        return mcdr::err(kApi, "invalid segment buffer");
-    if (!bounds || bounds->kind != Dx12Object::Kind::Buffer || !bounds->resource)
-        return mcdr::err(kApi, "invalid bounds buffer");
-    if (groupCount <= 0) return mcdr::err(kApi, "groupCount must be positive");
-    if (segmentsOffset < 0 || segmentsOffset + static_cast<long long>(groupCount) * 32LL > segments->size)
-        return mcdr::err(kApi, "segment range overflow (groups=" + std::to_string(groupCount) + " offset="
-                                   + std::to_string(segmentsOffset) + " size=" + std::to_string(segments->size)
-                                   + ")");
-    if (boundsOffset < 0 || boundsOffset + static_cast<long long>(groupCount) * 16LL > bounds->size)
-        return mcdr::err(kApi, "bounds range overflow (groups=" + std::to_string(groupCount) + " offset="
-                                   + std::to_string(boundsOffset) + " size=" + std::to_string(bounds->size)
-                                   + ")");
-
-    constexpr UINT kSlots = 3;
-    if (ctx->nextDrawSlot + kSlots > syncRingCapacity()) {
-        return mcdr::err(kApi, "draw descriptor heap exhausted for this frame (" + std::to_string(ctx->nextDrawSlot)
-                                   + " + " + std::to_string(kSlots) + " > " + std::to_string(syncRingCapacity())
-                                   + ")");
-    }
-
     const long long vbBytes = remainingToEnd(vertexBuffer, vertexOffset);
-    const long long ibBytes = remainingToEnd(indexBuffer, indexOffset);
-    if (vbBytes < 4 || ibBytes < 4) return mcdr::err(kApi, "empty vertex/index buffer range");
+    const long long secBytes = sectionsLength > 0 ? sectionsLength : remainingToEnd(sections, sectionsOffset);
+    const long long meshletBytes = meshletsLength > 0 ? meshletsLength : remainingToEnd(meshlets, meshletsOffset);
+    if (vbBytes < 4 || secBytes < 32 || meshletBytes < 32) {
+        return mcdr::err(kApi, "meshletDispatch: empty vertex/section/meshlet range");
+    }
+    if (sectionsLength > 0 && sectionsLength > remainingToEnd(sections, sectionsOffset)) {
+        return mcdr::err(kApi, "meshletDispatch: sections range overflow");
+    }
+    if (meshletsLength > 0 && meshletsLength > remainingToEnd(meshlets, meshletsOffset)) {
+        return mcdr::err(kApi, "meshletDispatch: meshlet range overflow");
+    }
 
-    // 段表是 root CBV；顶点/索引是 RAW SRV；包围球是 RAW UAV（Format=R32_TYPELESS）。
-    prepareMeshBuffer(ctx, segments, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-    prepareMeshBuffer(ctx, vertexBuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    prepareMeshBuffer(ctx, indexBuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    prepareMeshBuffer(ctx, bounds, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const UINT slotCount = 3u;
+    if (ctx->nextDrawSlot + slotCount > syncRingCapacity()) {
+        return mcdr::err(kApi, "meshletDispatch: draw descriptor heap exhausted for this frame");
+    }
+
+    prepareMeshBuffer(ctx, vertexBuffer,
+                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    prepareMeshBuffer(ctx, sections,
+                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    prepareMeshBuffer(ctx, meshlets,
+                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    prepareMeshBuffer(ctx, globals, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
 
     const UINT slot = ctx->drawHeapSlotBase + ctx->nextDrawSlot;
     const SIZE_T base = static_cast<SIZE_T>(slot) * gCtx.drawInc;
@@ -6411,43 +6060,29 @@ mcdr::Result<void> buildMeshletBounds(CommandContext* ctx, Dx12Pipeline* pipelin
     cpuRoot.ptr += base;
     writeRawBufferSRV(cpuRoot, vertexBuffer, vertexOffset, vbBytes);
     cpuRoot.ptr += gCtx.drawInc;
-    writeRawBufferSRV(cpuRoot, indexBuffer, indexOffset, ibBytes);
+    writeRawBufferSRV(cpuRoot, sections, sectionsOffset, secBytes);
     cpuRoot.ptr += gCtx.drawInc;
-    writeRawBufferUAV(cpuRoot, bounds, boundsOffset, static_cast<long long>(groupCount) * 16LL);
-    ctx->nextDrawSlot += kSlots;
+    writeRawBufferSRV(cpuRoot, meshlets, meshletsOffset, meshletBytes);
+    ctx->nextDrawSlot += slotCount;
 
     D3D12_GPU_DESCRIPTOR_HANDLE gpuRoot = gCtx.drawHeap->GetGPUDescriptorHandleForHeapStart();
     gpuRoot.ptr += base;
+    ctx->commandList->SetGraphicsRootDescriptorTable(ctx->currentPipeline->geometryParam, gpuRoot);
 
-    ID3D12GraphicsCommandList* list = ctx->commandList;
-    list->SetPipelineState(pipeline->withDepth.Get());
-    list->SetComputeRootSignature(pipeline->rootSignature.Get());
-    const D3D12_GPU_VIRTUAL_ADDRESS segmentsVa =
-        segments->resource->GetGPUVirtualAddress() + static_cast<UINT64>(segmentsOffset);
-    // b0 是段表的 compute root CBV：与图形侧同为 256 字节对齐约束。
-    if (segmentsVa % 256ULL != 0) {
-        return mcdr::err(kApi, std::string("segment table compute root CBV is not 256-byte aligned"
-                                          " (segments offset=") +
-                                  std::to_string(segmentsOffset) + ")");
+    const D3D12_GPU_VIRTUAL_ADDRESS globalsVA =
+        globals->resource->GetGPUVirtualAddress() + static_cast<UINT64>(globalsOffset);
+    if (globalsVA % 256ULL != 0) {
+        return mcdr::err(kApi, std::string("meshletDispatch: globals root CBV is not 256-byte aligned (offset=") +
+                                   std::to_string(globalsOffset) + ")");
     }
-    list->SetComputeRootConstantBufferView(0, segmentsVa);
-    list->SetComputeRootDescriptorTable(1, gpuRoot);
-    list->Dispatch(static_cast<UINT>((groupCount + 63) / 64), 1, 1);
+    ctx->commandList->SetGraphicsRootConstantBufferView(ctx->currentPipeline->segmentParam, globalsVA);
 
-    // P141：UAV 写入之后必须插 UAV 屏障，单靠资源状态转换不足以保证对后续 SRV 读可见。
-    D3D12_RESOURCE_BARRIER uavBarrier{};
-    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    uavBarrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-    uavBarrier.UAV.pResource = bounds->resource.Get();
-    list->ResourceBarrier(1, &uavBarrier);
-
-    // AS 要把这份数据当 t17（SRV）读，切回去；顺带把 PSO 缓存清掉 —— 上面绕过了
-    // setPipeline，cachedPso 还指着上一支图形管线，下一次 setPipeline 必须真正重绑。
-    prepareMeshBuffer(ctx, bounds, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    ctx->cachedPso = nullptr;
-
-    dbgLogInfo("buildMeshletBounds: groups=%d dispatches=%d vbOff=%lld ibOff=%lld segOff=%lld boundsOff=%lld\n",
-               groupCount, (groupCount + 63) / 64, vertexOffset, indexOffset, segmentsOffset, boundsOffset);
+    ComPtr<ID3D12GraphicsCommandList6> list6;
+    if (FAILED(ctx->commandList->QueryInterface(IID_PPV_ARGS(&list6))) || !list6) {
+        return mcdr::err(kApi, "meshletDispatch: ID3D12GraphicsCommandList6 is not available on this command list");
+    }
+    list6->DispatchMesh(static_cast<UINT>(meshletCount), 1, 1);
+    markMeshColorTargets(ctx);
     return {};
 }
 
@@ -7350,64 +6985,39 @@ mcdr::Result<void> initBlitPipeline() {
         }
     }
 
-    // 编译 VS / PS。P84：与主图形管线同一策略 —— 优先 DXC + SM 6.x（DXIL），
-    // DXC 不可用 / 设备 SM < 6.0 / 编译失败时退回 D3DCompile + SM 5.1（DXBC，既有行为）。
-    ComPtr<ID3DBlob> vsBlob, psBlob, errs;
-    std::vector<uint8_t> vsBytes(kBlitVS, kBlitVS + sizeof(kBlitVS));
-    std::vector<uint8_t> psBytes(kBlitPS, kBlitPS + sizeof(kBlitPS));
-    std::vector<uint8_t> vsDxil, psDxil;
-    const void* vsCode = nullptr;
-    SIZE_T vsCodeSize = 0;
-    const void* psCode = nullptr;
-    SIZE_T psCodeSize = 0;
+    // 编译 VS / PS。与主图形管线同一策略：硬要求 SM 6.9 + DXC，**没有 5.1(DXBC) 兜底**
+    // （2026-10-25）—— 不满足就直接报错，blit 不通就等于 Present 不通，必须当场可见。
     const std::string smProfile = graphicsShaderModelProfile();
-    if (!smProfile.empty()) {
-        const std::string vsSrc(kBlitVS, sizeof(kBlitVS) - 1);
-        const std::string psSrc(kBlitPS, sizeof(kBlitPS) - 1);
-        auto vsDxc = compileHlslToDxil(vsSrc, "main", "vs_" + smProfile, vsDxil);
-        auto psDxc = vsDxc ? compileHlslToDxil(psSrc, "main", "ps_" + smProfile, psDxil) : vsDxc;
-        if (vsDxc && psDxc) {
-            vsCode = vsDxil.data();
-            vsCodeSize = vsDxil.size();
-            psCode = psDxil.data();
-            psCodeSize = psDxil.size();
-            dbgLogInfo("initBlitPipeline: blit pipeline compiled with DXC SM %s (DXIL vs=%zuB ps=%zuB)", smProfile.c_str(),
-                       vsDxil.size(), psDxil.size());
-        } else {
-            dbgLogWarn("initBlitPipeline: DXC compilation failed; falling back to D3DCompile SM 5.1: %s",
-                       firstLine((!vsDxc ? vsDxc : psDxc).error().message).c_str());
-        }
+    if (smProfile.empty()) {
+        return mcdr::err("initBlitPipeline", "initBlitPipeline: " + sm69RequirementText());
     }
-    if (vsCode == nullptr) {
-        auto vsBlobRes = compileShaderBytecode(vsBytes, "blit_vs", "vs_5_1", vsBlob);
-        if (!vsBlobRes) return mcdr::err("initBlitPipeline", errorMessage(vsBlobRes.error()));
-        auto psBlobRes = compileShaderBytecode(psBytes, "blit_ps", "ps_5_1", psBlob);
-        if (!psBlobRes) return mcdr::err("initBlitPipeline", errorMessage(psBlobRes.error()));
-        vsCode = vsBlob->GetBufferPointer();
-        vsCodeSize = vsBlob->GetBufferSize();
-        psCode = psBlob->GetBufferPointer();
-        psCodeSize = psBlob->GetBufferSize();
+    std::vector<uint8_t> vsDxil, psDxil;
+    const std::string vsSrc(kBlitVS, sizeof(kBlitVS) - 1);
+    const std::string psSrc(kBlitPS, sizeof(kBlitPS) - 1);
+    auto vsDxc = compileHlslToDxil(vsSrc, "main", "vs_" + smProfile, vsDxil);
+    if (!vsDxc) {
+        return mcdr::err("initBlitPipeline", "blit_vs (DXC): " + firstLine(vsDxc.error().message));
     }
+    auto psDxc = compileHlslToDxil(psSrc, "main", "ps_" + smProfile, psDxil);
+    if (!psDxc) {
+        return mcdr::err("initBlitPipeline", "blit_ps (DXC): " + firstLine(psDxc.error().message));
+    }
+    const void* vsCode = vsDxil.data();
+    SIZE_T vsCodeSize = vsDxil.size();
+    const void* psCode = psDxil.data();
+    SIZE_T psCodeSize = psDxil.size();
+    dbgLogInfo("initBlitPipeline: blit pipeline compiled with DXC SM %s (DXIL vs=%zuB ps=%zuB)", smProfile.c_str(),
+               vsDxil.size(), psDxil.size());
 
     // P197：HDR 变体的像素着色器（几何与 VS 不变，只有 RTV 格式和 PS 不同）。
     std::vector<uint8_t> hdrPsDxil;
-    ComPtr<ID3DBlob> hdrPsBlob;
-    const void* hdrPsCode = nullptr;
-    SIZE_T hdrPsCodeSize = 0;
-    if (!smProfile.empty()) {
-        const std::string hdrSrc(kBlitPSHdr, sizeof(kBlitPSHdr) - 1);
-        if (compileHlslToDxil(hdrSrc, "main", "ps_" + smProfile, hdrPsDxil)) {
-            hdrPsCode = hdrPsDxil.data();
-            hdrPsCodeSize = hdrPsDxil.size();
-        }
+    const std::string hdrSrc(kBlitPSHdr, sizeof(kBlitPSHdr) - 1);
+    auto hdrDxc = compileHlslToDxil(hdrSrc, "main", "ps_" + smProfile, hdrPsDxil);
+    if (!hdrDxc) {
+        return mcdr::err("initBlitPipeline", "blit HDR PS (DXC): " + firstLine(hdrDxc.error().message));
     }
-    if (hdrPsCode == nullptr) {
-        std::vector<uint8_t> hdrBytes(kBlitPSHdr, kBlitPSHdr + sizeof(kBlitPSHdr));
-        auto hdrRes = compileShaderBytecode(hdrBytes, "blit_ps_hdr", "ps_5_1", hdrPsBlob);
-        if (!hdrRes) return mcdr::err("initBlitPipeline", "blit HDR PS: " + errorMessage(hdrRes.error()));
-        hdrPsCode = hdrPsBlob->GetBufferPointer();
-        hdrPsCodeSize = hdrPsBlob->GetBufferSize();
-    }
+    const void* hdrPsCode = hdrPsDxil.data();
+    SIZE_T hdrPsCodeSize = hdrPsDxil.size();
 
     // 创建 PSO（P197：SDR 用 RGBA8、HDR 用 RGBA16F，共用同一份根签名与输入布局）
     auto createBlitPso = [&](const void* pixCode, SIZE_T pixSize, DXGI_FORMAT rtvFormat,
@@ -7677,41 +7287,27 @@ mcdr::Result<void> initSharpenPipeline() {
         }
     }
 
-    // 编译 VS（复用 blit 的）/ PS：DXC + SM6 优先，失败退回 D3DCompile SM 5.1。
-    ComPtr<ID3DBlob> vsBlob, psBlob;
-    std::vector<uint8_t> vsBytes(kBlitVS, kBlitVS + sizeof(kBlitVS));
-    std::vector<uint8_t> psBytes(kSharpenPS, kSharpenPS + sizeof(kSharpenPS));
-    std::vector<uint8_t> vsDxil, psDxil;
-    const void* vsCode = nullptr;
-    SIZE_T vsCodeSize = 0;
-    const void* psCode = nullptr;
-    SIZE_T psCodeSize = 0;
+    // 编译 VS（复用 blit 的）/ PS：与主图形管线同一策略 —— 硬要求 SM 6.9 + DXC，无 5.1 兜底。
     const std::string smProfile = graphicsShaderModelProfile();
-    if (!smProfile.empty()) {
-        const std::string vsSrc(kBlitVS, sizeof(kBlitVS) - 1);
-        const std::string psSrc(kSharpenPS, sizeof(kSharpenPS) - 1);
-        auto vsDxc = compileHlslToDxil(vsSrc, "main", "vs_" + smProfile, vsDxil);
-        auto psDxc = vsDxc ? compileHlslToDxil(psSrc, "main", "ps_" + smProfile, psDxil) : vsDxc;
-        if (vsDxc && psDxc) {
-            vsCode = vsDxil.data();
-            vsCodeSize = vsDxil.size();
-            psCode = psDxil.data();
-            psCodeSize = psDxil.size();
-            dbgLogInfo("initSharpenPipeline: compiled with DXC SM %s", smProfile.c_str());
-        } else {
-            dbgLogWarn("initSharpenPipeline: DXC failed, falling back to D3DCompile SM 5.1");
-        }
+    if (smProfile.empty()) {
+        return mcdr::err("initSharpenPipeline", "initSharpenPipeline: " + sm69RequirementText());
     }
-    if (vsCode == nullptr) {
-        auto vsRes = compileShaderBytecode(vsBytes, "sharpen_vs", "vs_5_1", vsBlob);
-        if (!vsRes) return mcdr::err("initSharpenPipeline", errorMessage(vsRes.error()));
-        auto psRes = compileShaderBytecode(psBytes, "sharpen_ps", "ps_5_1", psBlob);
-        if (!psRes) return mcdr::err("initSharpenPipeline", errorMessage(psRes.error()));
-        vsCode = vsBlob->GetBufferPointer();
-        vsCodeSize = vsBlob->GetBufferSize();
-        psCode = psBlob->GetBufferPointer();
-        psCodeSize = psBlob->GetBufferSize();
+    std::vector<uint8_t> vsDxil, psDxil;
+    const std::string vsSrc(kBlitVS, sizeof(kBlitVS) - 1);
+    const std::string psSrc(kSharpenPS, sizeof(kSharpenPS) - 1);
+    auto vsDxc = compileHlslToDxil(vsSrc, "main", "vs_" + smProfile, vsDxil);
+    if (!vsDxc) {
+        return mcdr::err("initSharpenPipeline", "sharpen_vs (DXC): " + firstLine(vsDxc.error().message));
     }
+    auto psDxc = compileHlslToDxil(psSrc, "main", "ps_" + smProfile, psDxil);
+    if (!psDxc) {
+        return mcdr::err("initSharpenPipeline", "sharpen_ps (DXC): " + firstLine(psDxc.error().message));
+    }
+    const void* vsCode = vsDxil.data();
+    SIZE_T vsCodeSize = vsDxil.size();
+    const void* psCode = psDxil.data();
+    SIZE_T psCodeSize = psDxil.size();
+    dbgLogInfo("initSharpenPipeline: compiled with DXC SM %s", smProfile.c_str());
 
     // PSO：与 blit 完全同状态（noDepth / noBlend / noCull），只是 PS 不同。
     ComPtr<ID3D12PipelineState> pso;
@@ -8481,30 +8077,21 @@ mcdr::Result<void> smaaEnsureWorldResult(const D3D12_RESOURCE_DESC& srcDesc) {
     return {};
 }
 
-// 编译一个 SMAA 像素着色器（DXC 优先，失败退回 D3DCompile SM 5.1 —— 与 blit 同策略）。
+// 编译一个 SMAA / TAA 像素着色器：硬要求 SM 6.9 + DXC，没有 5.1(DXBC) 兜底（2026-10-25）。
 mcdr::Result<void> smaaCompilePs(const char* src, const char* debugName, const std::string& smProfile,
-                                 std::vector<uint8_t>& dxilOut, ComPtr<ID3DBlob>& blobOut,
-                                 const void*& code, SIZE_T& size) {
+                                 std::vector<uint8_t>& dxilOut, const void*& code, SIZE_T& size) {
     code = nullptr;
     size = 0;
-    if (!smProfile.empty()) {
-        const std::string text(src);
-        auto r = compileHlslToDxil(text, "main", "ps_" + smProfile, dxilOut);
-        if (r) {
-            code = dxilOut.data();
-            size = dxilOut.size();
-            return {};
-        }
-        dbgLogWarn("P104: SMAA %s DXC compilation failed; falling back to D3DCompile SM 5.1: %s", debugName,
-                   firstLine(r.error().message).c_str());
+    if (smProfile.empty()) {
+        return mcdr::err("smaaCompilePs", std::string(debugName) + ": " + sm69RequirementText());
     }
-    std::vector<uint8_t> bytes(src, src + std::strlen(src));
-    auto br = compileShaderBytecode(bytes, debugName, "ps_5_1", blobOut);
-    if (!br) {
-        return mcdr::err("smaaCompilePs", errorMessage(br.error()));
+    const std::string text(src);
+    auto r = compileHlslToDxil(text, "main", "ps_" + smProfile, dxilOut);
+    if (!r) {
+        return mcdr::err("smaaCompilePs", std::string(debugName) + " (DXC): " + firstLine(r.error().message));
     }
-    code = blobOut->GetBufferPointer();
-    size = blobOut->GetBufferSize();
+    code = dxilOut.data();
+    size = dxilOut.size();
     return {};
 }
 
@@ -8680,59 +8267,41 @@ mcdr::Result<void> smaaEnsurePipelines(DXGI_FORMAT rtFormat) {
         return mcdr::err("smaaEnsurePipelines", "CreateRootSignature hr=0x" + hrText(hr));
     }
 
-    // VS 与 blit 同一份 HLSL（全屏四边形 + 透传 texcoord）。
+    // VS 与 blit 同一份 HLSL（全屏四边形 + 透传 texcoord）。硬要求 SM 6.9 + DXC，无 5.1 兜底。
     const std::string smProfile = graphicsShaderModelProfile();
-    ComPtr<ID3DBlob> vsBlob;
+    if (smProfile.empty()) {
+        return mcdr::err("smaaEnsurePipelines", "smaaEnsurePipelines: " + sm69RequirementText());
+    }
     std::vector<uint8_t> vsDxil;
-    const void* vsCode = nullptr;
-    SIZE_T vsCodeSize = 0;
-    if (!smProfile.empty()) {
-        const std::string vsSrc(kBlitVS, sizeof(kBlitVS) - 1);
-        auto r = compileHlslToDxil(vsSrc, "main", "vs_" + smProfile, vsDxil);
-        if (r) {
-            vsCode = vsDxil.data();
-            vsCodeSize = vsDxil.size();
-        } else {
-            dbgLogWarn("P104: SMAA VS DXC compilation failed; falling back to D3DCompile SM 5.1: %s",
-                       firstLine(r.error().message).c_str());
-        }
+    const std::string vsSrc(kBlitVS, sizeof(kBlitVS) - 1);
+    auto vsDxc = compileHlslToDxil(vsSrc, "main", "vs_" + smProfile, vsDxil);
+    if (!vsDxc) {
+        return mcdr::err("smaaEnsurePipelines", "smaa_vs (DXC): " + firstLine(vsDxc.error().message));
     }
-    if (vsCode == nullptr) {
-        std::vector<uint8_t> vsBytes(kBlitVS, kBlitVS + sizeof(kBlitVS));
-        auto vr = compileShaderBytecode(vsBytes, "smaa_vs", "vs_5_1", vsBlob);
-        if (!vr) {
-            return mcdr::err("smaaEnsurePipelines", errorMessage(vr.error()));
-        }
-        vsCode = vsBlob->GetBufferPointer();
-        vsCodeSize = vsBlob->GetBufferSize();
-    }
+    const void* vsCode = vsDxil.data();
+    SIZE_T vsCodeSize = vsDxil.size();
 
-    // 三个 PS：blob/vector 必须活到 PSO 建完。
-    ComPtr<ID3DBlob> edgeBlob, weightBlob, blendBlob, weightLutBlob;
+    // 三个 PS：DXIL 缓冲必须活到 PSO 建完（不再有 ID3DBlob 那条路）。
     std::vector<uint8_t> edgeDxil, weightDxil, blendDxil, weightLutDxil;
     const void* edgeCode = nullptr;
     const void* weightCode = nullptr;
     const void* blendCode = nullptr;
     const void* weightLutCode = nullptr;
     SIZE_T edgeSize = 0, weightSize = 0, blendSize = 0, weightLutSize = 0;
-    if (auto r = smaaCompilePs(kSmaaEdgePS, "smaa_edge_ps", smProfile, edgeDxil, edgeBlob, edgeCode, edgeSize);
-        !r) {
+    if (auto r = smaaCompilePs(kSmaaEdgePS, "smaa_edge_ps", smProfile, edgeDxil, edgeCode, edgeSize); !r) {
         return mcdr::err("smaaEnsurePipelines", errorMessage(r.error()));
     }
-    if (auto r = smaaCompilePs(kSmaaWeightPS, "smaa_weight_ps", smProfile, weightDxil, weightBlob, weightCode,
-                               weightSize);
+    if (auto r = smaaCompilePs(kSmaaWeightPS, "smaa_weight_ps", smProfile, weightDxil, weightCode, weightSize);
         !r) {
         return mcdr::err("smaaEnsurePipelines", errorMessage(r.error()));
     }
     // P104：官方 LUT 版权重趟。这是本条路径的主算法；下面的解析版只是 LUT 初始化失败时的回退。
-    if (auto r = smaaCompilePs(kSmaaWeightLutPS, "smaa_weight_lut_ps", smProfile, weightLutDxil, weightLutBlob,
-                               weightLutCode, weightLutSize);
+    if (auto r = smaaCompilePs(kSmaaWeightLutPS, "smaa_weight_lut_ps", smProfile, weightLutDxil, weightLutCode,
+                               weightLutSize);
         !r) {
         return mcdr::err("smaaEnsurePipelines", errorMessage(r.error()));
     }
-    if (auto r = smaaCompilePs(kSmaaBlendPS, "smaa_blend_ps", smProfile, blendDxil, blendBlob, blendCode,
-                               blendSize);
-        !r) {
+    if (auto r = smaaCompilePs(kSmaaBlendPS, "smaa_blend_ps", smProfile, blendDxil, blendCode, blendSize); !r) {
         return mcdr::err("smaaEnsurePipelines", errorMessage(r.error()));
     }
 
@@ -8754,7 +8323,7 @@ mcdr::Result<void> smaaEnsurePipelines(DXGI_FORMAT rtFormat) {
     gCtx.smaaBlendFormat = rtFormat;
     gCtx.smaaPipelinesReady = true;
     dbgLogInfo("P104: SMAA pipelines ready (blend RTV fmt=%d, SM=%s)", static_cast<int>(rtFormat),
-               smProfile.empty() ? "5.1(D3DCompile)" : smProfile.c_str());
+               smProfile.c_str());
     // 两条权重管线只有一条会被用到，但两条都建好 ⇒ 任何时候都不需要重建、不需要重试。
     // 「官方 LUT」那行日志**不能**放在这里：smaaEnsurePipelines 先于 smaaEnsureLuts 执行，
     // 此刻 smaaLutsReady 一定是 false。它现在打在 applySmaaToTexture 选路之后。
@@ -9627,38 +9196,25 @@ mcdr::Result<void> taaEnsurePipelines() {
     }
 
     // VS 与 blit / SMAA 同一份全屏四边形 HLSL（POSITION + TEXCOORD，配合 blit 的顶点缓冲）。
+    // 硬要求 SM 6.9 + DXC，无 5.1(DXBC) 兜底。
     const std::string smProfile = graphicsShaderModelProfile();
-    ComPtr<ID3DBlob> vsBlob;
+    if (smProfile.empty()) {
+        return mcdr::err("taaEnsurePipelines", "taaEnsurePipelines: " + sm69RequirementText());
+    }
     std::vector<uint8_t> vsDxil;
-    const void* vsCode = nullptr;
-    SIZE_T vsCodeSize = 0;
-    if (!smProfile.empty()) {
-        const std::string vsSrc(kBlitVS, sizeof(kBlitVS) - 1);
-        auto r = compileHlslToDxil(vsSrc, "main", "vs_" + smProfile, vsDxil);
-        if (r) {
-            vsCode = vsDxil.data();
-            vsCodeSize = vsDxil.size();
-        } else {
-            dbgLogWarn("P152: TAA VS DXC compilation failed; falling back to D3DCompile SM 5.1: %s",
-                       firstLine(r.error().message).c_str());
-        }
+    const std::string vsSrc(kBlitVS, sizeof(kBlitVS) - 1);
+    auto vsDxc = compileHlslToDxil(vsSrc, "main", "vs_" + smProfile, vsDxil);
+    if (!vsDxc) {
+        return mcdr::err("taaEnsurePipelines", "taa_vs (DXC): " + firstLine(vsDxc.error().message));
     }
-    if (vsCode == nullptr) {
-        std::vector<uint8_t> vsBytes(kBlitVS, kBlitVS + sizeof(kBlitVS));
-        auto vr = compileShaderBytecode(vsBytes, "taa_vs", "vs_5_1", vsBlob);
-        if (!vr) {
-            return mcdr::err("taaEnsurePipelines", errorMessage(vr.error()));
-        }
-        vsCode = vsBlob->GetBufferPointer();
-        vsCodeSize = vsBlob->GetBufferSize();
-    }
+    const void* vsCode = vsDxil.data();
+    SIZE_T vsCodeSize = vsDxil.size();
 
-    // PS：DXIL/blob 必须活到 PSO 建完。
-    ComPtr<ID3DBlob> psBlob;
+    // PS：DXIL 缓冲必须活到 PSO 建完（不再有 ID3DBlob 那条路）。
     std::vector<uint8_t> psDxil;
     const void* psCode = nullptr;
     SIZE_T psCodeSize = 0;
-    if (auto r = smaaCompilePs(kTaaPS, "taa_ps", smProfile, psDxil, psBlob, psCode, psCodeSize); !r) {
+    if (auto r = smaaCompilePs(kTaaPS, "taa_ps", smProfile, psDxil, psCode, psCodeSize); !r) {
         return mcdr::err("taaEnsurePipelines", errorMessage(r.error()));
     }
 

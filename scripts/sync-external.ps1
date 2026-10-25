@@ -10,6 +10,8 @@
         external\fidelityfx GPUOpen-LibrariesAndSDKs/FidelityFX-SDK v2.3.0
     另有第五个（P111，Streamline 探针用）：
         external\streamline NVIDIA-RTX/Streamline                  v2.14.16
+    以及第六个（P2xx，神经辐照缓存 NRC，二进制发行包）：
+        external\nrc        NVIDIA-RTX/NRC                         v0.16.0.0
 
     只有 XeSS 的上游布局和本项目一致（inc\ + lib\ + bin\）。其余三个需要少量搬运，
     本脚本把这些搬运固定下来，保证“新克隆 -> 干净构建”可复现：
@@ -56,7 +58,7 @@ function Copy-Tree([string]$from, [string]$to) {
 }
 
 '== 1) 子模块 =='
-foreach ($s in @('dlss','nrd','xess','fidelityfx')) {
+foreach ($s in @('dlss','nrd','xess','fidelityfx','nrc')) {
     $p = Join-Path $ext $s
     if (Test-Path (Join-Path $p '.git')) { Ok "$s 已初始化" }
     else { Bad "$s 未初始化：git -C `"$root`" submodule update --init --depth 1 external/$s" }
@@ -120,6 +122,26 @@ else {
 foreach ($n in @('sl.interposer.dll','sl.common.dll','sl.dlss.dll','sl.dlss_g.dll','sl.reflex.dll','nvngx_deepdvc.dll')) {
     $p = Join-Path $libDir "streamline\$n"
     if (Test-Path $p) { Ok "运行时 DLL: lib\streamline\$n" } else { Bad "缺少运行时 DLL: $p" }
+}
+
+'== 6) NRC 运行期（external\nrc\Bin\x64 -> lib\nrc；NVRTC/CUDA 必须与 MCDR.dll 同目录）=='
+$nrcBin = Join-Path $ext 'nrc\Bin\x64'
+$nrcDst = Join-Path $libDir 'nrc'
+if (Test-Path $nrcBin) {
+    foreach ($n in @('NRC_D3D12.dll','cudart64_13.dll','nvrtc64_130_0.dll','nvrtc-builtins64_134.dll')) {
+        $src = Join-Path $nrcBin $n
+        if (-not (Test-Path $src)) { Bad "缺少 $src"; continue }
+        if ($Check) { Say "would copy $src -> $(Join-Path $nrcDst $n)"; continue }
+        New-Item -ItemType Directory -Path $nrcDst -Force | Out-Null
+        Copy-Item $src (Join-Path $nrcDst $n) -Force
+        Ok "copied lib\nrc\$n"
+    }
+    $nrcLib = Join-Path $ext 'nrc\Lib\x64\NRC_D3D12.lib'
+    if (Test-Path $nrcLib) { Ok "NRC_D3D12.lib 就位（vcxproj 的 include 指向 external\nrc\Include）" }
+    else { Bad "缺少 $nrcLib" }
+} else {
+    Bad "缺少 $nrcBin：git -C `"$root`" submodule update --init --depth 1 external/nrc"
+    Say 'NRC 是二进制发行包（DLL + import lib + CUDA 13 运行库 + 头文件），初始化子模块后本步骤才搬运行期。'
 }
 
 ''

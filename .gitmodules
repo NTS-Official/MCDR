@@ -13,3 +13,6 @@
 [submodule "external/streamline"]
 	path = external/streamline
 	url = https://github.com/NVIDIA-RTX/Streamline.git
+[submodule "external/nrc"]
+	path = external/nrc
+	url = https://github.com/NVIDIA-RTX/NRC.git

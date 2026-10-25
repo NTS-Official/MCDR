@@ -83,10 +83,18 @@ void dbgLogError(const char* fmt, ...);
 void dbgLogWarn(const char* fmt, ...);
 // 信息级别（默认关闭）
 void dbgLogInfo(const char* fmt, ...);
+// 信息级别，但按 **进度标记** 的策略输出：默认恒定输出（不受 setLogLevel 影响），可用
+// setShutdownTraceAlways(false) 改成普通 INFO。只给"关停/初始化这类必须留痕、又不能冒充错误"的
+// 标记用：默认 `[logging] logLevel = ERROR` 会把 dbgLogInfo 全滤掉，而 destroySurface/
+// destroyDevice 一旦卡住，那种输出就是唯一的线索。以前这些标记直接借用 dbgLogError，结果每次
+// 正常退出都刷一串 `[ERROR]`（P184 补记，2026-10-25）。
+void dbgLogProgress(const char* fmt, ...);
 // 调试级别（默认关闭）
 void dbgLogDebug(const char* fmt, ...);
 // 设置日志级别（0=ERR 1=WARN 2=INFO 3=DEBUG）
 void setLogLevel(int level);
+// 进度标记是否恒定输出（配置 `[logging] shutdownTrace`，默认 true）。
+void setShutdownTraceAlways(bool always);
 
 // PIX GPU 捕获层：请求在进程内载入 WinPixGpuCapturer.dll。必须在**首个 D3D12 设备创建
 // 之前**调用（捕获层靠挂钩 D3D12 工作），幂等；返回 1=已载入 0=未请求 -1=请求了但没载入。
@@ -217,10 +225,6 @@ struct DeviceContext {
     // P6：ExecuteIndirect 用 command signature（DrawIndexedInstanced / DrawInstanced）
     ComPtr<ID3D12CommandSignature> cmdSigIndexed;
     ComPtr<ID3D12CommandSignature> cmdSigNonIndexed;
-    // P139：mesh 段派发的 indirect 变体（D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH，
-    // ByteStride 12 = 三个 UINT 的线程组数）。AS 剔除要按 GPU 侧的计数派发，
-    // 而 ExecuteIndirect 必须先有这条 command signature。
-    ComPtr<ID3D12CommandSignature> cmdSigMesh;
 
     UINT srvInc = 0, rtvInc = 0, dsvInc = 0, samplerInc = 0;
     UINT drawInc = 0;  // == srvInc（同属 CBV_SRV_UAV 堆类型）
@@ -250,16 +254,19 @@ struct DeviceContext {
         bool enhancedBarriers = false;
         bool queried = false;  // false = CheckFeatureSupport 未被调用/全部失败
 
-        // P67：DXC（Shader Model 6.x / mesh shader 编译器）可用性。D3DCompile 只到
-        // SM 5.1，mesh shader（ms_6_6/as_6_6）必须由 DXC 编译；设备初始化时会动态
-        // 加载 dxcompiler.dll 并做一次 mesh shader 冒烟编译，作为「mesh shader 基础」
-        // 的自检（真正的 mesh 管线还需要 AS/MS 的 D3D12_PIPELINE_STATE_STREAM_DESC，
-        // 尚未实现）。
+        // P67：DXC（Shader Model 6.x 编译器）可用性。D3DCompile 只到 SM 5.1，而本项目
+        // **不再有 5.1 兜底**（2026-10-25 起）：图形管线硬要求 SM 6.9，mesh shader
+        // （ms_6_6/as_6_6）也必须是 DXC。设备初始化时动态加载 dxcompiler.dll 并做一次
+        // ms_6_9 冒烟编译，同时验证"这台 DXC 认 6_9"与"DXIL 链路通"。
         bool dxcAvailable = false;        // dxcompiler.dll 已加载且能拿到 IDxcCompiler3
-        bool meshShaderCompileOk = false;  // 冒烟编译（目标 ms_6_x）是否成功
+        bool meshShaderCompileOk = false;  // 冒烟编译（目标 ms_6_9）是否成功
         std::string dxcPath;    // 实际加载到的 dxcompiler.dll 完整路径
-        std::string dxcProfile;  // 冒烟编译使用的 target，如 "ms_6_6"
+        std::string dxcProfile;  // 冒烟编译使用的 target，恒为 "ms_6_9"
         std::string dxcNote;    // 失败原因或 DXC 版本信息
+
+        // 这台 DXC 是否真的能产出 SM 6.9 的 DXIL。1.8 及更早对 6_9 报 invalid profile，
+        // 那种机器上图形管线无法建立（没有 5.1 兜底，见 graphicsShaderModelProfile）。
+        bool dxcSupportsSm69() const { return dxcProfile == "ms_6_9"; }
 
         constexpr bool meshShadersSupported() const {
             return meshShaderTier >= D3D12_MESH_SHADER_TIER_1;
@@ -523,6 +530,9 @@ mcdr::Result<void*> createTexture(int usage, int format, int width, int height, 
 mcdr::Result<void*> createBuffer(int usage, long long size);
 mcdr::Result<void*> createSampler(int addressU, int addressV, int minFilter, int magFilter,
                                   int maxAnisotropy, float maxLod);
+// P220：地形专用采样器。`mipLodBias` 只应在超分比例 != 1 时非 0（见 D3D12TerrainSampler）。
+mcdr::Result<void*> createSamplerWithMipBias(int addressU, int addressV, int minFilter, int magFilter,
+                                             int maxAnisotropy, float maxLod, float mipLodBias);
 mcdr::Result<void*> createTextureView(Dx12Object* texture, int baseMipLevel, int mipLevels);
 void destroyObject(Dx12Object* obj);
 
@@ -557,17 +567,12 @@ struct Dx12Pipeline {
     // P72：mesh 管线（AS/MS）标记。mesh PSO 没有 IA 阶段，setPipeline 不再设置
     // IASetPrimitiveTopology（IA 状态对 mesh 管线无效，且 PSO 里本就不含输入布局）。
     bool isMesh = false;
-    // P137：mesh 尾参在根签名里的参数索引（建根签名时按 CBV 稠密编号 + 地形 SRV 表
+    // P217：mesh 尾参在根签名里的参数索引（建根签名时按 CBV 稠密编号 + 地形 SRV 表
     // 的实际排版算出来，再经 createMeshPipeline 抄进来）。PushDescriptors 只设到地形
-    // SRV 表（索引 = CBV 个数），b8 段表与 t14/t15/t16 表由 drawMeshSegments 补。
+    // SRV 表（索引 = CBV 个数），b8 小常量与 t14/t15/t16 表由 drawMeshlets 补。
     // 0 表示该 PSO 没有 mesh 尾参。
     UINT segmentParam = 0;
     UINT geometryParam = 0;
-    // P140：meshlet 剔除。cullParam != 0 表示根签名里有 b9 root 常量（视锥 + 本批基址/组数）；
-    // hasAs 表示 PSO 真的带 amplification shader —— 此时派发的线程组数是 ceil(组数/128)，
-    // 由 AS 再压缩成实际的 mesh 组数。
-    UINT cullParam = 0;
-    bool hasAs = false;
 };
 
 
@@ -875,7 +880,8 @@ DXGI_FORMAT toDxgiFormat(int gpuFormat);
 DXGI_FORMAT toDxgiVertexFormat(int gpuFormat);
 
 // ---------------------------------------------------------------------------
-// 图形管线（P4）：D3DCompile(vs_5_1/ps_5_1) + root signature + 双 PSO
+// 图形管线（P4）：DXC(vs_6_9/ps_6_9，DXIL) + root signature + 双 PSO
+// （2026-10-25 起硬要求 SM 6.9；原来的 D3DCompile(vs_5_1/ps_5_1) 兜底已删除，见 P216）
 // ---------------------------------------------------------------------------
 // Java 侧 dx12CreateGraphicsPipeline 的 desc 解析产物（字段语义见 Dx12Native Javadoc）。
 struct PipelineDesc {
@@ -896,8 +902,8 @@ struct PipelineDesc {
         uint8_t reg = 0;
     };
 
-    std::vector<uint8_t> vsBytes;  // HLSL 源码（vs_5_1 编译）
-    std::vector<uint8_t> psBytes;  // HLSL 源码（ps_5_1 编译）
+    std::vector<uint8_t> vsBytes;  // HLSL 源码（DXC 编成 vs_6_9/DXIL；2026-10-25 起无 5.1 兜底）
+    std::vector<uint8_t> psBytes;  // HLSL 源码（DXC 编成 ps_6_9/DXIL；同上）
     int colorCount = 0;
     std::vector<ColorTarget> colorTargets;
     bool hasDepth = false;
@@ -1044,44 +1050,13 @@ mcdr::Result<void> drawIndexedIndirect(CommandContext* ctx, Dx12Object* commands
                                        UINT drawCount);
 mcdr::Result<void> drawIndirect(CommandContext* ctx, Dx12Object* commands, long long offset, UINT drawCount);
 
-// P137：mesh 段派发。sections = 96 B/段（t16）、segments = 32 B/组（b8，≤1024 组/批）、
-// vertexBuffer/indexBuffer 走 t14/t15 的 RAW SRV（R32_TYPELESS + BUFFER_SRV_FLAG_RAW，
-// 供 ByteAddressBuffer 读取）。普通绑定仍由 pushDescriptors 负责，本函数只补 tail 参数。
-mcdr::Result<void> drawMeshSegments(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
-                                    Dx12Object* indexBuffer, long long indexOffset, Dx12Object* sections,
-                                    long long sectionsOffset, long long sectionsLength, Dx12Object* segments,
-                                    long long segmentsOffset, int groupCount);
-
-// P140：带 meshlet 剔除的段派发。meshletBounds = 16 B/组的包围球表（t17，与段表同序，
-// 索引是"全局组号"）；frustumPlanes = 6 个 float4 视空间平面（内侧 dot(n,c)+d >= 0），
-// 只用前 cullPlanes 个。已绑定的 PSO 必须 hasAs（AS 才会按压缩后的数量派发 mesh 组）。
-// 段表之外的四个缓冲都可以为 null（null = 该 PSO 没有对应尾参）。
-mcdr::Result<void> drawMeshSegmentsCulled(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
-                                          Dx12Object* indexBuffer, long long indexOffset, Dx12Object* sections,
-                                          long long sectionsOffset, long long sectionsLength, Dx12Object* segments,
-                                          long long segmentsOffset, Dx12Object* meshletBounds,
-                                          long long meshletBoundsOffset, const float* frustumPlanes, int cullPlanes,
-                                          int groupCount);
-
-// P139：同一个段派发的 indirect 版本。args 里每条 12 字节（DISPATCH_MESH 的
-// ThreadGroupCountX/Y/Z），maxCommandCount 条命令都读同一个 b8 段表基址 ⇒ 调用方
-// 每次只覆盖一批（≤1024 组），大于一批时按批多次调用。语义与 drawMeshSegments 一致，
-// 只是线程组数改由 GPU 侧缓冲给出（AS 剔除后要按 GPU 计数派发就走这条）。
-mcdr::Result<void> drawMeshSegmentsIndirect(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
-                                            Dx12Object* indexBuffer, long long indexOffset, Dx12Object* sections,
-                                            long long sectionsOffset, long long sectionsLength, Dx12Object* segments,
-                                            long long segmentsOffset, Dx12Object* args, long long argsOffset,
-                                            int maxCommandCount);
-
-// P141：用 compute 管线为每个 meshlet 组生成对象空间包围球（16 B：center.xyz + radius），
-// 写进 bounds（必须是用 usage 位 512 建的 UAV 缓冲）。pipeline 是 createMeshBoundsPipeline
-// 交出的句柄（= Dx12Pipeline*，withDepth 承载 CS PSO）。groupCount 与段表的组数一致：
-// 第 i 组读 meshSegments[i]，结果写 bounds[boundsOffset + i*16]。
-// 结束后 bounds 处于 NON_PIXEL_SHADER_RESOURCE，可直接作为 AS 的 t17 读取。
-mcdr::Result<void> buildMeshletBounds(CommandContext* ctx, Dx12Pipeline* pipeline, Dx12Object* vertexBuffer,
-                                      long long vertexOffset, Dx12Object* indexBuffer, long long indexOffset,
-                                      Dx12Object* segments, long long segmentsOffset, Dx12Object* bounds,
-                                      long long boundsOffset, int groupCount);
+// P217：meshlet 版地形派发。绑定布局 = createMeshRootSignature(meshExtras=1)：
+// b8 小常量（meshletCount）、t14 顶点池（28 B/顶点）、t15 段表（32 B/段）、t16 meshlet 表（32 B/条），
+// 三个缓冲都是 RAW SRV。一次 DispatchMesh(meshletCount) 覆盖整批，索引由 MS 算术生成。
+mcdr::Result<void> drawMeshlets(CommandContext* ctx, Dx12Object* vertexBuffer, long long vertexOffset,
+                                Dx12Object* sections, long long sectionsOffset, long long sectionsLength,
+                                Dx12Object* meshlets, long long meshletsOffset, long long meshletsLength,
+                                Dx12Object* globals, long long globalsOffset, int meshletCount);
 
 // ---------------------------------------------------------------------------
 // Surface（P5）：DXGI swapchain（镜像官方 VulkanGpuSurface）。

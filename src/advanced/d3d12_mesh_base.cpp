@@ -176,16 +176,14 @@ bool meshPipelineSupported(std::string* why) {
 struct MeshRootSigInfo {
     UINT segmentParam = 0;
     UINT geometryParam = 0;
-    // P140：meshlet 剔除用的 root 32 位常量（b9）参数索引；0 表示这份签名没有该参数。
-    UINT cullParam = 0;
 };
 
 std::mutex gMeshRootSigMutex;
 std::unordered_map<uint64_t, MeshRootSigInfo> gMeshRootSigs;
 
-void recordMeshRootSig(uint64_t handle, UINT segmentParam, UINT geometryParam, UINT cullParam) {
+void recordMeshRootSig(uint64_t handle, UINT segmentParam, UINT geometryParam) {
     std::lock_guard<std::mutex> lock(gMeshRootSigMutex);
-    gMeshRootSigs[handle] = MeshRootSigInfo{segmentParam, geometryParam, cullParam};
+    gMeshRootSigs[handle] = MeshRootSigInfo{segmentParam, geometryParam};
 }
 
 MeshRootSigInfo lookupMeshRootSig(uint64_t handle) {
@@ -278,7 +276,6 @@ mcdr::Result<void*> createMeshPipelineImpl(const MeshPipelineDesc& desc, uint64_
     // P137：外部签名（地形签名 + mesh 尾参）的尾参参数索引从注册表取。
     UINT meshSegmentParam = 0;
     UINT meshGeometryParam = 0;
-    UINT meshCullParam = 0;
     if (externalRootSignature != 0) {
         // P129：复用 JVM 侧交给我们的根签名（地形签名 + 段表 b8 / 顶点 t14 / 索引 t15 三个尾参）。
         // 这里 AddRef，让它与内部创建的路径拥有同样的生命周期语义（ComPtr 析构时 Release）。
@@ -289,10 +286,9 @@ mcdr::Result<void*> createMeshPipelineImpl(const MeshPipelineDesc& desc, uint64_
         const MeshRootSigInfo info = lookupMeshRootSig(externalRootSignature);
         meshSegmentParam = info.segmentParam;
         meshGeometryParam = info.geometryParam;
-        meshCullParam = info.cullParam;
-        dbgLogInfo("createMeshPipeline: rs=0x%llx segParam=%u geoParam=%u cullParam=%u as=%d\n",
+        dbgLogInfo("createMeshPipeline: rs=0x%llx segParam=%u geoParam=%u as=%d\n",
                    static_cast<unsigned long long>(externalRootSignature), info.segmentParam,
-                   info.geometryParam, info.cullParam, desc.asDxil.empty() ? 0 : 1);
+                   info.geometryParam, desc.asDxil.empty() ? 0 : 1);
     } else {
     ComPtr<ID3DBlob> rsBlob, rsErr;
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{};
@@ -440,9 +436,6 @@ mcdr::Result<void*> createMeshPipelineImpl(const MeshPipelineDesc& desc, uint64_
     pipeline->isMesh = true;  // setPipeline 据此跳过 IASetPrimitiveTopology
     pipeline->segmentParam = meshSegmentParam;
     pipeline->geometryParam = meshGeometryParam;
-    // P140：AS 存在 + 签名里有 b9 常量，才走 meshlet 剔除派发（组数按 AS 线程组折算）。
-    pipeline->cullParam = meshCullParam;
-    pipeline->hasAs = meshCullParam != 0 && !desc.asDxil.empty();
 
     auto buildPso = [&](bool withAs, bool withPs, ComPtr<ID3D12PipelineState>& out) -> mcdr::Result<void> {
         std::vector<unsigned char> stream;
@@ -549,7 +542,7 @@ namespace d3d12_mc {
 // 推的绑定（按地形布局算的槽位）对不上 mesh PSO。
 // ---------------------------------------------------------------------------
 mcdr::Result<uint64_t> createMeshRootSignature(const std::vector<PipelineDesc::Binding>& bindings,
-                                               bool meshExtras, bool meshletCull) {
+                                               bool meshExtras) {
     if (const auto r = ensureDevice(); !r)
         return mcdr::err("createMeshRootSignature", r.error().message);
 
@@ -588,25 +581,13 @@ mcdr::Result<uint64_t> createMeshRootSignature(const std::vector<PipelineDesc::B
     vbRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     D3D12_DESCRIPTOR_RANGE ibRange = vbRange;
     ibRange.BaseShaderRegister = 15;
-    // P135：逐区块数据（原 cbuffer ChunkSection）走 t16，一条 DispatchMesh 覆盖整批。
+    // P217：段表走 t15、meshlet 表走 t16，一条 DispatchMesh 覆盖整批。
     D3D12_DESCRIPTOR_RANGE sectionRange = vbRange;
     sectionRange.BaseShaderRegister = 16;
-    // P140：meshlet 包围球表走 t17（只在 meshlet 剔除签名里存在，保持旧的 3 range 布局不变）。
-    D3D12_DESCRIPTOR_RANGE boundsRange = vbRange;
-    boundsRange.BaseShaderRegister = 17;
-    const D3D12_DESCRIPTOR_RANGE geometryRanges[4] = {vbRange, ibRange, sectionRange, boundsRange};
-
-    // P140：meshlet 剔除的 root 32 位常量（b9）：6 个 float4 视锥平面 + base/count + 2 个 pad
-    // = 28 个 dword。base/count 每批由 drawMeshSegments 用 SetGraphicsRoot32BitConstants 重设。
-    D3D12_ROOT_PARAMETER cullConstants{};
-    cullConstants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    cullConstants.Constants.ShaderRegister = 9;
-    cullConstants.Constants.RegisterSpace = 0;
-    cullConstants.Constants.Num32BitValues = 28;
-    cullConstants.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    const D3D12_DESCRIPTOR_RANGE geometryRanges[3] = {vbRange, ibRange, sectionRange};
 
     std::vector<D3D12_ROOT_PARAMETER> params;
-    params.reserve(cbvRegs.size() + 4);
+    params.reserve(cbvRegs.size() + 3);
     for (uint8_t reg : cbvRegs) {
         D3D12_ROOT_PARAMETER p{};
         p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -627,20 +608,17 @@ mcdr::Result<uint64_t> createMeshRootSignature(const std::vector<PipelineDesc::B
         params.push_back(segmentCbv);
         D3D12_ROOT_PARAMETER p{};
         p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        p.DescriptorTable.NumDescriptorRanges = meshletCull ? 4u : 3u;
+        p.DescriptorTable.NumDescriptorRanges = 3u;
         p.DescriptorTable.pDescriptorRanges = geometryRanges;
         p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params.push_back(p);
-        if (meshletCull) params.push_back(cullConstants);
     }
 
-    // P137：尾参的参数索引 —— CBV 按 binding 顺序稠密排，之后是（可能存在的）地形
-    // SRV 表，再之后才是段表 b8 与 t14/t15/t16(+/t17) 表、以及 meshlet 剔除的 b9 常量。
-    // 这个顺序由上面 params 的推入顺序决定；drawMeshSegments 靠它去
-    // SetGraphicsRootConstantBufferView / DescriptorTable / SetGraphicsRoot32BitConstants。
+    // P217：尾参的参数索引 —— CBV 按 binding 顺序稠密排，之后是（可能存在的）地形
+    // SRV 表，再之后才是 b8 小常量与 t14/t15/t16 表。这个顺序由上面 params 的推入
+    // 顺序决定；drawMeshlets 靠它去 SetGraphicsRootConstantBufferView / DescriptorTable。
     const UINT segmentParam = static_cast<UINT>(cbvRegs.size()) + (srvRanges.empty() ? 0u : 1u);
     const UINT geometryParam = segmentParam + 1u;
-    const UINT cullParam = meshletCull ? geometryParam + 1u : 0u;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
     rsDesc.NumParameters = static_cast<UINT>(params.size());
@@ -674,8 +652,8 @@ mcdr::Result<uint64_t> createMeshRootSignature(const std::vector<PipelineDesc::B
     }
     ID3D12RootSignature* raw = rootSig.Detach();
     const uint64_t handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(raw));
-    // 只有带尾参的签名才需要画像（图形管线的签名不进 drawMeshSegments）。
-    if (meshExtras) recordMeshRootSig(handle, segmentParam, geometryParam, cullParam);
+    // 只有带尾参的签名才需要画像（图形管线的签名不进 drawMeshlets）。
+    if (meshExtras) recordMeshRootSig(handle, segmentParam, geometryParam);
     return handle;
 }
 
@@ -692,124 +670,6 @@ mcdr::Result<void*> createMeshPipeline(const MeshPipelineDesc& desc) {
 
 mcdr::Result<void*> createMeshPipeline(const MeshPipelineDesc& desc, uint64_t externalRootSignature) {
     return createMeshPipelineImpl(desc, externalRootSignature);
-}
-
-// ---------------------------------------------------------------------------
-// P141：meshlet 包围球 GPU 生成（compute）
-// 根签名：0 = root CBV b8（段表，与图形侧同一份 32 B/组数据）
-//         1 = 描述符表 { SRV t14 顶点, SRV t15 索引, UAV u0 包围球 }
-// CS 每线程处理一个 meshlet 组，输出对象空间 AABB 包围球 16 B（center.xyz + radius）。
-// ---------------------------------------------------------------------------
-mcdr::Result<uint64_t> createMeshBoundsRootSignature() {
-    if (const auto r = ensureDevice(); !r) {
-        return mcdr::err("createMeshBoundsRootSignature", r.error().message);
-    }
-
-    D3D12_ROOT_PARAMETER params[2]{};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    params[0].Descriptor.ShaderRegister = 8;
-    params[0].Descriptor.RegisterSpace = 0;
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-    D3D12_DESCRIPTOR_RANGE ranges[3]{};
-    for (D3D12_DESCRIPTOR_RANGE& range : ranges) {
-        range.NumDescriptors = 1;
-        range.RegisterSpace = 0;
-        range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-    }
-    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].BaseShaderRegister = 14;
-    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[1].BaseShaderRegister = 15;
-    ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[2].BaseShaderRegister = 0;
-
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable.NumDescriptorRanges = 3;
-    params[1].DescriptorTable.pDescriptorRanges = ranges;
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-    D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{};
-    versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-    versioned.Desc_1_0.NumParameters = 2;
-    versioned.Desc_1_0.pParameters = params;
-    versioned.Desc_1_0.NumStaticSamplers = 0;
-    versioned.Desc_1_0.pStaticSamplers = nullptr;
-    // 计算管线没有任何 IA/流输出要求，NONE 即可。
-    versioned.Desc_1_0.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-
-    ComPtr<ID3DBlob> blob, err;
-    HRESULT hr = D3D12SerializeVersionedRootSignature(&versioned, &blob, &err);
-    if (FAILED(hr)) {
-        std::string msg = "D3D12SerializeVersionedRootSignature hr=" + hrHex(hr);
-        if (err && err->GetBufferSize() > 0) {
-            msg += " ";
-            msg.append(static_cast<const char*>(err->GetBufferPointer()), err->GetBufferSize());
-        }
-        return mcdr::err("createMeshBoundsRootSignature", std::move(msg));
-    }
-    ComPtr<ID3D12RootSignature> sig;
-    hr = deviceContext().device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
-                                                     IID_PPV_ARGS(&sig));
-    if (FAILED(hr)) {
-        return mcdr::err("createMeshBoundsRootSignature", "CreateRootSignature hr=" + hrHex(hr));
-    }
-    const uint64_t handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(sig.Detach()));
-    dbgLogInfo("createMeshBoundsRootSignature: handle=0x%llx", static_cast<unsigned long long>(handle));
-    return handle;
-}
-
-mcdr::Result<void*> createMeshBoundsPipeline(const void* csDxil, int32_t csLen, uint64_t rootSignature) {
-    if (const auto r = ensureDevice(); !r) {
-        return mcdr::err("createMeshBoundsPipeline", r.error().message);
-    }
-    if (csDxil == nullptr || csLen <= 0) {
-        return mcdr::err("createMeshBoundsPipeline", "compute shader bytecode is empty");
-    }
-    if (rootSignature == 0) {
-        return mcdr::err("createMeshBoundsPipeline", "root signature handle is 0");
-    }
-
-    auto* sig = reinterpret_cast<ID3D12RootSignature*>(static_cast<uintptr_t>(rootSignature));
-    D3D12_SHADER_BYTECODE cs{};
-    cs.pShaderBytecode = csDxil;
-    cs.BytecodeLength = static_cast<SIZE_T>(csLen);
-
-    using StreamRootSig = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*>;
-    using StreamCs = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, D3D12_SHADER_BYTECODE>;
-    StreamRootSig sRoot;
-    sRoot.payload = sig;
-    StreamCs sCs;
-    sCs.payload = cs;
-    std::vector<unsigned char> stream;
-    stream.reserve(256);
-    appendSubobjects(stream, sRoot, sCs);
-
-    D3D12_PIPELINE_STATE_STREAM_DESC sd{};
-    sd.SizeInBytes = static_cast<SIZE_T>(stream.size());
-    sd.pPipelineStateSubobjectStream = stream.data();
-
-    auto pipeline = std::make_unique<Dx12Pipeline>();
-    // 计算管线没有图形状态：绑定由 buildMeshletBounds 直接 SetPipelineState 完成，
-    // 不走 setPipeline（那里会做 PSO 缓存与拓扑判断）。
-    pipeline->rootSignature = sig;
-    pipeline->isMesh = false;
-
-    ComPtr<ID3D12PipelineState> csPso;
-    ComPtr<ID3D12Device2> device2;
-    HRESULT hr = deviceContext().device.As(&device2);
-    if (FAILED(hr) || !device2) {
-        return mcdr::err("createMeshBoundsPipeline", "ID3D12Device2 unavailable hr=" + hrHex(hr));
-    }
-    hr = device2->CreatePipelineState(&sd, IID_PPV_ARGS(&csPso));
-    if (FAILED(hr)) {
-        return mcdr::err("createMeshBoundsPipeline", "CreatePipelineState(cs) hr=" + hrHex(hr));
-    }
-    pipeline->withDepth = csPso;
-    dbgLogInfo("createMeshBoundsPipeline: stream=%zuB cs=%zuB pso=%p",
-               static_cast<size_t>(sd.SizeInBytes), static_cast<size_t>(csLen),
-               static_cast<void*>(csPso.Get()));
-    return static_cast<void*>(pipeline.release());
 }
 
 }  // namespace d3d12_mc

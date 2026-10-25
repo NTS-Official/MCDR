@@ -196,6 +196,13 @@ void MCDR_CALL mcdrSetLogLevel(int32_t level) {
     d3d12_mc::setLogLevel(level);
 }
 
+void MCDR_CALL mcdrSetShutdownTraceAlways(int32_t always) {
+    // P184 补记：配置项 `[logging] shutdownTrace`。1（默认）= destroySurface/destroyDevice 的
+    // 进度标记无视 logLevel 恒定输出（退出卡死时唯一的线索）；0 = 它们退回普通 INFO。
+    // 日志语义（INFO）不变，只是"是否被 logLevel 过滤"由 Java 侧决定。
+    d3d12_mc::setShutdownTraceAlways(always != 0);
+}
+
 void MCDR_CALL mcdr_dx12SetEnvironment(const char* name, const char* value) {
     // A small, deliberate escape hatch: the Java side owns every user-visible setting, while the
     // native layer keeps its plain getenv() reads. _putenv_s updates the CRT environment block,

@@ -271,6 +271,11 @@ MCDR_API void MCDR_CALL mcdrSetLogVerbose(int32_t enabled);
 // Native log level: 0=error, 1=warning, 2=info, 3=debug.
 MCDR_API void MCDR_CALL mcdrSetLogLevel(int32_t level);
 
+// P184: progress markers on the shutdown path (destroySurface/destroyDevice) are INFO lines.
+// 1 (default) keeps them visible at any log level; 0 makes them plain INFO (filtered by the level).
+// Config: `[logging] shutdownTrace`.
+MCDR_API void MCDR_CALL mcdrSetShutdownTraceAlways(int32_t always);
+
 /// Set (or, with a null/empty value, clear) one process-wide environment variable from the
 /// Java-side configuration, so the handful of native switches that are still read with
 /// getenv()/_wgetenv() (DX12_DEBUG_LAYER, MCDR_DLSS_IMPL, DX12_NATIVE_LOG_FILE, ...) can be
@@ -679,6 +684,13 @@ MCDR_API mcdr_object* MCDR_CALL mcdr_dx12CreateSampler(int32_t addressU, int32_t
                                                        int32_t magFilter, int32_t maxAnisotropy,
                                                        float maxLod);
 
+// P220：带显式 mip LOD bias 的采样器。只给**地形图集**（vanilla LevelRenderer 的
+// chunkLayerSampler）用；bias 由超分比例决定（log2(render/display) - 0.5），不超分时调用方
+// 必须传 0，保持与 mcdr_dx12CreateSampler 完全一致。合法区间 [-16, 15.99]，越界由 native 夹取。
+MCDR_API mcdr_object* MCDR_CALL mcdr_dx12CreateSamplerWithMipBias(
+    int32_t addressU, int32_t addressV, int32_t minFilter, int32_t magFilter, int32_t maxAnisotropy,
+    float maxLod, float mipLodBias);
+
 MCDR_API mcdr_object* MCDR_CALL mcdr_dx12CreateTextureView(mcdr_object* texture, int32_t baseMipLevel,
                                                            int32_t mipLevels);
 
@@ -887,20 +899,19 @@ MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateMeshPipeline(const mcdr_mesh_pi
 // 与 mcdr_dx12CreateMeshPipeline 相同，但复用调用方提供的根签名
 // （ID3D12RootSignature* 的地址值，0 = 退回内部按 bindings 新建）。
 //
-// 用途（P129）：地形 mesh 变体要复用现有地形的绑定点布局（b0..b3 / t4 / t5），
-// 而段表、顶点缓冲、索引缓冲是 MS 新需要的尾参。JVM 侧按“地形签名 + 3 个尾参”
+// 用途（P129/P217）：地形 mesh 变体要复用现有地形的绑定点布局（b0..b3 / t4 / t5），
+// 再由 JVM 侧补 b8 小常量与 t14/t15/t16 的 mesh 尾参。JVM 侧按“地形签名 + 尾参”
 // 建好扩展签名后交进来，mesh PSO 与地形 PSO 才能共用同一套 draw 绑定。
 MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateMeshPipelineWithRootSignature(
     const mcdr_mesh_pipeline_desc* desc, uint64_t rootSignature);
 
 // 按绑定点布局建根签名（返回 ID3D12RootSignature* 的地址值，失败返回 0）。
-// meshExtras != 0 时追加 mesh 专用尾参：root CBV b8（段表）+ 第二个描述符表（t14 顶点/t15 索引）。
-// meshletCull != 0 时（必须同时 meshExtras）再追加：描述符表多一个 t17（meshlet 包围球）+
-// root 32 位常量 b9（28 个 dword：6 个 float4 视锥平面 + base/count + 2 个 pad）。
+// meshExtras != 0 时追加 mesh 专用尾参：root CBV b8（小常量/段表基址）+ 第二个描述符表
+// （t14 顶点 / t15 段表 / t16 meshlet 表，固定 3 个 range）。
 // 非 meshExtras 时带 ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT（图形管线用）；meshExtras 时不能带。
 // 调用方必须用 mcdr_dx12ReleaseRootSignature 释放。
 MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateMeshRootSignature(
-    const mcdr_pipeline_binding_desc* bindings, int32_t count, int32_t meshExtras, int32_t meshletCull);
+    const mcdr_pipeline_binding_desc* bindings, int32_t count, int32_t meshExtras);
 MCDR_API void MCDR_CALL mcdr_dx12ReleaseRootSignature(uint64_t rootSignature);
 
 // DispatchMesh with thread-group counts. Requires a mesh pipeline bound through
@@ -908,92 +919,18 @@ MCDR_API void MCDR_CALL mcdr_dx12ReleaseRootSignature(uint64_t rootSignature);
 // mcdr_dx12PushDescriptors. Returns 1 on success.
 MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchMesh(mcdr_command_ctx* ctx, int32_t x, int32_t y, int32_t z);
 
-// P137：mesh 段派发 —— 一次调用把整批地形段交给 mesh 管线的多个 thread group，
-// 替代逐段 DrawIndexed（solid_terrain 一帧 ~350 段）。
+// P217：meshlet 版地形派发（索引由 MS 算术生成）。
 //
-// 数据约定（与 mesh_plan.md 的 HLSL 契约一致）：
-//   * sections：96 字节/段的紧排区块数据（mat4 modelView 0..63、float visibility 64、
-//     ivec2 atlas 68..75、ivec3 区块原点 80..91）—— t16 的 ByteAddressBuffer，
-//     第 i 段的基址 = i*96。
-//   * segments：32 字节/组，{ uint firstIndex; uint indexCount; int baseVertex;
-//     uint sectionIndex; uint indexStride; uint pad0, pad1, pad2; }。firstIndex 相对
-//     indexBuffer 的 SRV 起点（单位＝索引），indexCount 是本组要处理的索引数（≤126），
-//     baseVertex 相对 vertexBuffer 的 SRV 起点，sectionIndex 指向 sections 里的段号，
-//     indexStride = 2（16 位索引）或 4（32 位索引）。
-//   * 每组最多 126 个索引（mesh shader 线程组上限 128，且一段 1536 索引必须切片），
-//     所以 groupCount 通常是 sum(ceil(indexCount/126))。
-//
-// 前置条件：已 mcdr_dx12SetPipeline 绑定派发用的 mesh PSO，并用
-// mcdr_dx12PushDescriptors 推过该 PSO 的普通绑定（地形 CBV + 纹理表）。
-// 本函数只补 mesh 尾参：root CBV b8（段表）+ 描述符表 t14 顶点 / t15 索引 / t16 区块。
-// groupCount > 1024 时按每批 1024 组分多次 DispatchMesh（b8 每次重设偏移）。
-// 返回 1 成功；0 失败（原因见 mcdrLastError()）。
-MCDR_API int32_t MCDR_CALL mcdr_dx12MeshDrawSegments(
-    mcdr_command_ctx* ctx, mcdr_object* vertexBuffer, int64_t vertexOffset, mcdr_object* indexBuffer,
-    int64_t indexOffset, mcdr_object* sections, int64_t sectionsOffset, int64_t sectionsLength,
-    mcdr_object* segments, int64_t segmentsOffset, int32_t groupCount);
-
-// P139：mcdr_dx12MeshDrawSegments 的 indirect 版本 —— 段表与 sections 的约定完全相同，
-// 只是线程组数由 args 缓冲给出（每命令 12 字节：uint ThreadGroupCountX/Y/Z，即
-// D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH 的签名），用 ExecuteIndirect 一次提交
-// maxCommandCount 条次派发。
-//
-// 段表基址仍由 segmentsOffset 决定，所以一次调用覆盖的是"从该基址起的一段连续组"；
-// 超过 1024 组就按批多次调用。args 缓冲必须是 GENERIC_READ（UPLOAD）堆上的资源。
-// 设备不支持 DISPATCH_MESH 签名时返回 0（原因见 mcdrLastError()），调用方回退到 direct。
-MCDR_API int32_t MCDR_CALL mcdr_dx12MeshDrawSegmentsIndirect(
-    mcdr_command_ctx* ctx, mcdr_object* vertexBuffer, int64_t vertexOffset, mcdr_object* indexBuffer,
-    int64_t indexOffset, mcdr_object* sections, int64_t sectionsOffset, int64_t sectionsLength,
-    mcdr_object* segments, int64_t segmentsOffset, mcdr_object* args, int64_t argsOffset,
-    int32_t maxCommandCount);
-
-// P140：带 meshlet 剔除的段派发（配合 meshletCull 根签名 + 带 AS 的 PSO）。
-//
-// 与 mcdr_dx12MeshDrawSegments 的差别只有三处：
-//   * meshletBounds：16 字节/组的包围球表 { float x, y, z, radius }，与段表**同序**、
-//     按"全局组号"索引（t17）；基址由 meshletBoundsOffset 给出（本项目恒为 0）。
-//   * frustumPlanes：6 个 float4 的**视空间**平面（内侧 = dot(n, c) + d >= 0），只用前
-//     cullPlanes 个（本项目第一版只用 4 个侧面）。
-//   * 线程组数按 AS 折算：ceil(组数/128)，AS 逐 meshlet 做球体-视锥测试，把存活的组号
-//     压缩进 payload 再 DispatchMesh(count)，被剔除的组不会启动 mesh shader。
-//
-// 返回 1 成功；0 失败（原因见 mcdrLastError()）。
-MCDR_API int32_t MCDR_CALL mcdr_dx12MeshDrawSegmentsCulled(
-    mcdr_command_ctx* ctx, mcdr_object* vertexBuffer, int64_t vertexOffset, mcdr_object* indexBuffer,
-    int64_t indexOffset, mcdr_object* sections, int64_t sectionsOffset, int64_t sectionsLength,
-    mcdr_object* segments, int64_t segmentsOffset, mcdr_object* meshletBounds, int64_t meshletBoundsOffset,
-    const float* frustumPlanes, int32_t cullPlanes, int32_t groupCount);
-
-// ---------------------------------------------------------------------------
-// P141：meshlet 包围球 —— GPU（compute）生成
-// ---------------------------------------------------------------------------
-// 为什么要它：AS 里的球体-视锥测试需要每个 meshlet 的包围球。CPU 侧拿不到区块顶点字节
-// （区块几何走 UberGpuBuffer 的 staging→heap 拷贝，不经 map），而"在 AS 里逐 meshlet 读
-// 顶点算 AABB"实测会成片多剔（同机位 mean|Δ|=33.99，段级包围球则是 0.20）。因此改为：
-// 先用下面这支 compute pass 从 t14/t15 生成包围球写进 UAV 缓冲，AS 再按 CPU 表（mode 0）读。
-//
-// 根签名（mcdr_dx12CreateMeshBoundsRootSignature）：
-//   param 0 = root CBV b8  —— 段表（与图形侧同一份 32 B/组数据）
-//   param 1 = descriptor table { SRV t14 顶点, SRV t15 索引, UAV u0 包围球 }
-// 包 围 球 = 16 B { float3 center（对象空间 AABB 中心）; float radius }，按组号顺序。
-// 缓冲必须是 usage 位 512（ALLOW_UNORDERED_ACCESS）建的，且长度 >= 组数 * 16。
-MCDR_API uint64_t MCDR_CALL mcdr_dx12CreateMeshBoundsRootSignature(void);
-
-// cs  = DXIL 字节（cs_6_0，入口 bounds_main）；rootSignature 来自上一支。
-// 返回 compute 管线句柄（销毁仍用 mcdr_dx12DestroyPipeline）；失败返回 NULL。
-MCDR_API void* MCDR_CALL mcdr_dx12CreateMeshBoundsPipeline(const void* csDxil, int32_t csLen,
-                                                           uint64_t rootSignature);
-
-// 对前 groupCount 个组生成包围球：第 i 组读段表 meshSegments[i]，结果写
-// bounds[boundsOffset + i*16]。结束后 bounds 处于 NON_PIXEL_SHADER_RESOURCE，
-// 可直接作为 mcdr_dx12MeshDrawSegmentsCulled 的 t17（mode 0）传入。
-// 返回 1 成功；0 失败（原因见 mcdrLastError()）。
-MCDR_API int32_t MCDR_CALL mcdr_dx12MeshBuildBounds(mcdr_command_ctx* ctx, mcdr_pipeline* pipeline,
-                                                    mcdr_object* vertexBuffer, int64_t vertexOffset,
-                                                    mcdr_object* indexBuffer, int64_t indexOffset,
-                                                    mcdr_object* segments, int64_t segmentsOffset,
-                                                    mcdr_object* bounds, int64_t boundsOffset,
-                                                    int32_t groupCount);
+// 绑定布局与 mcdr_dx12CreateMeshRootSignature(meshExtras=1) 一致：
+//   * root CBV b8  = 小常量（uint meshletCount + 3 个 pad，256 B 对齐）
+//   * 描述符表     = t14 顶点池（28 B/顶点）、t15 段表（32 B/段）、t16 meshlet 表（32 B/条）
+// 三个缓冲都是 RAW SRV（ByteAddressBuffer 着色器侧用 Load 读取），因此结构体步长由 HLSL
+// 自己按 32 B 解析，不需要 SRV 的 StructureByteStride。
+// 一次 DispatchMesh(meshletCount, 1, 1) 覆盖整批；段号写在 meshlet 记录里。
+MCDR_API int32_t MCDR_CALL mcdr_dx12MeshDrawMeshlets(
+    mcdr_command_ctx* ctx, mcdr_object* vertexBuffer, int64_t vertexOffset, mcdr_object* sections,
+    int64_t sectionsOffset, int64_t sectionsLength, mcdr_object* meshlets, int64_t meshletsOffset,
+    int64_t meshletsLength, mcdr_object* globals, int64_t globalsOffset, int32_t meshletCount);
 
 // ---------------------------------------------------------------------------
 // Surface  (was jni_bridge_p5.cpp — 13 exports)

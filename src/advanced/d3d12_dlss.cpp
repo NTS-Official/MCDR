@@ -2025,8 +2025,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             gReflex.optionsApplied = true;
             gReflex.appliedMode = effective;
             gReflex.appliedFrameLimitUs = gReflex.frameLimitUs;
-            logWarn("P213d reflex: effective mode=%d (user=%d fg=%d frameLimitUs=%u) result=0x%X",
-                    effective, gReflex.mode, fgMode, gReflex.frameLimitUs, static_cast<unsigned>(r));
+
         }
         void emitMarker(sl::PCLMarker marker) {
             if (gReflex.marker == nullptr || gLastFrameToken == nullptr) return;
@@ -2267,9 +2266,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
         if (gff(sl::kFeatureDLSS_G, "slDLSSGGetState", raw) == sl::Result::eOk && raw != nullptr) {
             a.getFgState = reinterpret_cast<PFn_SlDLSSGGetState>(raw);
         }
-        logWarn("[P213] DLSS-G api refresh: setOptions=%s getState=%s",
-                a.setFgOptions != nullptr ? "ok" : "null",
-                a.getFgState != nullptr ? "ok" : "null");
+
     }
 
     int32_t streamlineEvaluate(void* commandList, const mcdr_dlss_input& in, DlssTransitionFn tl,
@@ -2279,10 +2276,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
         StreamlineEvalApi& api = streamlineEvalApi();
         if (gDlssgMode.load() != 0) {
             refreshFgApi(api);
-            static uint32_t fgMissingLog = 0;
-            if (api.setFgOptions == nullptr && (++fgMissingLog % 300u) == 1u) {
-                logWarn("[P213] DLSS-G requested but slDLSSGSetOptions is null (plugin not loaded?)");
-            }
+
         }
         auto* color = reinterpret_cast<ID3D12Resource*>(in.pInColor);
         auto* depth = reinterpret_cast<ID3D12Resource*>(in.pInDepth);
@@ -2607,11 +2601,14 @@ sl::FrameToken* gLastFrameToken = nullptr;
                             wantFrames, maxFrames, gReflex.frameLimitUs);
                 }
             }
-            if (appliedFgMode != fgMode || appliedFgFrames != wantFrames ||
+            if (appliedFgMode != fgMode || appliedFgFrames != (fgMode == 2 && gReflex.frameLimitUs == 0 ? -1 : wantFrames) ||
                 appliedFgW != in.targetWidth || appliedFgH != in.targetHeight) {
                 sl::DLSSGOptions fg{};
-                fg.mode = sl::DLSSGMode::eOn;  // P225：动态也走显式帧数（见上）
-                fg.numFramesToGenerate = static_cast<uint32_t>(wantFrames);
+                // P226（用户 m10065）：DYNAMIC 且没有 Reflex 限帧时，交回 SL 的 eDynamic —— 它知道
+                // 显示器刷新率，会自己往刷新率上追；有 Reflex 限帧时才用 P225 的显式帧数（让限帧成为目标）。
+                const bool fgDynamic = (fgMode == 2) && (gReflex.frameLimitUs == 0);
+                fg.mode = fgDynamic ? sl::DLSSGMode::eDynamic : sl::DLSSGMode::eOn;
+                fg.numFramesToGenerate = fgDynamic ? 1u : static_cast<uint32_t>(wantFrames);
 
                 const sl::Result fgOptResult = api.setFgOptions(viewport, fg);
                 if (fgOptResult == sl::Result::eOk) {
@@ -2619,8 +2616,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     appliedFgFrames = wantFrames;
                     appliedFgW = in.targetWidth;
                     appliedFgH = in.targetHeight;
-                    logWarn("[P213] DLSS-G on: mode=%d frames=%d (hudless=%ux%u)",
-                            fgMode, wantFrames, in.targetWidth, in.targetHeight);
+
                 } else {
                     static bool warnedFgOpt = false;
                     if (!warnedFgOpt) {
@@ -2637,16 +2633,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     gFgPresented.store(static_cast<int32_t>(stFrame.numFramesActuallyPresented));
                 }
             }
-            // P213b：每 120 帧问一次 Streamline 到底插了多少帧。没有这行就只能靠肉眼猜。
-            if (api.getFgState != nullptr && (s.submitCount % 120u) == 0u) {
-                sl::DLSSGState st{};
-                const sl::Result stResult = api.getFgState(viewport, st, nullptr);
-                logInfo("[P213b] DLSS-G state r=0x%X status=0x%X presented=%u max=%u dyn=%d vram=%uMB",
-                        static_cast<unsigned>(stResult), static_cast<unsigned>(st.status),
-                        st.numFramesActuallyPresented, st.numFramesToGenerateMax,
-                        static_cast<int>(st.bIsDynamicMFGSupported),
-                        static_cast<unsigned>(st.estimatedVRAMUsageInBytes / (1024u * 1024u)));
-            }
+
         } else if (fgMode == 0 && api.setFgOptions != nullptr) {
             // 关闭只需要下发一次 eOff；之后 Streamline 自己保持这个状态。
             static bool fgOffSent = false;
@@ -2654,8 +2641,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 sl::DLSSGOptions fg{};
                 fg.mode = sl::DLSSGMode::eOff;
                 if (api.setFgOptions(viewport, fg) == sl::Result::eOk) {
-                    fgOffSent = true;
-                    logWarn("[P213] DLSS-G off");
+
                 }
             }
         }
@@ -3039,8 +3025,7 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
 void mcdr_dlss_set_fg_mode(int32_t mode, int32_t numFrames) {
     gDlssgMode.store(mode);
     gDlssgFrames.store(numFrames < 1 ? 1 : numFrames);
-    // P213e：JVM 侧真正把开关推过来时留一行，方便判断“没插帧”是没人下发还是 SL 拒绝。
-    logWarn("[P213e] set_fg_mode(mode=%d frames=%d)", mode, numFrames);
+
 }
 // P213c：上一次 Present 真正提交的帧数（1 = 没插帧）。JVM 的 F3 用它把 output 累加成
 // “presented fps”，否则一次 slPresent 只被 JVM 看到一次，两个数字永远相等。

@@ -83,8 +83,8 @@
            defined for x64 exclusively. Anything guarded by them must also be
            guarded in the C ABI surface, so that a Win32 build neither links the
            SDKs nor advertises them to the JVM side. -->
-      <PreprocessorDefinitions Condition="'$(Platform)'=='x64'">MCDR_HAS_DLSS=1;MCDR_HAS_NRD=1;MCDR_HAS_XESS=1;MCDR_HAS_FFX=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <!-- external\ manages the four upscaler/denoiser SDKs. They are vendored
+      <PreprocessorDefinitions Condition="'$(Platform)'=='x64'">MCDR_HAS_DLSS=1;MCDR_HAS_NRD=1;MCDR_HAS_XESS=1;MCDR_HAS_FFX=1;MCDR_HAS_NRC=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- external\ manages the five upscaler/denoiser/cache SDKs. They are vendored
            under MCDR\external\ (see external\README.md) rather than fetched per
            build, because none of them is available from a package manager:
              external\dlss       — DLSS / NGX SDK 310.9.1  (nvsdk_ngx*.h +
@@ -95,13 +95,26 @@
              external\fidelityfx — AMD FidelityFX SDK 2.3.0 (ffx_api*.h and the
                                    signed runtime DLLs; upstream ships NO import
                                    library, everything is GetProcAddress)
-           All four are only reachable on x64; MCDR_HAS_{DLSS,NRD,XESS,FFX} gate
-           every use so the Win32 configuration still compiles from the same
+             external\nrc        — NVIDIA Neural Radiance Cache 0.16 (NrcD3d12.h,
+                                   Nrc.hlsli and the x64 NRC_D3D12 import library)
+           All five are only reachable on x64; MCDR_HAS_{DLSS,NRD,XESS,FFX,NRC}
+           gate every use so the Win32 configuration still compiles from the same
            sources. Note that only DLSS and NRD are actually linked (see the Link
            blocks below); XeSS and FidelityFX are loaded at runtime, so their
            headers are on the include path but their .lib files are deliberately
-           NOT in AdditionalDependencies. -->
-      <AdditionalIncludeDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\fidelityfx\include;$(ProjectDir)external\streamline\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+           NOT in AdditionalDependencies.
+
+           NRC is on the include path but also NOT linked yet: it is the only SDK
+           here whose import library is a hard dependency at DLL-load time, and
+           its runtime (NRC_D3D12.dll + the CUDA 13 DLLs, ~113 MB) plus Tensor
+           Cores is a user-supplied install, so MCDR.dll must keep loading
+           without it. The first change that actually calls nrc::d3d12::* adds
+             <AdditionalLibraryDirectories>$(ProjectDir)external\nrc\Lib\x64</...>
+             <AdditionalDependencies>NRC_D3D12.lib</...>
+             <DelayLoadDLLs>NRC_D3D12.dll</DelayLoadDLLs>  (+ delayimp.lib)
+           so the import becomes lazy and a missing DLL surfaces as a
+           feature-unavailable error instead of MCDR.dll failing to load. -->
+      <AdditionalIncludeDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\fidelityfx\include;$(ProjectDir)external\streamline\include;$(ProjectDir)external\nrc\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <!-- These sources have Chinese comments; without /utf-8 the compiler
            reads them under the active code page and mangles them. -->
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>

@@ -1669,7 +1669,7 @@ int32_t hdrActiveFlag() { return mcdr_hdr_state_active(); }
 void destroySurface(Dx12Surface* s) {
     if (!s) return;
     dbgLogDebug("destroySurface: enter surface=%p", reinterpret_cast<void*>(s));
-    dbgLogError("[P184] destroySurface stage: enter");
+    dbgLogProgress("[P184] destroySurface stage: enter");
     // P196：独占全屏必须在释放链之前退出，否则显示模式会停在独占状态（桌面黑屏 / 分辨率不回退）。
     if (s->swapChain && s->exclusive) {
         const HRESULT fsHr = s->swapChain->SetFullscreenState(FALSE, nullptr);
@@ -1680,14 +1680,14 @@ void destroySurface(Dx12Surface* s) {
     // 先等待渲染线程完成当前帧（仅同步，不销毁线程），再等 GPU 空闲，
     // 避免 deviceWaitIdle → queue->Signal 与渲染线程的 Present 并发访问 swapchain 导致崩溃。
     waitForRenderThreadSubmit();
-    dbgLogError("[P184] destroySurface stage: waited render thread");
+    dbgLogProgress("[P184] destroySurface stage: waited render thread");
     (void)deviceWaitIdle();
-    dbgLogError("[P184] destroySurface stage: device idle");
+    dbgLogProgress("[P184] destroySurface stage: device idle");
     // P96/P183：先立刻把父窗口刷黑 —— 退出时窗口消失前会短暂露出父窗口客户区，
     // 早一步上色就少一帧灰/白幕；刷黑只动 GDI，不依赖下面的 fence 等待。
     HWND presentChild = s->presentWindow;
     paintParentBlackBeforeDestroy(presentChild);
-    dbgLogError("[P184] destroySurface stage: parent painted");
+    dbgLogProgress("[P184] destroySurface stage: parent painted");
     // P33 fix：等待 per-surface present fence，确保 Display Controller 已完成
     // flip 并释放 backbuffer 引用。IMMEDIATE 模式 + FLIP_DISCARD 下，deviceWaitIdle
     // 不等待 display controller，backbuffer 仍可能被 DWM 异步读取。
@@ -1714,17 +1714,17 @@ void destroySurface(Dx12Surface* s) {
     // P33 fix：present fence 等 GPU 完成所有命令（含 present），此时再 flush
     // 延迟删除对象，确保不在 GPU 仍引用资源时释放它们（消除 PreSwapInfoQueue
     // CORRUPTION 警告的根本原因）。
-    dbgLogError("[P184] destroySurface stage: fence wait done");
+    dbgLogProgress("[P184] destroySurface stage: fence wait done");
     flushPendingDeletes();
-    dbgLogError("[P184] destroySurface stage: pending deletes flushed");
+    dbgLogProgress("[P184] destroySurface stage: pending deletes flushed");
     if (getActiveSurface() == s) setActiveSurface(nullptr);
     // 先释放 swapchain（delete s），再销毁它的呈现宿主窗口，顺序不能反：
     // 窗口还活着时 DWM 仍持有该窗口的呈现资源引用。
     // presentChild 已在 fence 等待之前取出（P183），这里只清字段。
     s->presentWindow = nullptr;
-    dbgLogError("[P184] destroySurface stage: deleting surface");
+    dbgLogProgress("[P184] destroySurface stage: deleting surface");
     delete s;
-    dbgLogError("[P184] destroySurface stage: surface deleted");
+    dbgLogProgress("[P184] destroySurface stage: surface deleted");
     // P96：父窗口早在上面的 fence 等待之前就刷黑了（P183），这里只补日志与销毁子窗口。
     logWindowState("destroySurface child(before)", presentChild);
     logWindowState("destroySurface parent(before)", presentChild ? GetParent(presentChild) : nullptr);
@@ -1739,9 +1739,9 @@ void destroySurfaceNoWaitIdle(Dx12Surface* s) {
     if (getActiveSurface() == s) setActiveSurface(nullptr);
     HWND presentChild = s->presentWindow;
     s->presentWindow = nullptr;
-    dbgLogError("[P184] destroySurface stage: deleting surface");
+    dbgLogProgress("[P184] destroySurface stage: deleting surface");
     delete s;
-    dbgLogError("[P184] destroySurface stage: surface deleted");
+    dbgLogProgress("[P184] destroySurface stage: surface deleted");
     // P96：同 destroySurface —— 先刷黑父窗口再销毁子窗口（见该处说明）。
     paintParentBlackBeforeDestroy(presentChild);
     if (presentChild != nullptr) DestroyWindow(presentChild);
