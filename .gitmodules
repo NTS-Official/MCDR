@@ -16,3 +16,6 @@
 [submodule "external/nrc"]
 	path = external/nrc
 	url = https://github.com/NVIDIA-RTX/NRC.git
+[submodule "external/sharc"]
+	path = external/sharc
+	url = https://github.com/NVIDIA-RTX/SHARC.git
