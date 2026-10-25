@@ -3655,41 +3655,57 @@ const char* shadingRateUnsupportedReason(int rate) {
     return nullptr;
 }
 
-// 着色粒度控制的**唯一落点**：每 draw 速率、将来的材质级策略与着色率图像都从这里下发到
-// 命令列表。关闭时（requestedShadingRate < 0）一个调用都不产生，退化为改动前的行为。
-void applyShadingRate(ID3D12GraphicsCommandList* list) {
-    if (!list || gCtx.requestedShadingRate < 0) {
-        return;
+// P231：组合器名（日志用）。
+const char* shadingRateCombinerName(int combiner) {
+    switch (combiner) {
+        case static_cast<int>(D3D12_SHADING_RATE_COMBINER_PASSTHROUGH): return "PASSTHROUGH";
+        case static_cast<int>(D3D12_SHADING_RATE_COMBINER_OVERRIDE): return "OVERRIDE";
+        case static_cast<int>(D3D12_SHADING_RATE_COMBINER_MIN): return "MIN";
+        case static_cast<int>(D3D12_SHADING_RATE_COMBINER_MAX): return "MAX";
+        case static_cast<int>(D3D12_SHADING_RATE_COMBINER_SUM): return "SUM";
+        default: return "unknown";
+    }
+}
+
+// 着色粒度控制的**唯一落点**：把 rate 立刻下发到 list（RSSetShadingRate + 当前组合器）。
+// P231 起只会从 setShadingRateNow()（Java 侧的 scope）进来，不再在每条列表 Reset 之后全局
+// 重放 —— 那正是 P97 让天空/粒子/GUI 一起变粗的原因。返回值只用于日志，调用方拿 bool。
+bool issueShadingRate(ID3D12GraphicsCommandList* list, int rate) {
+    if (!list || rate < 0) {
+        return false;
     }
     // 能力兜底：配置一般在设备创建之前就读到了，那时问不到 tier/additional，所以真正下发前
     // 再判一次（只报一次 WARN，避免刷屏）。
-    if (const char* why = shadingRateUnsupportedReason(gCtx.requestedShadingRate)) {
+    if (const char* why = shadingRateUnsupportedReason(rate)) {
         if (!gCtx.shadingRateUnsupportedLogged) {
             gCtx.shadingRateUnsupportedLogged = true;
-            dbgLogWarn("VRS: shading rate %s not applied: %s; staying at 1X1",
-                       shadingRateName(gCtx.requestedShadingRate), why);
+            dbgLogWarn("VRS: shading rate %s not applied: %s; staying at 1X1", shadingRateName(rate), why);
         }
-        return;
+        return false;
     }
     ComPtr<ID3D12GraphicsCommandList5> list5;
     if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list5))) || !list5) {
         // 老 runtime 上拿不到 list5：不能静默 —— 那会表现为「配置了却不生效」。
-        if (gCtx.shadingRateAppliedLists == 0) {
+        if (!gCtx.shadingRateList5Logged) {
+            gCtx.shadingRateList5Logged = true;
             dbgLogWarn("VRS: ID3D12GraphicsCommandList5 unavailable; shading rate %s not applied",
-                       shadingRateName(gCtx.requestedShadingRate));
+                       shadingRateName(rate));
         }
-        return;
+        return false;
     }
-    // 两个 combiner 都 PASSTHROUGH：当前既不写 SV_ShadingRate（每图元速率），也还没有着色率
-    // 图像，于是最终速率就等于这里设的每 draw 速率。接着色率图像时改第二个 combiner。
-    const D3D12_SHADING_RATE_COMBINER combiners[2] = {D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
-                                                      D3D12_SHADING_RATE_COMBINER_PASSTHROUGH};
-    list5->RSSetShadingRate(static_cast<D3D12_SHADING_RATE>(gCtx.requestedShadingRate), combiners);
+    // 组合器来自设备上下文（P231 起可设）。默认都 PASSTHROUGH：既没人写 SV_ShadingRate，
+    // 也还没有着色率图像，于是最终速率就等于这次设的每 draw 速率。
+    const D3D12_SHADING_RATE_COMBINER combiners[2] = {
+        static_cast<D3D12_SHADING_RATE_COMBINER>(gCtx.shadingRateCombiner0),
+        static_cast<D3D12_SHADING_RATE_COMBINER>(gCtx.shadingRateCombiner1)};
+    list5->RSSetShadingRate(static_cast<D3D12_SHADING_RATE>(rate), combiners);
     ++gCtx.shadingRateAppliedLists;
     if (gCtx.shadingRateAppliedLists == 1) {
-        dbgLogInfo("VRS: shading rate %s applied via RSSetShadingRate (first command list)",
-                   shadingRateName(gCtx.requestedShadingRate));
+        dbgLogInfo("VRS: shading rate %s applied via RSSetShadingRate (combiners %s/%s)", shadingRateName(rate),
+                   shadingRateCombinerName(gCtx.shadingRateCombiner0),
+                   shadingRateCombinerName(gCtx.shadingRateCombiner1));
     }
+    return true;
 }
 
 }  // namespace
@@ -3702,18 +3718,17 @@ int setShadingRate(int rate) {
     }
     if (rate >= 0 && !gCtx.caps.queried) {
         // 配置是在设备创建之前读到的（NeoForge 的 ModConfigEvent 早于渲染器启动），那一刻还问
-        // 不到 tier/additional ⇒ 先收下，等 applyShadingRate() 在第一个图形命令列表上判并应用。
+        // 不到 tier/additional ⇒ 先收下，等第一次 scope（setShadingRateNow）下发时再判。
         gCtx.requestedShadingRate = rate;
-        dbgLogInfo("VRS: shading rate %s requested before the device exists; it will be gated and "
-                   "applied on the first graphics command list",
+        dbgLogInfo("VRS: shading rate %s requested before the device exists; it will be gated on the first "
+                   "scoped draw batch",
                    shadingRateName(rate));
         return 1;
     }
     if (rate >= 0) {
         if (const char* why = shadingRateUnsupportedReason(rate)) {
             // 设备已存在（典型：游戏内改配置触发的 Reloading 事件）⇒ 现在就能给结论，不留半开状态。
-            dbgLogWarn("VRS: shading rate %s refused: %s; keeping the default 1X1",
-                       shadingRateName(rate), why);
+            dbgLogWarn("VRS: shading rate %s refused: %s; keeping the default 1X1", shadingRateName(rate), why);
             return 0;
         }
     }
@@ -3723,10 +3738,43 @@ int setShadingRate(int rate) {
         dbgLogInfo("VRS: shading rate control off; device keeps its default 1X1");
         return 1;
     }
-    dbgLogInfo("VRS: shading rate %s set (tier=%d imageTileSize=%u additionalRates=%d) — applied to "
-               "every graphics command list started from now on",
+    dbgLogInfo("VRS: shading rate %s set (tier=%d imageTileSize=%u additionalRates=%d) — it is the coarse "
+               "rate ceiling for the whitelisted draw batches (P231: no longer replayed per list)",
                shadingRateName(rate), static_cast<int>(gCtx.caps.shadingRateTier),
                gCtx.caps.shadingRateImageTileSize, gCtx.caps.additionalShadingRates ? 1 : 0);
+    return 1;
+}
+
+int setShadingRateNow(CommandContext* ctx, int rate) {
+    // P231：scope 型下发。rate 只有 0x0..0xA 合法 —— 这里不接受 -1，因为"关闭"是 Java 侧
+    // 不调用它（不调用就等于列表保持默认 1X1），把 -1 混进来会让调用点多一个分支。
+    if (!isKnownShadingRate(rate)) {
+        dbgLogError("VRS: setShadingRateNow got unknown rate 0x%X (expected 0x0/0x1/0x4/0x5/0x6/0x9/0xA)",
+                    rate);
+        return -1;
+    }
+    if (!ctx || !ctx->commandList || !ctx->listOpen) {
+        // 调用点只可能是"主列表已开始录制"的地方；没有打开的列表说明 JVM 侧的 scope 包错了位置。
+        dbgLogWarn("VRS: setShadingRateNow(%s) without an open command list; ignored", shadingRateName(rate));
+        return -2;
+    }
+    return issueShadingRate(ctx->commandList, rate) ? 1 : 0;
+}
+
+int setShadingRateCombiners(int first, int second) {
+    const auto valid = [](int combiner) {
+        return combiner >= static_cast<int>(D3D12_SHADING_RATE_COMBINER_PASSTHROUGH) &&
+               combiner <= static_cast<int>(D3D12_SHADING_RATE_COMBINER_SUM);
+    };
+    if (!valid(first) || !valid(second)) {
+        dbgLogError("VRS: bad shading-rate combiners %d/%d (expected 0..4, PASSTHROUGH=0 OVERRIDE=1 MIN=2 "
+                    "MAX=3 SUM=4)",
+                    first, second);
+        return -1;
+    }
+    gCtx.shadingRateCombiner0 = first;
+    gCtx.shadingRateCombiner1 = second;
+    dbgLogInfo("VRS: combiners set to %s / %s", shadingRateCombinerName(first), shadingRateCombinerName(second));
     return 1;
 }
 
@@ -3784,8 +3832,9 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
         return mcdr::err("beginCommandListWithWait", "beginCommandListWithWait: list Reset " + hrText(hr));
     }
     dbgLogDebug("beginCommandListWithWait: list reset ok");
-    // P97：Reset 清掉列表状态，着色粒度必须在这里重放（关闭时零调用）。
-    applyShadingRate(ctx->commandList);
+    // P231：这里**不再**重放玩家档位。Reset 之后列表就是 D3D12 默认的 1X1，只有 Java 侧的
+    // scope（setShadingRateNow）才会把某一批绘制改粗 —— 否则天空、粒子、GUI 会跟着一起变粗
+    // （P97 的行为，P232 修掉）。
     dbgLogDebug("beginCommandListWithWait: pre-increment ctx=%p", reinterpret_cast<void*>(ctx));
     ctx->listOpen = 1;
     ctx->inRenderPass = 0;
@@ -4991,6 +5040,474 @@ static std::string sm69RequirementText() {
     return "shader model 6.9 is required and there is no SM 5.1 fallback any more, but the device "
            "reports SM " + std::string(shaderModelName(gCtx.caps.shaderModel)) +
            " (Agility SDK 619's D3D12Core.dll must sit next to MCDR.dll and be opted in)";
+}
+
+// ---------------------------------------------------------------------------
+// P234：compute 最小通路
+//
+// 根签名固定为「root UAV u0 + 8 个根常量 b0」：既避开描述符堆，也避开把根签名布局
+// 跨模块传出去。compute 本身跑在普通的 DIRECT 列表上（本模块没有 COMPUTE 列表类型），
+// 所以它和图形命令可以同列表共存 —— SRI 生成、NRC 的 update/query 都要这个性质。
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// P234/P235 共用：compute 的描述符堆
+//
+// typed UAV（`RWTexture2D`、以及 P235 的 R8_UINT 着色率图像）与 typed SRV 都必须
+// 经描述符表绑定 —— root descriptor 只支持 raw / structured buffer。堆懒建、64 槽
+// ring：一次 dispatch 占 1～3 格；同一帧内多次 dispatch 各占各的格，避免后一次
+// 覆盖前一次"已录制、未执行"的描述符。
+// ---------------------------------------------------------------------------
+bool ensureComputeHeap() {
+    if (gCtx.computeUavHeap) return true;
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.NumDescriptors = 64;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    const HRESULT hr =
+        gCtx.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&gCtx.computeUavHeap));
+    if (FAILED(hr)) {
+        dbgLogError("compute: CreateDescriptorHeap hr=0x%s", hrText(hr).c_str());
+        return false;
+    }
+    gCtx.computeUavStride =
+        gCtx.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    gCtx.computeUavNext = 0;
+    dbgLogInfo("compute: descriptor heap ready (64 slots, stride=%u)", gCtx.computeUavStride);
+    return true;
+}
+
+UINT computeHeapSlot() { return gCtx.computeUavNext++ % 64; }
+
+D3D12_CPU_DESCRIPTOR_HANDLE computeHeapCpu(UINT slot) {
+    D3D12_CPU_DESCRIPTOR_HANDLE h = gCtx.computeUavHeap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += static_cast<SIZE_T>(slot) * gCtx.computeUavStride;
+    return h;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE computeHeapGpu(UINT slot) {
+    D3D12_GPU_DESCRIPTOR_HANDLE h = gCtx.computeUavHeap->GetGPUDescriptorHandleForHeapStart();
+    h.ptr += static_cast<UINT64>(slot) * gCtx.computeUavStride;
+    return h;
+}
+
+mcdr::Result<void*> createComputePipeline(const void* dxil, int32_t dxilSize) {
+    if (auto d = ensureDevice(); !d) return mcdr::err("createComputePipeline", errorMessage(d.error()));
+    if (dxil == nullptr || dxilSize <= 0) {
+        return mcdr::err("createComputePipeline", "createComputePipeline: empty DXIL bytecode");
+    }
+
+    // u0 必须走描述符表：root descriptor 的 UAV 只支持 raw / structured buffer，
+    // typed UAV（RWTexture2D，P235 的着色率图像也是这种）挂在 root UAV 上会让
+    // CreateComputePipelineState 直接返回 E_INVALIDARG（2026-10-25 实测）。
+    D3D12_DESCRIPTOR_RANGE uavRange{};
+    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uavRange.NumDescriptors = 1;
+    uavRange.BaseShaderRegister = 0;  // u0
+    uavRange.RegisterSpace = 0;
+    uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable.NumDescriptorRanges = 1;
+    params[0].DescriptorTable.pDescriptorRanges = &uavRange;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants.ShaderRegister = 0;  // b0
+    params[1].Constants.RegisterSpace = 0;
+    params[1].Constants.Num32BitValues = 8;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+    rsDesc.NumParameters = 2;
+    rsDesc.pParameters = params;
+    rsDesc.NumStaticSamplers = 0;
+    rsDesc.pStaticSamplers = nullptr;
+    // 不带 ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT：compute 没有 IA 阶段。
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    ComPtr<ID3DBlob> rsBlob, rsErr;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, &rsErr);
+    if (FAILED(hr)) {
+        return mcdr::err("createComputePipeline",
+                         "createComputePipeline: D3D12SerializeRootSignature hr=0x" + hrText(hr));
+    }
+
+    auto obj = std::make_unique<Dx12Object>();
+    obj->kind = Dx12Object::Kind::ComputePipeline;
+    obj->size = dxilSize;
+    hr = gCtx.device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
+                                          IID_PPV_ARGS(&obj->computeRootSignature));
+    if (FAILED(hr)) {
+        return mcdr::err("createComputePipeline",
+                         "createComputePipeline: CreateRootSignature hr=0x" + hrText(hr));
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = obj->computeRootSignature.Get();
+    psoDesc.CS.pShaderBytecode = dxil;
+    psoDesc.CS.BytecodeLength = static_cast<SIZE_T>(dxilSize);
+    psoDesc.NodeMask = 0;
+    psoDesc.CachedPSO.pCachedBlob = nullptr;
+    psoDesc.CachedPSO.CachedBlobSizeInBytes = 0;
+    psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+    hr = gCtx.device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&obj->computePipelineState));
+    if (FAILED(hr)) {
+        std::string text = "createComputePipeline: CreateComputePipelineState hr=" + hrText(hr);
+        // P234：E_INVALIDARG 在 compute PSO 上只有几种可能（DXIL 不是 compute 对象 / 根签名指针
+        // 无效 / desc 被写坏），把能查的都打出来，并把 debug layer 的最近消息一并倒出，
+        // 免得靠猜。dxil 的头 4 字节应当是 'DXBC'（DXIL 容器沿用这个魔数）。
+        char magic[5] = {0, 0, 0, 0, 0};
+        if (dxilSize >= 4) {
+            std::memcpy(magic, dxil, 4);
+        }
+        char headText[128];
+        std::snprintf(headText, sizeof(headText),
+                      " dxil=%d magic=[%c%c%c%c] rootSig=%p", dxilSize, magic[0], magic[1], magic[2],
+                      magic[3], static_cast<void*>(psoDesc.pRootSignature));
+        text += headText;
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET
+            || hr == DXGI_ERROR_DEVICE_HUNG) {
+            text += " — " + deviceStatusText();
+        }
+        dumpInfoQueueMessages();
+        return mcdr::err("createComputePipeline", text);
+    }
+
+    dbgLogInfo("createComputePipeline: PSO handle=%p dxil=%d bytes (descriptor table u0 + 8 root constants b0)",
+               reinterpret_cast<void*>(obj.get()), dxilSize);
+    return static_cast<void*>(obj.release());
+}
+
+int dispatchCompute(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* uavTexture,
+                    const int32_t* constants, int32_t constantCount, int32_t x, int32_t y, int32_t z) {
+    if (ctx == nullptr || !ctx->commandList || !ctx->listOpen) {
+        dbgLogError("dispatchCompute: called without an open command list");
+        return -2;
+    }
+    if (pipeline == nullptr || pipeline->kind != Dx12Object::Kind::ComputePipeline
+        || !pipeline->computePipelineState || !pipeline->computeRootSignature) {
+        dbgLogError("dispatchCompute: handle is not a compute pipeline");
+        return 0;
+    }
+    if (uavTexture == nullptr || uavTexture->kind != Dx12Object::Kind::Texture
+        || !uavTexture->resource) {
+        dbgLogError("dispatchCompute: UAV target is not a texture");
+        return 0;
+    }
+    // usage 位 32 = ALLOW_UNORDERED_ACCESS（见 textureFlags）。少了它 CreateUnorderedAccessView
+    // 与 root UAV 都会失败，而失败点落在 GPU 侧、日志里什么也没有 —— 这里提前拦住。
+    if ((uavTexture->usage & 32) == 0) {
+        dbgLogError("dispatchCompute: texture lacks usage bit 32 (ALLOW_UNORDERED_ACCESS), usage=0x%x",
+                    uavTexture->usage);
+        return 0;
+    }
+    if (x <= 0 || y <= 0 || z <= 0) {
+        dbgLogError("dispatchCompute: invalid thread-group counts %d,%d,%d", x, y, z);
+        return 0;
+    }
+    constexpr int32_t kMaxConstants = 8;
+    if (constantCount < 0 || constantCount > kMaxConstants
+        || (constantCount > 0 && constants == nullptr)) {
+        dbgLogError("dispatchCompute: constantCount %d out of range (0..%d)", constantCount, kMaxConstants);
+        return 0;
+    }
+
+    ID3D12GraphicsCommandList* list = ctx->commandList;
+    // P234：typed UAV 必须经描述符表绑定（见根签名里 uavRange 的注释）。堆懒建，
+    // 64 槽 ring —— 一次 dispatch 占一格；同一帧内多次 dispatch 各自占格，避免
+    // 覆盖前一次已录制但未执行的描述符。
+    if (!ensureComputeHeap()) {
+        return 0;
+    }
+    const UINT uavSlot = computeHeapSlot();
+    const D3D12_CPU_DESCRIPTOR_HANDLE uavCpu = computeHeapCpu(uavSlot);
+    const D3D12_GPU_DESCRIPTOR_HANDLE uavGpu = computeHeapGpu(uavSlot);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+    uavDesc.Format = uavTexture->dxgiFormat;
+    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uavDesc.Texture2D.MipSlice = 0;
+    uavDesc.Texture2D.PlaneSlice = 0;
+    gCtx.device->CreateUnorderedAccessView(uavTexture->resource.Get(), nullptr, &uavDesc, uavCpu);
+
+    // 创建时恒为 COMMON（createTexture 的初始状态），所以这里的 from 状态是确定的；
+    // 转回 COMMON 则让后续跨列表的拷贝仍按"未保持状态"处理（见 dbgReadbackTexturePixels）。
+    transitionTextureTo(ctx, uavTexture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->SetPipelineState(pipeline->computePipelineState.Get());
+    list->SetComputeRootSignature(pipeline->computeRootSignature.Get());
+    ID3D12DescriptorHeap* heaps[1] = {gCtx.computeUavHeap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootDescriptorTable(0, uavGpu);
+    if (constantCount > 0) {
+        list->SetComputeRoot32BitConstants(1, static_cast<UINT>(constantCount), constants, 0);
+    }
+    list->Dispatch(static_cast<UINT>(x), static_cast<UINT>(y), static_cast<UINT>(z));
+    transitionTextureTo(ctx, uavTexture, D3D12_RESOURCE_STATE_COMMON);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// P235：着色率图像（tier 2 SRI）
+//
+// 布局：[0] 描述符表（t0/t1 两张 SRV：上一帧深度 + 上一帧速度）
+//       [1] 描述符表（u0 一张 UAV：R8_UINT 的着色率图像）
+//       [2] 根常量 b0（8 个 int32：宽/高/tile/阈值…）
+// 与 P234 的单 UAV 版并存：那条给"只写一张图"的简单 compute 用，这条给需要
+// 读两张输入的 SRI 用。图像值就是 D3D12_SHADING_RATE_* 的枚举值（0=1X1 … 0xA=4X4）。
+// ---------------------------------------------------------------------------
+mcdr::Result<void*> createComputePipelineShadingRate(const void* dxil, int32_t dxilSize) {
+    if (auto d = ensureDevice(); !d) return mcdr::err("createComputePipelineShadingRate", errorMessage(d.error()));
+    if (dxil == nullptr || dxilSize <= 0) {
+        return mcdr::err("createComputePipelineShadingRate",
+                         "createComputePipelineShadingRate: empty DXIL bytecode");
+    }
+
+    D3D12_DESCRIPTOR_RANGE srvRange{};
+    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange.NumDescriptors = 2;
+    srvRange.BaseShaderRegister = 0;  // t0, t1
+    srvRange.RegisterSpace = 0;
+    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_DESCRIPTOR_RANGE uavRange{};
+    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uavRange.NumDescriptors = 1;
+    uavRange.BaseShaderRegister = 0;  // u0
+    uavRange.RegisterSpace = 0;
+    uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER params[3]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable.NumDescriptorRanges = 1;
+    params[0].DescriptorTable.pDescriptorRanges = &srvRange;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges = &uavRange;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[2].Constants.ShaderRegister = 0;  // b0
+    params[2].Constants.RegisterSpace = 0;
+    params[2].Constants.Num32BitValues = 8;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+    rsDesc.NumParameters = 3;
+    rsDesc.pParameters = params;
+    rsDesc.NumStaticSamplers = 0;
+    rsDesc.pStaticSamplers = nullptr;
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    ComPtr<ID3DBlob> rsBlob, rsErr;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsBlob, &rsErr);
+    if (FAILED(hr)) {
+        return mcdr::err("createComputePipelineShadingRate",
+                         "createComputePipelineShadingRate: D3D12SerializeRootSignature hr=0x" + hrText(hr));
+    }
+
+    auto obj = std::make_unique<Dx12Object>();
+    obj->kind = Dx12Object::Kind::ComputePipeline;
+    obj->size = dxilSize;
+    hr = gCtx.device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
+                                          IID_PPV_ARGS(&obj->computeRootSignature));
+    if (FAILED(hr)) {
+        return mcdr::err("createComputePipelineShadingRate",
+                         "createComputePipelineShadingRate: CreateRootSignature hr=0x" + hrText(hr));
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = obj->computeRootSignature.Get();
+    psoDesc.CS.pShaderBytecode = dxil;
+    psoDesc.CS.BytecodeLength = static_cast<SIZE_T>(dxilSize);
+    psoDesc.NodeMask = 0;
+    psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+    hr = gCtx.device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&obj->computePipelineState));
+    if (FAILED(hr)) {
+        std::string text =
+            "createComputePipelineShadingRate: CreateComputePipelineState hr=0x" + hrText(hr);
+        char head[96];
+        std::snprintf(head, sizeof(head), " dxil=%d", dxilSize);
+        text += head;
+        dumpInfoQueueMessages();
+        return mcdr::err("createComputePipelineShadingRate", text);
+    }
+
+    dbgLogInfo("createComputePipelineShadingRate: PSO handle=%p dxil=%d bytes (srv t0/t1 + uav u0 + b0)",
+               static_cast<void*>(obj.get()), dxilSize);
+    return static_cast<void*>(obj.release());
+}
+
+int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* srvDepth,
+                              Dx12Object* srvMotion, Dx12Object* image, const int32_t* constants,
+                              int32_t constantCount, int32_t x, int32_t y, int32_t z) {
+    if (ctx == nullptr || !ctx->commandList || !ctx->listOpen) {
+        dbgLogError("dispatchComputeShadingRate: called without an open command list");
+        return -2;
+    }
+    if (pipeline == nullptr || pipeline->kind != Dx12Object::Kind::ComputePipeline
+        || !pipeline->computePipelineState || !pipeline->computeRootSignature) {
+        dbgLogError("dispatchComputeShadingRate: handle is not a compute pipeline");
+        return 0;
+    }
+    if (srvDepth == nullptr || srvMotion == nullptr || image == nullptr || !image->resource
+        || image->kind != Dx12Object::Kind::Texture) {
+        dbgLogError("dispatchComputeShadingRate: depth/motion view or image missing");
+        return 0;
+    }
+    if ((image->usage & 32) == 0) {
+        dbgLogError("dispatchComputeShadingRate: image lacks usage bit 32, usage=0x%x", image->usage);
+        return 0;
+    }
+    constexpr int32_t kMaxConstants = 8;
+    if (constantCount < 0 || constantCount > kMaxConstants
+        || (constantCount > 0 && constants == nullptr)) {
+        dbgLogError("dispatchComputeShadingRate: constantCount %d out of range (0..%d)", constantCount,
+                    kMaxConstants);
+        return 0;
+    }
+    if (x <= 0 || y <= 0 || z <= 0) {
+        dbgLogError("dispatchComputeShadingRate: invalid thread-group counts %d,%d,%d", x, y, z);
+        return 0;
+    }
+
+    if (!ensureComputeHeap()) return 0;
+    ID3D12GraphicsCommandList* list = ctx->commandList;
+
+    // 两张 SRV 必须落在同一条连续区间（根参数 [0] 是 2 个描述符的表）。
+    const UINT srvSlot = computeHeapSlot();
+    const UINT uavSlot = srvSlot + 1;
+    gCtx.computeUavNext = srvSlot + 2;
+    const D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = computeHeapCpu(srvSlot);
+    const D3D12_CPU_DESCRIPTOR_HANDLE uavCpu = computeHeapCpu(uavSlot);
+    if (srvDepth->cpuHandle.ptr != 0) {
+        gCtx.device->CopyDescriptorsSimple(1, srvCpu, srvDepth->cpuHandle,
+                                           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    if (srvMotion->cpuHandle.ptr != 0) {
+        D3D12_CPU_DESCRIPTOR_HANDLE second{};
+        second.ptr = srvCpu.ptr + gCtx.computeUavStride;
+        gCtx.device->CopyDescriptorsSimple(1, second, srvMotion->cpuHandle,
+                                           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+    uavDesc.Format = image->dxgiFormat;
+    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uavDesc.Texture2D.MipSlice = 0;
+    uavDesc.Texture2D.PlaneSlice = 0;
+    gCtx.device->CreateUnorderedAccessView(image->resource.Get(), nullptr, &uavDesc, uavCpu);
+
+    // 两张输入必须可读；状态跟踪走 transitionTo（同一命令上下文内自洽）。
+    if (srvDepth->sourceTexture && srvDepth->sourceTexture->resource) {
+        transitionTo(ctx, srvDepth->sourceTexture->resource.Get(), D3D12_RESOURCE_STATE_COMMON,
+                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    if (srvMotion->sourceTexture && srvMotion->sourceTexture->resource) {
+        transitionTo(ctx, srvMotion->sourceTexture->resource.Get(), D3D12_RESOURCE_STATE_COMMON,
+                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    transitionTextureTo(ctx, image, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    list->SetPipelineState(pipeline->computePipelineState.Get());
+    list->SetComputeRootSignature(pipeline->computeRootSignature.Get());
+    ID3D12DescriptorHeap* heaps[1] = {gCtx.computeUavHeap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootDescriptorTable(0, computeHeapGpu(srvSlot));
+    list->SetComputeRootDescriptorTable(1, computeHeapGpu(uavSlot));
+    if (constantCount > 0) {
+        list->SetComputeRoot32BitConstants(2, static_cast<UINT>(constantCount), constants, 0);
+    }
+    list->Dispatch(static_cast<UINT>(x), static_cast<UINT>(y), static_cast<UINT>(z));
+    // 图像留在 COMMON：绑定前由 setShadingRateImage 单独转到 SHADING_RATE_SOURCE。
+    transitionTextureTo(ctx, image, D3D12_RESOURCE_STATE_COMMON);
+    return 1;
+}
+
+// 建一张 R8_UINT 的着色率图像。尺寸是 **tile 数**（宽高各自 ceil(pixel / tile)），
+// 因为 SRI 的每个 texel 管一整块 tile；tile 边长见 caps.shadingRateImageTileSize
+// （NVIDIA 16、AMD 8）。usage 34 = 32(UAV) | 2(COPY_SRC，供自检读回)。
+mcdr::Result<void*> createShadingRateImage(int32_t width, int32_t height) {
+    if (auto d = ensureDevice(); !d) return mcdr::err("createShadingRateImage", errorMessage(d.error()));
+    if (!gCtx.caps.shadingRateImageSupported()) {
+        return mcdr::err("createShadingRateImage", "createShadingRateImage: device is below VRS tier 2");
+    }
+    if (width <= 0 || height <= 0 || width > 4096 || height > 4096) {
+        return mcdr::err("createShadingRateImage", "createShadingRateImage: bad tile dimensions");
+    }
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = static_cast<UINT64>(width);
+    desc.Height = static_cast<UINT>(height);
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8_UINT;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    auto obj = std::make_unique<Dx12Object>();
+    obj->kind = Dx12Object::Kind::Texture;
+    obj->usage = 34;
+    obj->dxgiFormat = DXGI_FORMAT_R8_UINT;
+    obj->size = static_cast<long long>(width) * height;
+    HRESULT hr = gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                      D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                      IID_PPV_ARGS(&obj->resource));
+    if (FAILED(hr)) {
+        return mcdr::err("createShadingRateImage",
+                         "createShadingRateImage: CreateCommittedResource hr=0x" + hrText(hr));
+    }
+    dbgLogInfo("createShadingRateImage: handle=%p %dx%d tiles (tile=%u)", static_cast<void*>(obj.get()),
+               width, height, gCtx.caps.shadingRateImageTileSize);
+    return static_cast<void*>(obj.release());
+}
+
+// 把图像挂到命令列表的 SRI 槽位（image == nullptr 表示摘掉）。
+// SHADING_RATE_SOURCE 是 D3D12_RESOURCE_STATES 里一个普通位（0x1000000），
+// transitionTo 直接能用 —— 本模块没有别的 barrier ABI。
+int setShadingRateImage(CommandContext* ctx, Dx12Object* image) {
+    if (ctx == nullptr || !ctx->commandList || !ctx->listOpen) {
+        dbgLogError("setShadingRateImage: called without an open command list");
+        return -2;
+    }
+    ComPtr<ID3D12GraphicsCommandList5> list5;
+    if (FAILED(ctx->commandList->QueryInterface(IID_PPV_ARGS(&list5))) || !list5) {
+        dbgLogWarn("setShadingRateImage: command list is not ID3D12GraphicsCommandList5");
+        return 0;
+    }
+    if (image == nullptr) {
+        list5->RSSetShadingRateImage(nullptr);
+        // P235：解绑必须把图像转回 COMMON —— SHADING_RATE_SOURCE 只在"绑定期间"
+        // 合法，其余代码路径一律按 COMMON 做状态转换（读回就是其中之一）。
+        if (gCtx.shadingRateImageBound != nullptr && gCtx.shadingRateImageBound->resource) {
+            transitionTo(ctx, gCtx.shadingRateImageBound->resource.Get(),
+                         D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            gCtx.shadingRateImageBound = nullptr;
+        }
+        return 1;
+    }
+    if (image->kind != Dx12Object::Kind::Texture || !image->resource) {
+        dbgLogError("setShadingRateImage: handle is not a texture");
+        return -1;
+    }
+    // 换绑：先把上一张转回 COMMON，再推新的这张。
+    if (gCtx.shadingRateImageBound != nullptr && gCtx.shadingRateImageBound != image
+        && gCtx.shadingRateImageBound->resource) {
+        transitionTo(ctx, gCtx.shadingRateImageBound->resource.Get(),
+                     D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        gCtx.shadingRateImageBound = nullptr;
+    }
+    transitionTo(ctx, image->resource.Get(), D3D12_RESOURCE_STATE_COMMON,
+                 D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE);
+    gCtx.shadingRateImageBound = image;
+    list5->RSSetShadingRateImage(image->resource.Get());
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        dbgLogInfo("setShadingRateImage: RSSetShadingRateImage bound");
+    }
+    return 1;
 }
 
 mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
@@ -6238,6 +6755,10 @@ void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag) {
             fbFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
             break;
     }
+    // P235: 拷贝足迹的格式必须与源纹理完全一致。R8_UINT 源配 R8_UNORM 足迹不属于
+    // "兼容格式"，CopyTextureRegion 返回 E_INVALIDARG，整条命令列表被丢弃之后
+    // staging 的 Map 也跟着失败（2026-10-25 实测：SRI 自检报 staging Map failed）。
+    fbFmt = fmt;
     UINT64 rowBytes = static_cast<UINT64>(w) * bpp;
     UINT64 pitch = (rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
                    & ~static_cast<UINT64>(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
@@ -6314,7 +6835,15 @@ void dbgReadbackTexturePixels(Dx12Object* tex, const char* tag) {
     if (auto waited = waitForQueueFenceValue(fv, 5'000'000'000ULL); !waited) return;
 
     void* ptr = nullptr;
-    if (FAILED(staging->Map(0, nullptr, &ptr))) return;
+    if (FAILED(staging->Map(0, nullptr, &ptr))) {
+        // P235: 读回失败时把设备移除原因一起打出来 —— Map 失败往往意味着前面某条
+        // 命令列表已经把设备弄丢了（GetCompletedValue 返回 UINT64_MAX 也是这个信号）。
+        const HRESULT rr = gCtx.device ? gCtx.device->GetDeviceRemovedReason() : E_FAIL;
+        dbgLogError("readback[%s]: staging Map failed (fmt=%d %ux%u pitch=%llu total=%llu removedReason=0x%08X)",
+                    tag, static_cast<int>(fmt), w, h, static_cast<unsigned long long>(pitch),
+                    static_cast<unsigned long long>(total), static_cast<unsigned>(rr));
+        return;
+    }
     const uint8_t* base = static_cast<const uint8_t*>(ptr);
     int xs[3] = {0, static_cast<int>(w) / 2, static_cast<int>(w) - 1};
     int ys[3] = {0, static_cast<int>(h) / 2, static_cast<int>(h) - 1};

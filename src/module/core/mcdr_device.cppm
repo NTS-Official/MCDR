@@ -115,13 +115,28 @@ int setPixDirectory(const char* utf8Path);
 int startPixTimingCapture(const char* utf8Path);
 int stopPixTimingCapture();
 
-// P97：VRS 着色粒度控制点。rate = 原始 D3D12_SHADING_RATE（1X1=0x0 1X2=0x1 2X1=0x4
-// 2X2=0x5 2X4=0x6 4X2=0x9 4X4=0xA），-1 = 关闭（一个 RSSetShadingRate 都不调用，设备
-// 保持默认 1X1）。取值只存进 DeviceContext，真正的落到命令列表由 applyShadingRate()
-// 在每条图形命令列表 Reset 之后统一做（Reset 清列表状态，所以只能在那里应用）。
+// P97/P231：VRS 着色粒度控制点 —— 玩家档位（= 地形的粗粒度上限）。rate = 原始
+// D3D12_SHADING_RATE（1X1=0x0 1X2=0x1 2X1=0x4 2X2=0x5 2X4=0x6 4X2=0x9 4X4=0xA），-1 = 关闭
+// （一个 RSSetShadingRate 都不调用，设备保持默认 1X1）。
+//
+// P231 起语义变了：这里**只存进 DeviceContext 并做能力预检**，不再在每条命令列表 Reset 之后
+// 全局重放 —— P97 的全局重放会把天空/粒子/GUI 一起变粗（见 P232 的按批次白名单）。真正下发
+// 走 setShadingRateNow()，由 Java 侧把"可以变粗的那批绘制"包起来，出作用域恢复 1X1。
 // 返回 1=接受（含"设备还没建，先收下"） 0=设备无法满足该档位（tier 0，或 2X4/4X2/4X4 缺
 // AdditionalShadingRatesSupported —— 只有设备已存在时才答得出来） -1=未知速率值。
 int setShadingRate(int rate);
+
+// P231：scope 型应用点（ABI 见 mcdr_abi.h 的 mcdr_dx12SetShadingRateNow）。rate 只接受
+// 0x0..0xA；立刻对 ctx 当前打开的命令列表下发 RSSetShadingRate，不读也不写
+// requestedShadingRate。返回 1=已下发 0=设备无法满足该档位/列表不是
+// ID3D12GraphicsCommandList5 -1=未知速率 -2=ctx 为空或没有打开的列表。
+int setShadingRateNow(CommandContext* ctx, int rate);
+
+// P231：两个着色率组合器（0..4）。存进 DeviceContext，之后每次下发都用它们。默认
+// {PASSTHROUGH, PASSTHROUGH}；逐图元速率（mesh shader 的 SV_ShadingRate）开始写之前不能把
+// 第一个改成 MIN —— 逐图元默认 1X1 会把每 draw 的 2X2 全部压回去。
+// 返回 1=已保存 -1=取值越界。
+int setShadingRateCombiners(int first, int second);
 
 // P104：抗锯齿模式（来自 Java 侧的视频设置选项 dxrMcAaMode，与 VRS 一样**不需要重启**）。
 // mode 取值与 Kotlin 的 D3D12AntiAliasing 一致：**0=OFF 1=SMAA 2=TAA 3=DLAA**。
@@ -217,6 +232,24 @@ struct DeviceContext {
     ComPtr<ID3D12DescriptorHeap> samplerHeap;  // Sampler（SHADER_VISIBLE）
     ComPtr<ID3D12DescriptorHeap> drawHeap;     // P6：每帧瞬时 CBV/SRV 描述符（SHADER_VISIBLE，ring x2）
 
+    // P234：compute 的 typed UAV 描述符堆（SHADER_VISIBLE，64 槽 ring）。
+    //
+    // 为什么不是 root descriptor：D3D12 的 root UAV 描述符只支持 raw / structured
+    // buffer，`RWTexture2D` 这类 **typed** UAV 必须走描述符表。2026-10-25 实测：
+    // 把 u0 声明成 D3D12_ROOT_PARAMETER_TYPE_UAV 后，即便 DXIL 合法、根签名指针
+    // 非空，CreateComputePipelineState 仍返回 E_INVALIDARG（0x80070057）。
+    // 着色率图像（P235）本身就是 typed UAV（R8_UINT），所以这里直接走描述符表。
+    ComPtr<ID3D12DescriptorHeap> computeUavHeap;  // 懒建
+    UINT computeUavStride = 0;                    // 堆的 DescriptorSize
+    UINT computeUavNext = 0;                      // ring 游标（64 槽）
+
+    // P235：当前挂在命令列表 SRI 槽位上的着色率图像。绑定会把它的资源状态推到
+    // D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE，而这个状态只有"绑定期间"才是合法的；
+    // 解绑（image == nullptr）或换绑时必须把它转回 COMMON，否则后续任何按 COMMON
+    // 假设做状态转换的路径（读回、拷贝、UAV）都会踩到状态不匹配 —— 2026-10-25
+    // 实测到的现象是 SRI 自检在 `staging Map failed` 处失败。
+    Dx12Object* shadingRateImageBound = nullptr;
+
     // P33 async：开启异步分区后，drawHeap 的每个帧段被划出一部分给 worker 分区，
     // 同步 ring 只允许使用每段起始的 syncRingReserve 个槽位。0 = 未开启异步分区
     // （同步 ring 可用整段 kDrawHeapPerFrame）。由 dx12AsyncDescriptorCreate 设置。
@@ -290,14 +323,20 @@ struct DeviceContext {
     // 「SDK 没装」看起来是同一件事。
     mcdr::RtxSupport rtx;
 
-    // P97：VRS 着色粒度控制点。requestedShadingRate = -1 表示关闭（默认值）：设备保持
-    // D3D12 默认的 1x1，整条录制路径不产生任何 RSSetShadingRate 调用。>= 0 时由
-    // applyShadingRate() 在每条图形命令列表 Reset 之后应用 —— Reset 会清掉列表状态，
-    // 所以只能在那里（每条列表）重放，不能在创建时设一次就算完。
+    // P97/P231：VRS 玩家档位（= 地形粗粒度上限）。requestedShadingRate = -1 表示关闭
+    // （默认值）：整条录制路径不产生任何 RSSetShadingRate 调用。P231 起它只做存储与能力
+    // 预检，真正下发由 Java 侧的 scope（setShadingRateNow）逐批次完成 —— 所以这个字段是
+    // "玩家想要的上限"，不是"每条列表都要重放的速率"。
     int requestedShadingRate = -1;
-    UINT64 shadingRateAppliedLists = 0;  // 已应用过的命令列表数（首次应用打一行 INFO）
-    // applyShadingRate() 判出"设备不支持这个档位"时只 WARN 一次（它会在每条列表上被调用）。
+    // 已下发过 RSSetShadingRate 的次数（首次下发打一行 INFO）。
+    UINT64 shadingRateAppliedLists = 0;
+    // 能力判负 / 拿不到 list5 各只 WARN 一次（scope 每帧会调很多次，刷屏没有意义）。
     bool shadingRateUnsupportedLogged = false;
+    bool shadingRateList5Logged = false;
+    // P231：两个组合器（D3D12_SHADING_RATE_COMBINER 的整数值）。默认都 PASSTHROUGH ——
+    // 逐图元速率还没人写，stage0 用 MIN 会让每 draw 的 2X2 失效。
+    int shadingRateCombiner0 = static_cast<int>(D3D12_SHADING_RATE_COMBINER_PASSTHROUGH);
+    int shadingRateCombiner1 = static_cast<int>(D3D12_SHADING_RATE_COMBINER_PASSTHROUGH);
     UINT64 timestampFrequency = 0;  // 从 GetTimestampFrequency 获取（DeviceInfo.timestampPeriod 用）
     ComPtr<ID3D12CommandQueue> queue;   // 图形队列（提交命令用）
 
@@ -421,7 +460,10 @@ struct DeviceContext {
 // 资源对象（Java long 句柄 = Dx12Object*）
 // ---------------------------------------------------------------------------
 struct Dx12Object {
-    enum class Kind { Texture, Buffer, Sampler, TextureView };
+    // P234：ComputePipeline 不是资源，只承载 compute PSO + 它自己的固定根签名
+    // （1 个 root UAV + 8 个根常量）。销毁仍走 destroyObject 的延迟删除，
+    // 因为它同样可能被在飞的命令列表引用。
+    enum class Kind { Texture, Buffer, Sampler, TextureView, ComputePipeline };
 
     Kind kind = Kind::Buffer;
     ComPtr<ID3D12Resource> resource;  // Texture / Buffer
@@ -438,6 +480,10 @@ struct Dx12Object {
     // TextureView 指向的底层 Texture（采样前需 transition 到
     // PIXEL_SHADER_RESOURCE；Texture/Buffer 恒为 nullptr）。
     Dx12Object* sourceTexture = nullptr;
+    // P234：Kind::ComputePipeline 时有效。根签名与 PSO 一起建，
+    // 调用方不需要（也无法）从外部传根签名进来。
+    ComPtr<ID3D12RootSignature> computeRootSignature;
+    ComPtr<ID3D12PipelineState> computePipelineState;
 };
 
 // ---------------------------------------------------------------------------
@@ -479,6 +525,22 @@ void probeDxc(DeviceContext::Capabilities& caps);
 // 交给这里，拿回 DXIL 字节码再喂给 createMeshPipeline。失败时 Error 带 DXC 诊断首行。
 mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::string& entry,
                                     const std::string& profile, std::vector<uint8_t>& outDxil);
+
+// P234：compute 最小通路。根签名固定（1 个 root UAV(u0) + 8 个 int32 根常量(b0)），
+// 所以这里只要 DXIL 字节码，不需要绑定表；SRI / NRC 接入时换纹理格式即可，签名不用动。
+mcdr::Result<void*> createComputePipeline(const void* dxil, int32_t dxilSize);
+
+// 在已打开的命令列表上派发一次（内部做 COMMON → UNORDERED_ACCESS → COMMON 的转换）。
+// 返回 1=已派发 0=参数/资源状态不对 -2=没有打开的命令列表（与 setShadingRateNow 同一套码）。
+// P235：着色率图像（tier 2 SRI）。布局 = 2 张 SRV（t0/t1）+ 1 张 UAV（u0）+ b0 根常量。
+mcdr::Result<void*> createComputePipelineShadingRate(const void* dxil, int32_t dxilSize);
+int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* srvDepth,
+                               Dx12Object* srvMotion, Dx12Object* image, const int32_t* constants,
+                               int32_t constantCount, int32_t x, int32_t y, int32_t z);
+mcdr::Result<void*> createShadingRateImage(int32_t width, int32_t height);
+int setShadingRateImage(CommandContext* ctx, Dx12Object* image);
+int dispatchCompute(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* uavTexture,
+                    const int32_t* constants, int32_t constantCount, int32_t x, int32_t y, int32_t z);
 
 // JNI 层访问设备上下文（读 adapterName/featureLevel）。
 DeviceContext& deviceContext();

@@ -2549,14 +2549,17 @@ sl::FrameToken* gLastFrameToken = nullptr;
         // - §6.0：slDLSSGSetOptions 要在呈现线程调用、下一次 Present 生效 —— 本函数就在渲染线程，
         //   紧随其后的 present 就是它要影响的那一次。
         const int32_t fgMode = fgModeEarly;
+        // P213e（用户 m01219）：`appliedFgMode` 原来是 `if (wantFg)` 块内的静态量，关掉 FG 的
+        // 分支看不见它，于是那里只能用一次性闩 `fgOffSent` —— 开过再关就再也不发 eOff，
+        // Streamline 继续插帧而我们以为已经关了。挪到这里，两个分支共用。
+        static int32_t appliedFgMode = -1;
+        static int32_t appliedFgFrames = -1;
         if (wantFg) {
             // 上一步的拷贝把 outResource 留在了 COPY_SOURCE；tag 里声明的是 UNORDERED_ACCESS，
             // 所以这里要把它切回去（Present 时状态必须与 tag 一致）。
             transition(outResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
             // 选项只在“期望状态变了”时下发：每帧调会拖慢 Present 线程（文档 §6.0 也不建议）。
-            static int32_t appliedFgMode = -1;
-            static int32_t appliedFgFrames = -1;
             // P213f：交换链重建（ResizeBuffers）之后 SL 侧必须重新拿到 options，否则 FG 会停在
             // 旧尺寸上不再插帧。用“输出尺寸”当代理：尺寸变了就重发一次。
             static uint32_t appliedFgW = 0;
@@ -2635,15 +2638,20 @@ sl::FrameToken* gLastFrameToken = nullptr;
             }
 
         } else if (fgMode == 0 && api.setFgOptions != nullptr) {
-            // 关闭只需要下发一次 eOff；之后 Streamline 自己保持这个状态。
-            static bool fgOffSent = false;
-            if (!fgOffSent) {
+            // P213e（用户 m01219）：关掉 FG 必须真的下发一次 eOff。原来靠一次性闩 `fgOffSent`，
+            // 一旦本进程里开过 FG 再关，就再也不发 → SL 仍在插帧、JVM 这边却以为已经关了。
+            if (appliedFgMode != 0) {
                 sl::DLSSGOptions fg{};
                 fg.mode = sl::DLSSGMode::eOff;
                 if (api.setFgOptions(viewport, fg) == sl::Result::eOk) {
-
+                    appliedFgMode = 0;
+                    appliedFgFrames = 0;
                 }
             }
+            // P213c（用户 m01219）：关着时“上一次真正提交的帧数”必须是 1。原来这里不复位，
+            // gFgPresented 会停在上次开 FG 时的 2/3…，JVM 的 F3 把它当成每帧都交了 2 帧，
+            // 于是出现“RTSS 实测 120、F3 却显示 120/240 (FG 2.0x)”。
+            gFgPresented.store(1);
         }
 
         if (evalResult != sl::Result::eOk) {
@@ -3025,7 +3033,11 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
 void mcdr_dlss_set_fg_mode(int32_t mode, int32_t numFrames) {
     gDlssgMode.store(mode);
     gDlssgFrames.store(numFrames < 1 ? 1 : numFrames);
-
+    // P213c（用户 m01219）：关掉时立刻把“上一次提交的帧数”复位，不等下一帧 evaluate ——
+    // F3 每帧都在读它，晚一帧就会显示一次 2× 的错数。
+    if (mode == 0) {
+        gFgPresented.store(1);
+    }
 }
 // P213c：上一次 Present 真正提交的帧数（1 = 没插帧）。JVM 的 F3 用它把 output 累加成
 // “presented fps”，否则一次 slPresent 只被 JVM 看到一次，两个数字永远相等。

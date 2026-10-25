@@ -144,7 +144,11 @@ int32_t readbackSamples36(ID3D12Resource* res, UINT w, UINT h, UINT bpp, DXGI_FO
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.StateAfter = finalState;
     cl->ResourceBarrier(1, &b);
-    cl->Close();
+    const HRESULT closeHr = cl->Close();
+    if (FAILED(closeHr)) {
+        dbgLogError("readbackSamples36: Close hr=0x%08X fmt=%d %ux%u", static_cast<unsigned>(closeHr),
+                    static_cast<int>(fbFmt), w, h);
+    }
 
     ID3D12CommandList* lists[] = {cl.Get()};
     ctx.queue->ExecuteCommandLists(1, lists);
@@ -156,6 +160,9 @@ int32_t readbackSamples36(ID3D12Resource* res, UINT w, UINT h, UINT bpp, DXGI_FO
 
     void* ptr = nullptr;
     if (FAILED(staging->Map(0, nullptr, &ptr))) {
+        const HRESULT rr2 = ctx.device ? ctx.device->GetDeviceRemovedReason() : E_FAIL;
+        dbgLogError("readbackSamples36: Map failed fmt=%d %ux%u removedReason=0x%08X", static_cast<int>(fbFmt),
+                    w, h, static_cast<unsigned>(rr2));
         err = "staging Map failed";
         return 0;
     }
@@ -335,6 +342,16 @@ int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixels(mcdr_object* texture, int32_t* 
             bpp = 4;
             fbFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
             break;
+    }
+    // P235：1 字节格式（R8_*）在原实现里落进 default 分支（bpp=4 + RGBA8 足迹），
+    // 拷贝足迹与源格式不兼容 ⇒ CopyTextureRegion 判非法 ⇒ 设备被移除 ⇒ staging 的
+    // Map 失败（2026-10-25 SRI 自检实测）。只给 R8 家族开一条专用分支：
+    // bpp=1、足迹格式 = 源格式。其余格式保持原有映射不动 —— 改成"一律用源格式"
+    // 会让 compute 自检的 RGBA8 读回变成全 0（同一实测轮次），原因未查明，不冒险。
+    if (td.Format == DXGI_FORMAT_R8_UNORM || td.Format == DXGI_FORMAT_R8_UINT
+        || td.Format == DXGI_FORMAT_R8_SNORM || td.Format == DXGI_FORMAT_R8_SINT) {
+        bpp = 1;
+        fbFmt = td.Format;
     }
     std::string err;
     if (!readbackSamples36(r, w, h, bpp, fbFmt, D3D12_RESOURCE_STATE_COMMON, out, err)) {

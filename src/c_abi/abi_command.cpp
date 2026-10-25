@@ -408,4 +408,25 @@ int32_t MCDR_CALL mcdr_dx12AsyncSendCommandsReady(mcdr_command_ctx* ctx) {
 
 void MCDR_CALL mcdr_dx12ClearAsyncRenderCtx(void) { d3d12_mc::clearAsyncRenderCtx(); }
 
+// P234：compute 派发。返回码 1/0/-2 由 native 决定（-2 = 没有打开的命令列表）。
+int32_t MCDR_CALL mcdr_dx12DispatchCompute(mcdr_command_ctx* ctx, mcdr_object* pipeline,
+                                           mcdr_object* uavTexture, const int32_t* constants,
+                                           int32_t constantCount, int32_t x, int32_t y, int32_t z) {
+    return d3d12_mc::dispatchCompute(ctx, pipeline, uavTexture, constants, constantCount, x, y, z);
+}
+
+
+// P235：着色率图像的派发与绑定（1=成功 0=参数/设备问题 -1=坏句柄 -2=列表没开）。
+int32_t MCDR_CALL mcdr_dx12DispatchComputeShadingRate(mcdr_command_ctx* ctx, mcdr_object* pipeline,
+                                                      mcdr_object* srvDepth, mcdr_object* srvMotion,
+                                                      mcdr_object* image, const int32_t* constants,
+                                                      int32_t constantCount, int32_t x, int32_t y,
+                                                      int32_t z) {
+    return d3d12_mc::dispatchComputeShadingRate(ctx, pipeline, srvDepth, srvMotion, image, constants,
+                                                constantCount, x, y, z);
+}
+
+int32_t MCDR_CALL mcdr_dx12SetShadingRateImage(mcdr_command_ctx* ctx, mcdr_object* image) {
+    return d3d12_mc::setShadingRateImage(ctx, image);
+}
 }  // extern "C"

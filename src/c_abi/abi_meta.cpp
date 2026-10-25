@@ -244,6 +244,24 @@ int32_t MCDR_CALL mcdrSetShadingRate(int32_t rate) {
     return d3d12_mc::setShadingRate(rate);
 }
 
+int32_t MCDR_CALL mcdr_dx12SetShadingRateNow(mcdr_command_ctx* ctx, int32_t rate) {
+    // P231. The per-draw policy brackets the draw batches that may be shaded coarsely with this
+    // call and restores 1X1 afterwards, so the coarse rate never reaches the sky, particles or the
+    // GUI. Legal mid-"pass": this module's beginRenderPass is only OMSetRenderTargets, never
+    // ID3D12GraphicsCommandList4::BeginRenderPass.
+    // Returns 1=issued, 0=the device cannot honour it (tier 0 / missing additional rates) or the
+    // list is not an ID3D12GraphicsCommandList5, -1=unknown rate, -2=ctx null or no open list.
+    return d3d12_mc::setShadingRateNow(ctx, rate);
+}
+
+int32_t MCDR_CALL mcdr_dx12SetShadingRateCombiners(int32_t first, int32_t second) {
+    // P231. Stage 0 combines the per-draw rate with the per-primitive rate (SV_ShadingRate),
+    // stage 1 with the shading-rate image. Defaults stay {PASSTHROUGH, PASSTHROUGH} until the mesh
+    // shader writes SV_ShadingRate: under MIN a per-primitive 1X1 would undo every requested 2X2.
+    // Returns 1=stored, -1=a value outside 0..4.
+    return d3d12_mc::setShadingRateCombiners(first, second);
+}
+
 int32_t MCDR_CALL mcdrSetAntiAliasing(int32_t mode) {
     // P104/P108/P152. mode mirrors the Java-side option: **0=OFF 1=SMAA 2=TAA 3=DLAA**. SMAA
     // (three passes glued in place) and TAA (P152: a native resolve with an RGBA16F history

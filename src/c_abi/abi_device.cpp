@@ -126,6 +126,34 @@ mcdr_object* MCDR_CALL mcdr_dx12CreateTextureView(mcdr_object* texture, int32_t 
 
 void MCDR_CALL mcdr_dx12DestroyResource(mcdr_object* object) { d3d12_mc::destroyObject(object); }
 
+mcdr_object* MCDR_CALL mcdr_dx12CreateComputePipeline(const void* dxil, int32_t dxilSize) {
+    const auto r = d3d12_mc::createComputePipeline(dxil, dxilSize);
+    if (!r) {
+        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateComputePipeline",
+                                                            r.error().message);
+    }
+    return static_cast<d3d12_mc::Dx12Object*>(*r);
+}
+
+
+// P235：着色率图像的 compute PSO（2×SRV + 1×UAV）与图像本身。
+mcdr_object* MCDR_CALL mcdr_dx12CreateComputePipelineShadingRate(const void* dxil, int32_t dxilSize) {
+    const auto r = d3d12_mc::createComputePipelineShadingRate(dxil, dxilSize);
+    if (!r) {
+        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateComputePipelineShadingRate",
+                                                             r.error().message);
+    }
+    return static_cast<d3d12_mc::Dx12Object*>(*r);
+}
+
+mcdr_object* MCDR_CALL mcdr_dx12CreateShadingRateImage(int32_t width, int32_t height) {
+    const auto r = d3d12_mc::createShadingRateImage(width, height);
+    if (!r) {
+        return mcdr::abi::failWithPtr<d3d12_mc::Dx12Object>("mcdr_dx12CreateShadingRateImage",
+                                                             r.error().message);
+    }
+    return static_cast<d3d12_mc::Dx12Object*>(*r);
+}
 void* MCDR_CALL mcdr_dx12MapBuffer(mcdr_object* buffer, int64_t offset, int64_t length, int32_t read,
                                    int32_t write, int64_t* outLength) {
     // The mapped range is always the caller-requested length; report it back so

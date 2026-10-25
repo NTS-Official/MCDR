@@ -351,6 +351,28 @@ MCDR_API int32_t MCDR_CALL mcdrStopPixTimingCapture(void);
 // list, with a WARN naming the reason.
 MCDR_API int32_t MCDR_CALL mcdrSetShadingRate(int32_t rate);
 
+// P231: the **scoped** shading-rate control point. `rate` is one of the seven raw
+// D3D12_SHADING_RATE values (0x0/0x1/0x4/0x5/0x6/0x9/0xA; -1 is *not* accepted here) and is
+// issued as `RSSetShadingRate` on `ctx`'s currently open command list, right now. Unlike
+// mcdrSetShadingRate it neither reads nor writes the stored player setting: the caller brackets
+// exactly the draws that may be shaded coarsely and restores 1X1 afterwards, which is what makes
+// the coarse rate stop at the terrain instead of also hitting the sky, particles and the GUI
+// (P232). Because this module never uses ID3D12GraphicsCommandList4::BeginRenderPass — a "pass"
+// here is just OMSetRenderTargets — the call is legal in the middle of one.
+// Returns 1 = issued, 0 = this device cannot honour the rate (VRS tier 0, or 2X4/4X2/4X4 without
+// AdditionalShadingRatesSupported) or the list has no ID3D12GraphicsCommandList5, -1 = unknown
+// rate value, -2 = ctx is null or has no open command list (caller bug; WARN once).
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetShadingRateNow(mcdr_command_ctx* ctx, int32_t rate);
+
+// P231: the two shading-rate combiners used by every RSSetShadingRate this module issues. Both
+// take a D3D12_SHADING_RATE_COMBINER value (PASSTHROUGH=0 OVERRIDE=1 MIN=2 MAX=3 SUM=4). Stage 0
+// combines the per-draw rate with the per-primitive rate (a mesh shader's SV_ShadingRate output),
+// stage 1 combines that result with the shading-rate image (tier 2). The defaults are
+// {PASSTHROUGH, PASSTHROUGH}; the per-draw policy keeps stage 0 at PASSTHROUGH until the mesh
+// shader actually writes SV_ShadingRate, because a per-primitive rate of 1X1 under MIN would
+// undo every 2X2 the policy asks for. Returns 1 = stored, -1 = a value outside 0..4.
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetShadingRateCombiners(int32_t first, int32_t second);
+
 // Anti-aliasing mode, same numbering as the Java-side option
 // (**0=OFF, 1=SMAA, 2=TAA, 3=DLAA**). SMAA runs as three full-screen passes
 // (edge detection, blend weights, neighbourhood blending) over the world layer, right
@@ -872,6 +894,35 @@ MCDR_API mcdr_pipeline* MCDR_CALL mcdr_dx12CreateGraphicsPipeline(const mcdr_pip
 MCDR_API void MCDR_CALL mcdr_dx12DestroyPipeline(mcdr_pipeline* pipeline);
 
 // ---------------------------------------------------------------------------
+// Compute (P234: 最小通路 —— 着色率图像 / NRC 的硬前置)
+//
+// 本模块没有 D3D12_COMMAND_LIST_TYPE_COMPUTE：compute 走普通的 DIRECT 列表
+// （SetPipelineState(compute PSO) + SetComputeRootSignature + Dispatch），
+// 这也是"同一条列表里既录制图形又录制 compute"的前提。
+//
+// 根签名是固定的：
+//   [0] descriptor table (1×UAV, u0) —— 目标纹理，创建时必须带 usage 位 32
+//       （ALLOW_UNORDERED_ACCESS）。**必须是描述符表**：root descriptor 的 UAV 只
+//       支持 raw / structured buffer，typed UAV（RWTexture2D / R8_UINT 的 SRI）
+//       挂 root UAV 会让 CreateComputePipelineState 返回 E_INVALIDARG（实测）。
+//       描述符堆由模块自己懒建（64 槽 ring），调用方不用也拿不到堆。
+//   [1] root constants   (b0) —— 至多 8 个 int32
+// 因此调用方只需要「DXIL 字节码」和「一张带 UAV 位的纹理」两样东西；将来接 SRI 时
+// 换成 R8_UINT 纹理即可，签名不用动。
+// ---------------------------------------------------------------------------
+
+// 从 DXIL 建 compute PSO。DXIL 由 mcdr_dx12CompileShaderDxc(..., "cs_6_x", ...) 产出
+// （cs_6_8 起支持 Wave 内在函数；本机实测 6.9 可用）。失败返回 NULL，原因见 mcdrLastError()。
+MCDR_API mcdr_object* MCDR_CALL mcdr_dx12CreateComputePipeline(const void* dxil, int32_t dxilSize);
+
+// 在已打开的命令列表上派发一次。内部把目标纹理 COMMON → UNORDERED_ACCESS、
+// Dispatch、再转回 COMMON（跨列表的后续拷贝因此仍按 COMMON 处理）。
+// 返回 1=已派发 0=参数或资源状态不对（会写一条 ERROR 说明是哪一条） -2=没有打开的命令列表。
+MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchCompute(mcdr_command_ctx* ctx, mcdr_object* pipeline,
+                                                     mcdr_object* uavTexture, const int32_t* constants,
+                                                     int32_t constantCount, int32_t x, int32_t y, int32_t z);
+
+// ---------------------------------------------------------------------------
 // Mesh shaders (P72: amplification/mesh pipeline + HLSL->DXIL compilation)
 //
 // Mesh shaders are unreachable through D3DCompile (SM 5.1 ceiling), so the
@@ -1126,9 +1177,33 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12AsyncFenceRegisterCallback(mcdr_fence_mgr* m
                                                                mcdr_fence_callback_fn cb, int64_t userHandle,
                                                                int64_t timeoutMs);
 
+// ---------------------------------------------------------------------------
+// P235：着色率图像（tier 2 SRI）
+//
+// compute 读上一帧深度（t0）与上一帧速度（t1），写一张 R8_UINT 的 tile 表（u0）：
+// 每个 texel 管一整块 tile，值是 D3D12_SHADING_RATE_* 的枚举（0=1X1 … 0xA=4X4）。
+// 图像尺寸是 **tile 数**（宽高各自 ceil(pixel / tile)），tile 边长看设备能力
+// （NVIDIA 16、AMD 8）。
+// ---------------------------------------------------------------------------
+MCDR_API mcdr_object* MCDR_CALL mcdr_dx12CreateComputePipelineShadingRate(const void* dxil,
+                                                                         int32_t dxilSize);
+MCDR_API mcdr_object* MCDR_CALL mcdr_dx12CreateShadingRateImage(int32_t width, int32_t height);
+
+// 在已打开的命令列表上生成一次。srvDepth/srvMotion 是 TextureView 句柄
+// （mcdr_dx12CreateTextureView 的产物），image 是上面那张图像。
+// 返回 1=已派发 0=参数或资源不对 -2=没有打开的命令列表。
+MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchComputeShadingRate(
+    mcdr_command_ctx* ctx, mcdr_object* pipeline, mcdr_object* srvDepth, mcdr_object* srvMotion,
+    mcdr_object* image, const int32_t* constants, int32_t constantCount, int32_t x, int32_t y,
+    int32_t z);
+
+// 把图像挂到列表的 SRI 槽位（image 传 NULL 摘掉）。内部把图像从 COMMON 转到
+// SHADING_RATE_SOURCE；返回 1=已绑定 0=列表不是 ID3D12GraphicsCommandList5 -1=不是纹理
+// -2=没有打开的命令列表。
+MCDR_API int32_t MCDR_CALL mcdr_dx12SetShadingRateImage(mcdr_command_ctx* ctx, mcdr_object* image);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
 
 #endif // MCDR_ABI_H
-
