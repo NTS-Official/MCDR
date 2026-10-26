@@ -55,7 +55,16 @@ extern "C" {
 //      mcdr_dx12QueryDlss 三个 FFM 绑定（签名见 mcdr_abi.h 与 P108 报告）；
 //   2. MCDR_Layout.kt 登记 MCDR_DLSS_INPUT 并加 EXPECTED_C_SIZES 行（C sizeof = 112）；
 //   3. 完成 1、2 之后把这里改成 2u，并同步 MCDR_ABI.kt 的 MCDR_ABI_VERSION = 2。
-#define MCDR_ABI_VERSION 2u
+//
+// v2 -> v3（P271，超分抽象层）：
+//   - 新增 mcdr_sr_caps（sizeof = 80 / align = 4）与 mcdr_sr_dispatch（sizeof = 128 /
+//     align = 8）两张表，以及 8 个 mcdr_dx12Sr* 入口（声明见本文件 P271 段）。
+//   - 老导出一个都没删、一个签名都没改；DLSS 的既有路径原样保留，SrEvaluate 在 v1 里
+//     就是把载荷翻译成 mcdr_dlss_input 后转发给同一条实现。
+//   - **必须同一次改齐**：MCDR_ABI.kt 的 MCDR_ABI_VERSION = 3、两张表的 FFM 镜像、
+//     MCDR_Layout.kt 的 SR_CAPS / SR_DISPATCH 与 EXPECTED_C_SIZES 行、以及
+//     abi_meta.cpp 的 layoutTable()（那边少一个字段，Kotlin 的 verify() 会直接 abort）。
+#define MCDR_ABI_VERSION 3u
 
 // The same value at runtime, so a stale Java-side constant cannot be optimised
 // away and a mismatched pair fails at load time rather than at first draw.
@@ -275,6 +284,13 @@ MCDR_API void MCDR_CALL mcdrSetLogLevel(int32_t level);
 // 1 (default) keeps them visible at any log level; 0 makes them plain INFO (filtered by the level).
 // Config: `[logging] shutdownTrace`.
 MCDR_API void MCDR_CALL mcdrSetShutdownTraceAlways(int32_t always);
+
+// 把每条 native 日志同时镜像到该文件（配置项 `[logging] nativeLogFile`；用户 m03308 之前这条
+// 配置只写在 toml 里、没有任何代码读它 —— 它的作用是让"用户端拿不到 native 行"这件事不再发生）。
+// `utf8Path` 为 UTF-8 路径，相对路径按进程工作目录（游戏目录）解析，追加写、逐行 flush。
+// 传 NULL 或空串 = 关闭镜像并释放已打开的句柄。
+// 返回 1=已配置 0=已关闭（能否真的落盘要到下一次写日志时才知道，这里不做同步 open）。
+MCDR_API int32_t MCDR_CALL mcdrSetLogFile(const char* utf8Path);
 
 /// Set (or, with a null/empty value, clear) one process-wide environment variable from the
 /// Java-side configuration, so the handful of native switches that are still read with
@@ -609,6 +625,142 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12QueryDlss(char* note, int32_t noteCap);
 // Idempotent; safe before the device exists. Returns 1 when the directory was accepted and
 // the search path widened, 0 when the input was rejected or empty.
 MCDR_API int32_t MCDR_CALL mcdr_dx12SetDlssVendorDir(const char* utf8Dir);
+
+// ---------------------------------------------------------------------------
+// P271：超分（Super Resolution）抽象层的 v3 契约
+// ---------------------------------------------------------------------------
+// 为什么不复用 mcdr_dlss_input：那张表的布局（sizeof=112）被 MCDR_Layout.kt 与
+// _port\abi_check.py 钉住，而且它的语义只服务 DLSS 一家。SR 层要同时容纳
+// DLSS（Streamline）/ FSR（ffx_api）/ XeSS，因此把「渲染尺寸 + 显示尺寸 + jitter +
+// MV 尺度 + 相机参数 + 若干可选资源」收敛成一张与厂商无关的载荷，厂商差异下沉到
+// native 的 Provider（方案见仓库根 sr_plan.md 的 P272）。**纯追加**：老导出一个字节
+// 都没动，P271 期间新入口的行为与老路径等价（DLSS 转发，FSR/XeSS 如实报不可用）。
+//
+// 调用时序（与既有 DLSS 路径同点：世界层画完、GUI 之前，命令列表开着）：
+//   mcdr_dx12SrPick()      记录期望后端（只记录，不重建；重建发生在下一帧帧首）
+//   mcdr_dx12SrQueryCaps() 查询某后端在本机的能力面（可在无命令列表时调用）
+//   mcdr_dx12SrCreate()    建/唤醒后端（要求命令列表开着，与 mcdr_dx12CreateDlssFeature 同）
+//   mcdr_dx12SrResize()    渲染/显示尺寸变化时通知
+//   mcdr_dx12SrEvaluate()  逐帧提交
+//   mcdr_dx12SrJitter()    该后端偏好的亚像素 jitter（0 = 无意见，沿用 D3D12Temporal）
+//   mcdr_dx12SrDestroy()   释放（帧首、无打开命令列表时才可调用）
+//   mcdr_dx12SrQuery()     一行可用性文本（日志与 UI）
+//
+// 资源指针一律是 **JVM 创建的纹理句柄**（Dx12Object*，即 D3D12GpuTexture.handle() 的值），
+// 不是 ID3D12Resource*：实现单元自建的纹理会掉出模块的 resourceState 表（P108 控制组实测
+// 读回全 0），解包只在模块侧做（P108 的 mv->GetDesc() 空 vtable 就是这么崩的）。
+// 传 0 表示「这张资源没有」。
+
+#define MCDR_SR_BACKEND_NONE 0
+#define MCDR_SR_BACKEND_DLSS 1
+#define MCDR_SR_BACKEND_FSR 2
+#define MCDR_SR_BACKEND_XESS 3
+
+// mcdr_sr_caps.takesMasks / mcdr_sr_dispatch 的掩码能力位。三家语义不同（SL 的
+// kBufferTypeReactiveMaskHint、FFX 的 reactive/transparencyAndComposition、XeSS 的
+// responsive pixel mask），这里是并集，具体怎么喂由 Provider 决定。
+#define MCDR_SR_MASK_REACTIVE 1
+#define MCDR_SR_MASK_RESPONSIVE 2
+
+// 后端能力面。sizeof = 80、align = 4。Kotlin 侧镜像见 MCDR_Layout.kt 的 SR_CAPS。
+// note 是给 UI 与日志的短原因（UTF-8，NUL 结尾），不是给机器判断的。
+typedef struct mcdr_sr_caps {
+    int32_t backend;         // 0  = MCDR_SR_BACKEND_*
+    int32_t available;       // 4  1 = 本机此刻可用
+    int32_t coupledDenoise;  // 8  1 = 该后端自带降噪（DLSS-D / FSR4 ML）
+    int32_t needsExposure;   // 12 1 = 需要曝光纹理
+    int32_t takesMasks;      // 16 MCDR_SR_MASK_* 位集
+    int32_t externalHeap;    // 20 1 = 接受调用方提供的临时堆
+    int32_t jitterPhaseCount;// 24 0 = 无意见（沿用 D3D12Temporal 的 8）
+    int32_t minRenderWidth;  // 28
+    int32_t minRenderHeight; // 32
+    int32_t maxRenderWidth;  // 36
+    int32_t maxRenderHeight; // 40
+    int32_t nativeAA;        // 44 1 = 允许 1.0x（DLAA 式）
+    int32_t reserved;        // 48 保留，必须为 0（给后续 flags 留位，不动 sizeof）
+    char note[28];           // 52 短原因，NUL 结尾（52 + 28 = 80）
+} mcdr_sr_caps;
+
+// 与厂商无关的每帧载荷。sizeof = 136、align = 8（六个指针在 72..119，正好落在 8 边界）。
+// Kotlin 侧镜像见 MCDR_Layout.kt 的 SR_DISPATCH。
+//
+// 约定（与 mcdr_dlss_input 一致，别改）：渲染尺寸是**渲染目标**尺寸，显示尺寸是**窗口**尺寸；
+// jitter 是**渲染空间像素**、不归一化、不取负；motionVectorScale 在「MV 已是像素位移」时给 1.0。
+// P275：`cameraAspectRatio` / `viewSpaceToMetersFactor` 是**可选**字段 —— 0 一律表示"未填"，
+// 后端按各自的安全默认处理（aspect = displayWidth/displayHeight、meters = 1.0）。
+// `cameraVerticalFov` 就是 FSR 的 `cameraFovAngleVertical`（弧度），DLSS 侧走 `mcdr_dlss_constants`
+// 的同义字段，两处必须同源（都取自 `GameRenderer.getFov` 的实际值，不要用视场设置的标称值）。
+typedef struct mcdr_sr_dispatch {
+    int32_t renderWidth;          // 0
+    int32_t renderHeight;         // 4
+    int32_t displayWidth;         // 8
+    int32_t displayHeight;        // 12
+    float jitterOffsetX;          // 16
+    float jitterOffsetY;          // 20
+    float motionVectorScaleX;     // 24
+    float motionVectorScaleY;     // 28
+    float preExposure;            // 32
+    float frameTimeDeltaMs;       // 36
+    float cameraNear;             // 40
+    float cameraFar;              // 44
+    float cameraVerticalFov;      // 48 弧度
+    float sharpness;              // 52 0 = 不锐化
+    int32_t reset;                // 56 1 = 丢弃历史
+    int32_t hdrInput;             // 60 1 = 输入是 HDR 线性色
+    int32_t backend;              // 64 MCDR_SR_BACKEND_*（0 = 用 SrPick 选的那个）
+    int32_t flags;                // 68 保留，必须为 0
+    void* pColorInput;            // 72 渲染尺寸颜色
+    void* pColorOutput;           // 80 显示尺寸颜色（UAV 写）
+    void* pDepth;                 // 88 渲染尺寸深度
+    void* pMotionVectors;         // 96 渲染尺寸 RG16F
+    void* pReactiveMask;          // 104 R8，可 0
+    void* pExposure;              // 112 R32F，可 0
+    int32_t depthFormatOrdinal;   // 120 与 mcdr_dlss_input 的同名字段同义
+    float cameraAspectRatio;      // 124 P275：显示尺寸的宽高比（FSR 可选、DLSS 常量里有同义字段）
+    float viewSpaceToMetersFactor;// 128 P275：1.0 = 一个世界单位算 1 米；0 = 未填（后端按 1.0 处理）
+    int32_t _pad2;                // 132（补到 136 = align 8 的整数倍）
+} mcdr_sr_dispatch;
+
+// 记录期望后端。纯记录：不建、不销毁、不重建（重建在下一帧帧首，见 P280）。
+// 返回 1 = 已记录，0 = 后端编号未知，-1 = 参数非法。Never throws.
+MCDR_API int32_t MCDR_CALL mcdr_dx12SrPick(int32_t backend);
+
+// 查询后端能力面。out 必须非空；*out 会被整体覆盖（先清零再填）。
+// 返回 1 = 已填（available 字段才是结论），-1 = 参数非法（含 backend 越界）。
+MCDR_API int32_t MCDR_CALL mcdr_dx12SrQueryCaps(int32_t backend, mcdr_sr_caps* out);
+
+// 建/唤醒后端。与 mcdr_dx12CreateDlssFeature 同点调用：必须在命令列表打开时。
+// maxRenderWidth/Height 是**上界**（热切换与 resize 时用来判要不要重建），displayWidth/Height
+// 是本帧的窗口尺寸。返回 1 = 就绪（可以接着 Evaluate），0 = 本机不可用（已 log 一次），
+// -1 = 参数非法。
+MCDR_API int32_t MCDR_CALL mcdr_dx12SrCreate(mcdr_command_ctx* ctx, int32_t backend,
+                                              int32_t maxRenderWidth, int32_t maxRenderHeight,
+                                              int32_t displayWidth, int32_t displayHeight);
+
+// 尺寸变化通知。返回 1 = 已接受，0 = 后端未就绪（忽略），-1 = 参数非法。
+MCDR_API int32_t MCDR_CALL mcdr_dx12SrResize(mcdr_command_ctx* ctx, int32_t renderWidth,
+                                              int32_t renderHeight, int32_t displayWidth,
+                                              int32_t displayHeight);
+
+// 逐帧提交。返回 1 = 已执行，0 = 跳过（后端未就绪 / 本帧不适用），-1 = 参数非法。
+MCDR_API int32_t MCDR_CALL mcdr_dx12SrEvaluate(mcdr_command_ctx* ctx, const mcdr_sr_dispatch* desc);
+
+// 该后端偏好的亚像素 jitter。返回 1 = 已写 outX/outY，0 = 无意见（沿用 D3D12Temporal 的
+// Halton(2,3)，这时 outX/outY 不被修改），-1 = 参数非法。
+MCDR_API int32_t MCDR_CALL mcdr_dx12SrJitter(int32_t frameIndex, float* outX, float* outY);
+
+// P274：该后端期望的 jitter 相位长度（0 = 不适用）。参数非法返回 -1。
+// DLSS / XeSS 报 8；FSR 报 `8 * (displayWidth / renderWidth)^2` 并夹到 [1, 256]
+// （P277 接了真后端之后改用 `ffxQueryDescUpscaleGetJitterPhaseCount` 问运行库）。
+MCDR_API int32_t MCDR_CALL mcdr_dx12SrJitterPhaseCount(int32_t backend, int32_t renderWidth,
+                                                      int32_t displayWidth);
+
+// 释放后端资源。只允许在没有打开命令列表时调用（帧首）；重复调用安全。
+MCDR_API void MCDR_CALL mcdr_dx12SrDestroy(void);
+
+// 一行可用性文本：当前/期望后端、各自 available、最近一次失败原因。
+// 返回 1 = 已写（buf 为 NUL 结尾），0 = 没有内容，-1 = 参数非法。
+MCDR_API int32_t MCDR_CALL mcdr_dx12SrQuery(char* note, int32_t noteCap);
 
 // ---------------------------------------------------------------------------
 // P112：DLSS 的每帧相机常量（Streamline 的 sl::Constants 逐字段对应；
@@ -1015,6 +1167,12 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12GetHdrAppliedMode(void);
 // P117: 光追可见性分层总开关（0=off, 1=ao, 2=ao_shadows, 3=full）；不支持的设备上记下但不生效。
 MCDR_API void MCDR_CALL mcdr_dx12SetRaytracingMode(int32_t mode);
 
+// P251（交换链建链选项，下次建链时生效）：
+//   allowTearing       0 = 不建 ALLOW_TEARING 的链（强制 DWM 合成翻页），非 0 = 允许（默认）。
+//                      某些覆盖层（RTSS/Afterburner 的 OSD）只在合成翻页下画得出来。
+//   forcePresentChild  非 0 = 优先把链建在自建呈现子窗口上（P196 之前的默认），0 = 默认（顶层窗口）。
+MCDR_API void MCDR_CALL mcdr_dx12SetSwapchainOptions(int32_t allowTearing, int32_t forcePresentChild);
+
 MCDR_API void MCDR_CALL mcdr_dx12DestroySurface(mcdr_surface* surface);
 MCDR_API mcdr_surface* MCDR_CALL mcdr_dx12GetActiveSurfaceHandle(void);
 
@@ -1189,13 +1347,34 @@ MCDR_API mcdr_object* MCDR_CALL mcdr_dx12CreateComputePipelineShadingRate(const 
                                                                          int32_t dxilSize);
 MCDR_API mcdr_object* MCDR_CALL mcdr_dx12CreateShadingRateImage(int32_t width, int32_t height);
 
-// 在已打开的命令列表上生成一次。srvDepth/srvMotion 是 TextureView 句柄
-// （mcdr_dx12CreateTextureView 的产物），image 是上面那张图像。
+// 在已打开的命令列表上生成一次。srvDepth/srvMotion/srvPrevious 是 TextureView 句柄
+// （mcdr_dx12CreateTextureView 的产物）：t0 深度、t1 速度、t2 上一帧的着色率图像
+// （P236 时间钳制用，读不到历史时可传同一张或任意有效视图，并在 constants 里关掉钳制）。
+// image 是要写的那张图像。
 // 返回 1=已派发 0=参数或资源不对 -2=没有打开的命令列表。
 MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchComputeShadingRate(
     mcdr_command_ctx* ctx, mcdr_object* pipeline, mcdr_object* srvDepth, mcdr_object* srvMotion,
-    mcdr_object* image, const int32_t* constants, int32_t constantCount, int32_t x, int32_t y,
-    int32_t z);
+    mcdr_object* srvPrevious, mcdr_object* image, const int32_t* constants, int32_t constantCount,
+    int32_t x, int32_t y, int32_t z);
+
+// ---------------------------------------------------------------------------
+// P276：通用 compute 纹理 pass（3×SRV t0/t1/t2 + 1×UAV u0 + b0 的 8 个 int）
+//
+// 根签名与 P235 的着色率图像那条**完全相同**，只是用途从"算 SRI 图像"泛化成
+// "读几张纹理、写一张纹理"。所以实现直接复用那两个函数，这里只给一对不带
+// "ShadingRate" 字样的名字 —— 否则以后读掩码的代码会写成
+// `dispatchComputeShadingRate(..., mask, ...)`，对不上号。
+//
+// image 必须带 usage 位 32（ALLOW_UNORDERED_ACCESS），否则返回 0。
+// srv0/srv1/srv2 必须是带 CPU 描述符句柄的 TextureView；用不到的槽传同一张有效视图
+// （着色器不读即可）—— 三张都必须有，这是固定根签名。
+// ---------------------------------------------------------------------------
+MCDR_API mcdr_object* MCDR_CALL mcdr_dx12CreateComputePipelineTexture3(const void* dxil,
+                                                                     int32_t dxilSize);
+MCDR_API int32_t MCDR_CALL mcdr_dx12DispatchComputeTexture3(
+    mcdr_command_ctx* ctx, mcdr_object* pipeline, mcdr_object* srv0, mcdr_object* srv1,
+    mcdr_object* srv2, mcdr_object* image, const int32_t* constants, int32_t constantCount,
+    int32_t x, int32_t y, int32_t z);
 
 // 把图像挂到列表的 SRI 槽位（image 传 NULL 摘掉）。内部把图像从 COMMON 转到
 // SHADING_RATE_SOURCE；返回 1=已绑定 0=列表不是 ID3D12GraphicsCommandList5 -1=不是纹理

@@ -417,13 +417,24 @@ int32_t MCDR_CALL mcdr_dx12DispatchCompute(mcdr_command_ctx* ctx, mcdr_object* p
 
 
 // P235：着色率图像的派发与绑定（1=成功 0=参数/设备问题 -1=坏句柄 -2=列表没开）。
+// P276：通用 compute 纹理 pass 的派发（转发给 SRI 那条实现，根签名相同）。
+int32_t MCDR_CALL mcdr_dx12DispatchComputeTexture3(mcdr_command_ctx* ctx, mcdr_object* pipeline,
+                                              mcdr_object* srv0, mcdr_object* srv1,
+                                              mcdr_object* srv2, mcdr_object* image,
+                                              const int32_t* constants, int32_t constantCount,
+                                              int32_t x, int32_t y, int32_t z) {
+    return d3d12_mc::dispatchComputeShadingRate(ctx, pipeline, srv0, srv1, srv2, image, constants,
+                                                constantCount, x, y, z);
+}
+
 int32_t MCDR_CALL mcdr_dx12DispatchComputeShadingRate(mcdr_command_ctx* ctx, mcdr_object* pipeline,
                                                       mcdr_object* srvDepth, mcdr_object* srvMotion,
+                                                      mcdr_object* srvPrevious,
                                                       mcdr_object* image, const int32_t* constants,
                                                       int32_t constantCount, int32_t x, int32_t y,
                                                       int32_t z) {
-    return d3d12_mc::dispatchComputeShadingRate(ctx, pipeline, srvDepth, srvMotion, image, constants,
-                                                constantCount, x, y, z);
+    return d3d12_mc::dispatchComputeShadingRate(ctx, pipeline, srvDepth, srvMotion, srvPrevious,
+                                                image, constants, constantCount, x, y, z);
 }
 
 int32_t MCDR_CALL mcdr_dx12SetShadingRateImage(mcdr_command_ctx* ctx, mcdr_object* image) {

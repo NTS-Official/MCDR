@@ -114,6 +114,18 @@
     <ClInclude Include="include\mcdr_dlss_impl.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="include\mcdr_hdr_state.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="include\mcdr_rt_state.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="include\mcdr_surface_opts_state.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="include\mcdr_window_host.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\module\c_abi\mcdr_abi_common.cppm">
@@ -170,6 +182,9 @@
     <ClCompile Include="src\c_abi\abi_async.cpp">
       <Filter>源文件\C ABI</Filter>
     </ClCompile>
+    <ClCompile Include="src\c_abi\abi_sr.cpp">
+      <Filter>源文件\C ABI</Filter>
+    </ClCompile>
     <ClCompile Include="src\core\dllmain.cpp">
       <Filter>源文件\Core</Filter>
     </ClCompile>
@@ -180,6 +195,15 @@
       <Filter>源文件\Core</Filter>
     </ClCompile>
     <ClCompile Include="src\core\d3d12_surface.cpp">
+      <Filter>源文件\Core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\d3d12_sr.cpp">
+      <Filter>源文件\Core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\d3d12_fsr.cpp">
+      <Filter>源文件\Core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\d3d12_xess.cpp">
       <Filter>源文件\Core</Filter>
     </ClCompile>
     <ClCompile Include="src\core\d3d12_async_descriptor.cpp">
@@ -202,6 +226,15 @@
     </ClCompile>
     <ClCompile Include="src\core\d3d12_hdr_state.cpp">
       <Filter>源文件\Core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\d3d12_rt_state.cpp">
+      <Filter>源文件\Advanced</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\d3d12_surface_opts_state.cpp">
+      <Filter>源文件\Core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\d3d12_window_host.cpp">
+      <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

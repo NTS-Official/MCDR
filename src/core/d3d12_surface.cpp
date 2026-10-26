@@ -3,7 +3,11 @@ module;
 #include "_d3d12_module_prelude.h"
 #include "mcdr_dlss_impl.h"  // P113：mcdr_reflex_before_present
 #include "mcdr_hdr_state.h"  // P197：HDR 模式/激活状态（surface 与 DLSS 两个 TU 共享）
+#include "mcdr_surface_opts_state.h"  // P251：allowTearing / presentChild（配置推来）
+#include "mcdr_window_host.h"  // P267: SeamlessWindowHost
 #include <algorithm>          // P197：std::clamp
+#include <cwctype>            // P252：towlower（模块名小写化）
+#include <tlhelp32.h>         // P252：Module32First / 进程模块快照
 
 module mcdr.d3d12.device;
 
@@ -65,62 +69,30 @@ PFN_DCompositionCreateDevice resolveDCompCreateDevice() {
     return fn;
 }
 
-// P112 阶段 0：swapchain 的 DXGI 工厂是否走 Streamline interposer。
-// SL 通过包装 DXGI 工厂来接管 swapchain 创建（sl.dlss 插件要靠它把 present 链挂上）；
-// 默认关，只有 MCDR_STREAMLINE=1 时才尝试，任何一步失败都回退原生 CreateDXGIFactory1，
-// 因此默认路径与改动前完全等价。
-typedef HRESULT(WINAPI* PFN_SL_CreateDXGIFactory1)(REFIID, void**);
+// P248/P249：DXGI 工厂统一走原生 CreateDXGIFactory1，**再**把它升级成 SL 的代理工厂。
+// 从 P248 起 slInit 置了 `sl::PreferenceFlags::eUseDXGIFactoryProxy`（见 d3d12_device.cpp）：
+// 这个模式下 SL 不改写工厂/交换链的 v-table，而是要求调用方拿着它给的代理工厂建链
+// （ProgrammingGuideManualHooking.md:190-207；sl_core_api.h:265-275 要求接口创建后**立刻**
+// 升级）。因此这里不能再 LoadLibrary sl.interposer.dll 取它的 CreateDXGIFactory1 —— 那正是
+// 被这个 flag 取代的 v-table 集成方式，会让 Present 槽解析到 sl.interposer.dll，注入式
+// overlay（RTSS/Afterburner）挂不上 OSD。
+//
+// 曾经漏掉「升级」这一步的后果（P249 用户 m03032 报「开了帧生成但没生效」）：链是纯原生的，
+// SL 的 slHookPresent/CreateSwapChainForHwnd 钩子虽然装上了却一次都触发不到 ——
+// `slDLSSGSetOptions` 返回 eOk、`slDLSSGGetState` 也 Ok，但 numFramesActuallyPresented 恒 0，
+// 且 sl.log 报 `Streamline presentCommon() was not observed`。
 
-bool streamlineInterposerRequested() {
-    // P118：统一由 DLSS 实现单元决策（默认 Streamline，缺运行库自动回退 NGX）。
-    return mcdr_dlss_streamline_requested() != 0;
-}
-
-// MCDR.dll 所在目录（带结尾反斜杠）—— 运行时 DLL 与 MCDR.dll 同目录。
-std::wstring ownModuleDirectory() {
-    HMODULE mod = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCWSTR>(&ownModuleDirectory), &mod)) {
-        return {};
-    }
-    wchar_t path[MAX_PATH] = {};
-    if (!GetModuleFileNameW(mod, path, MAX_PATH)) return {};
-    std::wstring s(path);
-    const auto slash = s.find_last_of(L"\\/");
-    return slash == std::wstring::npos ? std::wstring() : s.substr(0, slash + 1);
-}
-
-bool createFactoryViaStreamline(REFIID riid, void** out) {
-    if (!streamlineInterposerRequested() || out == nullptr) return false;
-    static const PFN_SL_CreateDXGIFactory1 fn = []() -> PFN_SL_CreateDXGIFactory1 {
-        const std::wstring dir = ownModuleDirectory();
-        if (dir.empty()) return nullptr;
-        HMODULE mod = LoadLibraryW((dir + L"sl.interposer.dll").c_str());
-        if (mod == nullptr) return nullptr;
-        return reinterpret_cast<PFN_SL_CreateDXGIFactory1>(
-            GetProcAddress(mod, "CreateDXGIFactory1"));
-    }();
-    if (fn == nullptr) {
-        dbgLogWarn("P112 SL: sl.interposer.dll / CreateDXGIFactory1 unavailable; native factory");
-        return false;
-    }
-    const HRESULT slHr = fn(riid, out);
-    if (FAILED(slHr)) {
-        dbgLogWarn("P112 SL: interposer CreateDXGIFactory1 %s; native factory", hrText(slHr).c_str());
-        return false;
-    }
-    return true;
-}
-
-// 统一工厂入口：MCDR_STREAMLINE=1 且 interposer 可用时用它，否则原生。
+// 统一工厂入口：原生创建 + 立刻升级成代理（SL 未启用时升级是空操作）。
 template <typename T>
 HRESULT createDxgiFactory(ComPtr<T>& factory) {
-    if (createFactoryViaStreamline(__uuidof(T),
-                                   reinterpret_cast<void**>(factory.GetAddressOf()))) {
-        return S_OK;
+    const HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) return hr;
+    void* raw = factory.Get();
+    if (mcdr_sl_upgrade_interface(&raw) != 0 && raw != nullptr) {
+        // 成功时是 replace in place：原生那一个引用已经变成代理的引用，Attach 不 AddRef。
+        factory.Attach(static_cast<T*>(raw));
     }
-    return CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    return hr;
 }
 
 // 解绑/绑定 composition visual 的内容。DirectComposition 会持有 swapchain 的
@@ -333,6 +305,36 @@ void resizePresentationWindow(HWND child, UINT width, UINT height) {
 //   2) 全部被拒时回退 CreateSwapChainForComposition + DirectComposition（不绑定 HWND）。
 // reuse 非空且已是 composition 模式时直接复用其 composition 对象重建——对同一 HWND
 // 重复 CreateTargetForHwnd 会返回 DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED。
+// P252：把进程里所有 d3d12* / dxgi / RTSS / SL / nvngx 模块连同基址打出来。
+// RTSS 的 FnOffsetCache（Profiles\Config 的 [FnOffsetCache64]）是按 "D3D12Core.DLL 的偏移"
+// 解析 ID3D12CommandQueue::ExecuteCommandLists 的；进程里若同时存在 inbox core
+// （system32\d3d12core.dll，10.0.26100.x）和 Agility core（dxrmc\D3D12Core.dll，1.619.x），
+// 它可能把 hook 挂到没在用的那个上 —— OSD 于是整体失效。dev（OSD 正常）与用户 Prism
+// 实例（OSD 不来）各跑一次，对比这几行就能定案。
+static void logOverlayModules(const char* tag) {
+    const HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, ::GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    if (::Module32FirstW(snap, &me) != 0) {
+        do {
+            std::wstring lower(me.szModule);
+            for (auto& c : lower) c = static_cast<wchar_t>(::towlower(c));
+            if (lower.find(L"d3d12") == std::wstring::npos &&
+                lower.find(L"dxgi") == std::wstring::npos &&
+                lower.find(L"rtss") == std::wstring::npos &&
+                lower.find(L"interposer") == std::wstring::npos &&
+                lower.find(L"nvngx") == std::wstring::npos) {
+                continue;
+            }
+            dbgLog("%s module %ls base=%p size=%lu path=%ls", tag, me.szModule,
+                   reinterpret_cast<void*>(me.modBaseAddr), static_cast<unsigned long>(me.modBaseSize),
+                   me.szExePath);
+        } while (::Module32NextW(snap, &me) != 0);
+    }
+    ::CloseHandle(snap);
+}
+
 // RTSS/Afterburner 等 overlay 通过改写交换链 vtable 的 Present 槽（索引 8）来挂 OSD。
 // 该槽若仍解析到 system32\dxgi.dll，说明本进程这条交换链根本没被 hook —— 这是
 // "RTSS OSD 不显示" 的决定性证据；若解析到 RTSSHooks64.dll，说明 hook 生效，问题在别处。
@@ -356,6 +358,23 @@ static void logSwapChainPresentHook(IDXGISwapChain* sc) {
     dbgLog("swapchain Present slot=%p owner=%ls bytes=%02X %02X %02X %02X",
            present, sv.empty() ? L"(unknown)" : std::wstring(sv).c_str(),
            b[0], b[1], b[2], b[3]);
+
+    // P250：把「RTSS 到底注入没注入这个进程」和「链长什么样」一起记下来，否则
+    // "owner=dxgi.dll" 既可能是没注入、也可能是注入了但没挂到这条链上，分不开。
+    const HMODULE rtssHooks = ::GetModuleHandleW(L"RTSSHooks64.dll");
+    const HMODULE rtssLoader = ::GetModuleHandleW(L"RTSSHooksLoader64.dll");
+    DXGI_SWAP_CHAIN_DESC desc{};
+    const bool haveDesc = SUCCEEDED(sc->GetDesc(&desc));
+    dbgLog("P250 overlay probe: RTSSHooks64=%p RTSSHooksLoader64=%p desc.ok=%d OutputWindow=%p "
+           "Format=%d BufferCount=%u SwapEffect=%d Windowed=%d Refresh=%u/%u",
+           reinterpret_cast<void*>(rtssHooks), reinterpret_cast<void*>(rtssLoader), haveDesc ? 1 : 0,
+           haveDesc ? reinterpret_cast<void*>(desc.OutputWindow) : nullptr,
+           haveDesc ? static_cast<int>(desc.BufferDesc.Format) : -1,
+           haveDesc ? desc.BufferCount : 0u, haveDesc ? static_cast<int>(desc.SwapEffect) : -1,
+           haveDesc ? (desc.Windowed ? 1 : 0) : -1,
+           haveDesc ? desc.BufferDesc.RefreshRate.Numerator : 0u,
+           haveDesc ? desc.BufferDesc.RefreshRate.Denominator : 0u);
+    logOverlayModules("P252");
 }
 
 // P197：查某显示器的「SDR 白」亮度（nits）。DXGI_OUTPUT_DESC1 里没有这个值 ——
@@ -506,6 +525,12 @@ mcdr::Result<void> createSwapChainForWindow(IDXGIFactory4* factory, ID3D12Comman
                 pumpWindowMessages(pass * 60);
             }
             for (const auto& tier : kTiers) {
+                // P251：配置关掉 tearing 时跳过第一档，链只能进 DWM 合成翻页
+                // （RTSS/Afterburner 的 OSD 只在合成翻页下画得出来）。
+                if ((tier.flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0 &&
+                    mcdr_surface_opts_allow_tearing() == 0) {
+                    continue;
+                }
                 sd.SwapEffect = tier.effect;
                 sd.Flags = tier.flags;
                 HRESULT hr =
@@ -649,58 +674,48 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
     // 窗口时，DXGI 才可能进入真独占全屏 —— 子窗口永远只是父窗口里的一个子表面，
     // SetFullscreenState 会失败或把界面变成弹窗式（见 createSwapChainForWindow 注释）。
     // 呈现子窗口因此降级为回退：顶层窗口建链失败时才创建它再试一次。
+    // P267 SeamlessWindowHost: the chain lives on a child window we create ourselves that has
+    // never been touched by GL (1:1 with the parent client area, hidden until the first Present).
+    MCDR_WindowHost* host = nullptr;
     HWND presentChild = nullptr;
-
-    SwapChainBundle bundle;
-    auto swapChainRes = createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, nullptr, initW,
-                                                 initH, nullptr, bundle, chainFormat);
-    if (!swapChainRes && win != nullptr) {
-        dbgLog("createSurface: chain on game window failed (%s); retrying with presentation child",
-               swapChainRes.error().message.c_str());
-        presentChild = createPresentationWindow(win, initW, initH);
-        if (presentChild != nullptr) {
-            dbgLogDebug("createSurface: presentation child hwnd=%p (%ux%u)",
-                        reinterpret_cast<void*>(presentChild), initW, initH);
-            swapChainRes = createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, presentChild,
-                                                    initW, initH, nullptr, bundle, chainFormat);
+    if (win != nullptr && mcdr_surface_opts_force_present_child() != 0) {
+        host = mcdr_host_create(win, static_cast<int32_t>(initW), static_cast<int32_t>(initH));
+        if (host != nullptr) {
+            presentChild = reinterpret_cast<HWND>(mcdr_host_child(host));
+            dbgLogInfo("[P267] seamless host child=%p (%ux%u) parent=%p",
+                       reinterpret_cast<void*>(presentChild), initW, initH,
+                       reinterpret_cast<void*>(win));
+            // 子窗口要等第一帧 Present 才显示，这段窗口期里 SDL 的客户区从未被绘制过
+            // （默认白面）。先把父窗口刷黑，用户看到的就是"黑幕 -> 内容"，而不是白闪。
+            paintWindowBlack(win);
         } else {
-            dbgLog("createSurface: presentation child window creation failed (err=%lu)",
-                   static_cast<unsigned long>(GetLastError()));
+            dbgLogWarn("[P267] seamless host creation failed (err=%lu); using top-level window",
+                       static_cast<unsigned long>(GetLastError()));
         }
     }
-    if (!swapChainRes) {
-        // 打印调试层消息辅助诊断
-        if (ctx.infoQueue) {
-            UINT64 n = ctx.infoQueue->GetNumStoredMessages();
-            for (UINT64 i = 0; i < n && i < 20; ++i) {
-                SIZE_T len = 0;
-                if (FAILED(ctx.infoQueue->GetMessage(static_cast<UINT>(i), nullptr, &len))) continue;
-                std::vector<char> buf(len > 0 ? len : 1);
-                D3D12_MESSAGE* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
-                if (SUCCEEDED(ctx.infoQueue->GetMessage(static_cast<UINT>(i), msg, &len))) {
-                    const int sevInt = static_cast<int>(msg->Severity);
-                    if (sevInt <= static_cast<int>(D3D12_MESSAGE_SEVERITY_ERROR)) {
-                        dbgLogError("InfoQueue[%u] %s", static_cast<unsigned>(i),
-                                    msg->pDescription ? msg->pDescription : "");
-                    } else if (sevInt == static_cast<int>(D3D12_MESSAGE_SEVERITY_WARNING)) {
-                        dbgLogWarn("InfoQueue[%u] %s", static_cast<unsigned>(i),
-                                   msg->pDescription ? msg->pDescription : "");
-                    } else {
-                        dbgLogInfo("InfoQueue[%u] %s", static_cast<unsigned>(i),
-                                   msg->pDescription ? msg->pDescription : "");
-                    }
-                }
-            }
-            ctx.infoQueue->ClearStoredMessages();
-        }
-        return mcdr::err("createSurface", swapChainRes.error().message);
+
+    // Physical isolation: unbind the current GL context while DXGI creates the chain so the
+    // HWND it receives has never been used with OpenGL.
+    const bool glWasSuspended = mcdr_host_suspend_gl() != 0;
+    SwapChainBundle bundle;
+    auto swapChainRes = createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, presentChild,
+                                                initW, initH, nullptr, bundle, chainFormat);
+    if (!swapChainRes && presentChild != nullptr) {
+        dbgLog("createSurface: chain on seamless host failed (%s); retrying on game window",
+               swapChainRes.error().message.c_str());
+        mcdr_host_release(host);
+        host = nullptr;
+        presentChild = nullptr;
+        swapChainRes = createSwapChainForWindow(factory.Get(), ctx.queue.Get(), win, nullptr, initW,
+                                                initH, nullptr, bundle, chainFormat);
     }
+    if (glWasSuspended) mcdr_host_restore_gl();
     if (bundle.composition && presentChild != nullptr) {
-        // 走了 DirectComposition 回退：画面由 visual 合成到主窗口，呈现子窗口只会
-        // 盖住它，直接销毁并回落到"无子窗口"的旧行为。
-        dbgLogInfo("createSurface: composition fallback -> destroying presentation child");
-        paintParentBlackBeforeDestroy(presentChild);
-        DestroyWindow(presentChild);
+        // DirectComposition fallback: the visual composites onto the main window and a child
+        // window on top would hide it. Release the host and keep the legacy path.
+        dbgLogInfo("createSurface: composition fallback -> releasing seamless host");
+        mcdr_host_release(host);
+        host = nullptr;
         presentChild = nullptr;
     }
     ComPtr<IDXGISwapChain1> swapChain1 = bundle.swapChain;
@@ -733,7 +748,8 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
 
     Dx12Surface* s = new Dx12Surface();
     s->hwnd = hwnd;
-    s->presentWindow = presentChild;  // 非空 = swapchain 建在自建子窗口上（HWND 路径）
+    s->presentWindow = presentChild;
+    s->host = host;  // 非空 = swapchain 建在自建子窗口上（HWND 路径）
     s->swapChain = swapChain3;
     s->compositionMode = bundle.composition;
     s->dcompDevice = bundle.dcompDevice;
@@ -778,6 +794,12 @@ mcdr::Result<void> setExclusiveFullscreen(Dx12Surface* s, bool on) {
     if (s->compositionMode) {
         return mcdr::err("setExclusiveFullscreen",
                          "composition swap chain cannot enter exclusive fullscreen");
+    }
+    if (s->host != nullptr) {
+        // P267: the chain hangs off a child window; only a top-level swap chain can take the
+        // output. Exclusive fullscreen therefore needs the host to go away first (next step).
+        return mcdr::err("setExclusiveFullscreen",
+                         "exclusive fullscreen needs a top-level swap chain (seamless host active)");
     }
     const BOOL want = on ? TRUE : FALSE;
     const HRESULT hr = s->swapChain->SetFullscreenState(want, nullptr);
@@ -853,7 +875,13 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
     }
     s->presentMode = presentMode;
     // 呈现子窗口跟随客户区尺寸（它是 swapchain 的实际宿主窗口）。
-    resizePresentationWindow(s->presentWindow, static_cast<UINT>(width), static_cast<UINT>(height));
+    // P267: keep the seamless host child 1:1 with the client area (WM_SIZE already did it
+    // once, this covers the configureSurface path).
+    if (s->host != nullptr) {
+        mcdr_host_resize(static_cast<MCDR_WindowHost*>(s->host), width, height);
+    } else {
+        resizePresentationWindow(s->presentWindow, static_cast<UINT>(width), static_cast<UINT>(height));
+    }
 
     // 新尺寸与当前 swapchain 一致时，无需 ResizeBuffers（避免已重建的 swapchain
     // 被错误尺寸锁死后再调 ResizeBuffers 仍报 INVALID_CALL）。
@@ -1625,6 +1653,39 @@ void presentSurface(Dx12Surface* s) {
     // P113：Reflex 要求 Present 之前 sleep（文档 ProgrammingGuideReflex.md §5）。
     mcdr_reflex_before_present();
     HRESULT hr = s->swapChain->Present(syncInterval, flags);
+    // P267: only now that a real frame reached the screen do we show the child window that
+    // carries it -- this is what keeps the startup from flashing an unpainted white/black face.
+    if (s->host != nullptr && SUCCEEDED(hr) && !s->hostRevealed) {
+        s->hostRevealed = true;
+        mcdr_host_reveal(static_cast<MCDR_WindowHost*>(s->host));
+        dbgLogInfo("[P267] seamless host revealed (first successful present)");
+    }
+    // P252：建链时记过一次 Present 槽，但 RTSS 也可能是链建立之后才把 hook 挂上/替换掉。
+    // 在稳定出帧后（#1 / #120 / #600）再各记一次，dev 与用户环境可逐帧对比。
+    {
+        static std::atomic<int> p252PresentCounter{0};
+        const int seen = p252PresentCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (seen == 1 || seen == 120 || seen == 600) {
+            void** p252vtbl = *reinterpret_cast<void***>(s->swapChain.Get());
+            if (p252vtbl != nullptr && p252vtbl[8] != nullptr) {
+                HMODULE p252owner = nullptr;
+                ::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                     reinterpret_cast<LPCWSTR>(p252vtbl[8]), &p252owner);
+                std::wstring p252path(MAX_PATH, L'\0');
+                const DWORD p252n =
+                    p252owner != nullptr ? ::GetModuleFileNameW(p252owner, p252path.data(), MAX_PATH) : 0;
+                p252path.resize(p252n);
+                std::wstring_view p252sv(p252path);
+                const size_t p252slash = p252sv.find_last_of(L"\\/");
+                if (p252slash != std::wstring_view::npos) p252sv.remove_prefix(p252slash + 1);
+                const auto* p252bytes = reinterpret_cast<const unsigned char*>(p252vtbl[8]);
+                dbgLogInfo("P252 present #%d slot=%p owner=%ls bytes=%02X %02X %02X %02X", seen, p252vtbl[8],
+                           p252sv.empty() ? L"(unknown)" : std::wstring(p252sv).c_str(), p252bytes[0],
+                           p252bytes[1], p252bytes[2], p252bytes[3]);
+            }
+        }
+    }
     mcdr_reflex_after_present();  // P115：PCL 的 ePresentEnd 标记
     // present 后 backbuffer 所有权已释放（vanilla 每帧 acquire->blit->present，
     // 若此处不重置，configureSurface 的 ResizeBuffers 会误以为仍有 acquired
@@ -1686,7 +1747,9 @@ void destroySurface(Dx12Surface* s) {
     // P96/P183：先立刻把父窗口刷黑 —— 退出时窗口消失前会短暂露出父窗口客户区，
     // 早一步上色就少一帧灰/白幕；刷黑只动 GDI，不依赖下面的 fence 等待。
     HWND presentChild = s->presentWindow;
-    paintParentBlackBeforeDestroy(presentChild);
+    MCDR_WindowHost* const surfaceHost = static_cast<MCDR_WindowHost*>(s->host);
+    s->host = nullptr;
+    if (surfaceHost == nullptr) paintParentBlackBeforeDestroy(presentChild);
     dbgLogProgress("[P184] destroySurface stage: parent painted");
     // P33 fix：等待 per-surface present fence，确保 Display Controller 已完成
     // flip 并释放 backbuffer 引用。IMMEDIATE 模式 + FLIP_DISCARD 下，deviceWaitIdle
@@ -1728,7 +1791,11 @@ void destroySurface(Dx12Surface* s) {
     // P96：父窗口早在上面的 fence 等待之前就刷黑了（P183），这里只补日志与销毁子窗口。
     logWindowState("destroySurface child(before)", presentChild);
     logWindowState("destroySurface parent(before)", presentChild ? GetParent(presentChild) : nullptr);
-    if (presentChild != nullptr) DestroyWindow(presentChild);
+    if (surfaceHost != nullptr) {
+        mcdr_host_release(surfaceHost);  // 最后一个引用时恢复父窗口过程并销毁子窗口
+    } else if (presentChild != nullptr) {
+        DestroyWindow(presentChild);
+    }
     logWindowState("destroySurface parent(after)", presentChild ? GetParent(presentChild) : nullptr);
     dbgLogDebug("destroySurface: done surface=%p", reinterpret_cast<void*>(s));
 }
@@ -1739,12 +1806,18 @@ void destroySurfaceNoWaitIdle(Dx12Surface* s) {
     if (getActiveSurface() == s) setActiveSurface(nullptr);
     HWND presentChild = s->presentWindow;
     s->presentWindow = nullptr;
+    MCDR_WindowHost* const surfaceHost = static_cast<MCDR_WindowHost*>(s->host);
+    s->host = nullptr;
     dbgLogProgress("[P184] destroySurface stage: deleting surface");
     delete s;
     dbgLogProgress("[P184] destroySurface stage: surface deleted");
     // P96：同 destroySurface —— 先刷黑父窗口再销毁子窗口（见该处说明）。
-    paintParentBlackBeforeDestroy(presentChild);
-    if (presentChild != nullptr) DestroyWindow(presentChild);
+    if (surfaceHost != nullptr) {
+        mcdr_host_release(surfaceHost);
+    } else {
+        paintParentBlackBeforeDestroy(presentChild);
+        if (presentChild != nullptr) DestroyWindow(presentChild);
+    }
 }
 
 // P6 诊断：读回 back buffer 采样像素。内部先等 GPU 完全空闲（同步一帧），

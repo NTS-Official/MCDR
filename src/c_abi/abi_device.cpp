@@ -137,6 +137,11 @@ mcdr_object* MCDR_CALL mcdr_dx12CreateComputePipeline(const void* dxil, int32_t 
 
 
 // P235：着色率图像的 compute PSO（2×SRV + 1×UAV）与图像本身。
+// P276：与下面同一个根签名，名字不带 ShadingRate（直接转发）。
+mcdr_object* MCDR_CALL mcdr_dx12CreateComputePipelineTexture3(const void* dxil, int32_t dxilSize) {
+    return mcdr_dx12CreateComputePipelineShadingRate(dxil, dxilSize);
+}
+
 mcdr_object* MCDR_CALL mcdr_dx12CreateComputePipelineShadingRate(const void* dxil, int32_t dxilSize) {
     const auto r = d3d12_mc::createComputePipelineShadingRate(dxil, dxilSize);
     if (!r) {

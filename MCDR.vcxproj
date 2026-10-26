@@ -114,7 +114,7 @@
              <DelayLoadDLLs>NRC_D3D12.dll</DelayLoadDLLs>  (+ delayimp.lib)
            so the import becomes lazy and a missing DLL surfaces as a
            feature-unavailable error instead of MCDR.dll failing to load. -->
-      <AdditionalIncludeDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\fidelityfx\include;$(ProjectDir)external\streamline\include;$(ProjectDir)external\nrc\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\xess\inc\xess;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include\dx12;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\upscalers\include;$(ProjectDir)external\fidelityfx\include;$(ProjectDir)external\streamline\include;$(ProjectDir)external\nrc\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <!-- These sources have Chinese comments; without /utf-8 the compiler
            reads them under the active code page and mangles them. -->
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -215,8 +215,12 @@
          exported from a C++ module, and the Kotlin side must keep including it. -->
     <ClInclude Include="include\mcdr_abi.h" />
     <ClInclude Include="include\mcdr_dlss_impl.h" />
+    <ClInclude Include="include\mcdr_hdr_state.h" />
     <ClInclude Include="include\mcdr_rtx_support.h" />
+    <ClInclude Include="include\mcdr_rt_state.h" />
     <ClInclude Include="include\mcdr_smaa_luts.h" />
+    <ClInclude Include="include\mcdr_surface_opts_state.h" />
+    <ClInclude Include="include\mcdr_window_host.h" />
     <ClInclude Include="include\_d3d12_module_prelude.h" />
     <!-- Shared prelude for the module interface units below. Every .cppm #includes
          this in its global module fragment (NOMINMAX + windows/d3d12/dxgi/dcomp +
@@ -229,6 +233,7 @@
          are likewise detected as implementation units of mcdr.abi.common even
          though they keep the .cpp extension.) -->
     <ClCompile Include="src\advanced\smaa_luts.cpp" />
+    <ClCompile Include="src\core\d3d12_window_host.cpp" />
     <ClCompile Include="src\module\c_abi\mcdr_abi_common.cppm" />
     <!-- 叶子模块：Error / Result<T>，不 import 任何 mcdr.* 模块 -->
     <ClCompile Include="src\module\core\mcdr_error.cppm" />
@@ -255,15 +260,27 @@
     <ClCompile Include="src\c_abi\abi_mesh.cpp" />
     <ClCompile Include="src\c_abi\abi_surface.cpp" />
     <ClCompile Include="src\c_abi\abi_async.cpp" />
+    <!-- P271：超分抽象层的 C ABI 外壳（8 个 mcdr_dx12Sr* 入口）。纯追加单元，
+         不碰老路径；P272 之后厂商逻辑才会从这一层下沉到 Provider。 -->
+    <ClCompile Include="src\c_abi\abi_sr.cpp" />
     <!-- DLL 入口点：普通 TU（不属于任何命名模块），见文件内注释 -->
     <ClCompile Include="src\core\dllmain.cpp" />
     <ClCompile Include="src\core\d3d12_descriptor_allocator.cpp" />
     <ClCompile Include="src\core\d3d12_device.cpp" />
     <ClCompile Include="src\core\d3d12_surface.cpp" />
+    <!-- P272：超分 Provider 接口层（能力表 + DLSS provider + 注册表）。与 d3d12_device.cpp
+         同属模块 mcdr.d3d12.device 的实现单元，所以不需要额外设置。 -->
+    <ClCompile Include="src\core\d3d12_sr.cpp" />
+    <ClCompile Include="src\core\d3d12_fsr.cpp" />
+    <ClCompile Include="src\core\d3d12_xess.cpp" />
+    <!-- P267：SeamlessWindowHost（呈现子窗口 + GL 隔离），普通 TU -->
+    <ClCompile Include="src\core\d3d12_window_host.cpp" />
     <!-- P197：HDR 状态单元。普通 TU（surface 是模块单元、DLSS 是普通 TU，
          模块 purview 里的定义无法被普通 TU 链接，故状态单拎出来）。 -->
     <ClCompile Include="src\core\d3d12_hdr_state.cpp" />
     <ClCompile Include="src\core\d3d12_rt_state.cpp" />
+    <!-- P251：交换链建链选项（allowTearing / presentChild）状态单元，同为普通 TU。 -->
+    <ClCompile Include="src\core\d3d12_surface_opts_state.cpp" />
     <ClCompile Include="src\core\d3d12_async_descriptor.cpp" />
     <ClCompile Include="src\core\d3d12_async_fence.cpp" />
     <ClCompile Include="src\advanced\d3d12_rtx_probe.cpp" />

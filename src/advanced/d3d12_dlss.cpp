@@ -187,6 +187,11 @@ namespace
     // -----------------------------------------------------------------------
     // State. One process-wide DLSS instance (the device is a singleton too).
     // -----------------------------------------------------------------------
+    // P291f（用户 m03752）：每一档名义上的上采样倍数（target/render）。NGX 的动态分辨率区间是
+    // [target/nominal, target]；render 比 target/nominal 还小时，NGXDLAA::EvaluateFeature 只写一行
+    // 「Dynamic scaling error ... outside of Min ... Max」然后交出一张空纹理 —— 表现是世界全黑、
+    // GUI 正常（Illusion\run\dxrmc\sl.log 里 2289 行都是这句：render 844x440 vs Min 1280x667）。
+    static const double kTierNominalFactor[5] = {3.0, 2.0, 1.72, 1.5, 1.0};
     struct State
     {
         bool initAttempted = false;   // NGX init was tried (success or not)
@@ -205,6 +210,7 @@ namespace
         // only exists so the status query and the log lines can report it.
         bool enabled = false;
         uint64_t submitCount = 0;     // successful Evaluate calls
+        bool tooSmallWarned = false;
         ID3D12Device* device = nullptr;
         NVSDK_NGX_Parameter* params = nullptr;
         NVSDK_NGX_Handle* feature = nullptr;
@@ -988,6 +994,37 @@ namespace
         return fn;
     }
 
+    // P249：把原生 DXGI 工厂原地升级成 SL 的代理工厂（`eUseDXGIFactoryProxy` 模式下建
+    // swapchain 的唯一正确入口，语义见 mcdr_dlss_impl.h 的声明处与 sl_core_api.h:265-275）。
+    // 未走 streamline / interposer 不在 / 还没 slInit 时返回 0，调用方继续用原生工厂。
+    int32_t streamlineUpgradeInterface(void** baseInterface) {
+        if (baseInterface == nullptr || *baseInterface == nullptr) return 0;
+        // PFun_slUpgradeInterface 在 SDK 里是**函数类型**别名（sl_core_api.h:66），要用指针。
+        using PFn_Upgrade = sl::Result (*)(void**);
+        static PFn_Upgrade const fn = []() -> PFn_Upgrade {
+            const std::wstring dir = dlssModuleDirectory();
+            if (dir.empty()) return nullptr;
+            HMODULE sl = ::LoadLibraryW((dir + L"sl.interposer.dll").c_str());
+            if (sl == nullptr) return nullptr;
+            return reinterpret_cast<PFn_Upgrade>(::GetProcAddress(sl, "slUpgradeInterface"));
+        }();
+        if (fn == nullptr) return 0;
+        // 未 slInit 时 SL 只会回 eErrorInitNotCalled，不必自己判断初始化状态。
+        void* const native = *baseInterface;
+        void* upgraded = native;
+        if (fn(&upgraded) != sl::Result::eOk || upgraded == nullptr) {
+            *baseInterface = native;  // 失败时把原生指针原样放回去
+            return 0;
+        }
+        // 文档是 replace in place：成功时调用方手里那一个引用直接变成代理的引用
+        // （所以这里既不 Release 也不 AddRef，所有权由调用方转移）。
+        *baseInterface = upgraded;
+        return upgraded != native ? 1 : 0;
+    }
+
+    // P291n（用户 m04823）：Streamline 路径的档位解析（定义在 chooseQuality 之后）。
+    uint32_t resolveQualityValue(const mcdr_dlss_input& in);
+
     // 把本帧几何 + 质量档写进 SL 的 DLSS 选项；失败时告警。
     int32_t streamlineApplyOptions(const mcdr_dlss_input& in) {
         const PFn_SlDLSSSetOptions fn = slDlssSetOptionsFn();
@@ -997,6 +1034,10 @@ namespace
             case NVSDK_NGX_PerfQuality_Value_DLAA:       opt.mode = sl::DLSSMode::eDLAA; break;
             case NVSDK_NGX_PerfQuality_Value_MaxQuality: opt.mode = sl::DLSSMode::eMaxQuality; break;
             case NVSDK_NGX_PerfQuality_Value_Balanced:   opt.mode = sl::DLSSMode::eBalanced; break;
+            // P291（用户 m03752）：极致性能 = 3x。它原先落进 default 被当成 MaxPerformance（2x），
+            // Streamline 于是按 2x 规划特征，我们却喂 3x 的输入 —— 评价结果全黑（只有 GUI 正常），
+            // 而 50% / 58% / 67% 恰好都与 default 的 eMaxPerformance 或已有分支吻合，所以只有这一档坏。
+            case NVSDK_NGX_PerfQuality_Value_UltraPerformance: opt.mode = sl::DLSSMode::eUltraPerformance; break;
             default:                                     opt.mode = sl::DLSSMode::eMaxPerformance; break;
         }
         opt.outputWidth = static_cast<uint32_t>(in.targetWidth);
@@ -1236,6 +1277,80 @@ namespace
         return best;
     }
 
+    // P291n（用户 m04823「dlss选项下面写着 dlss not initialized yet」的连带发现）：
+    // Streamline 模式下 NGX 由 SL 拥有，`s.initOk` 恒为 false，于是 `mcdr_dlss_create` 在
+    // 走到 `ensureFeature` 之前就返回了 —— 档位解析（含 P291f 的两道守卫）从来没执行过，
+    // `s.qualityValue` 一直是它的初值 0。而 NGX 的 0 就是 MaxPerf（2x）：UI 说"极致性能"、
+    // 交给 SL 的是 2x、我们喂 3x 的输入 → NGX 每帧 `Dynamic scaling error` + 空纹理 = 黑屏。
+    // 这里把档位解析抽成两条路径共用的函数；返回 NGX 的 PerfQualityValue。
+    uint32_t resolveQualityValue(const mcdr_dlss_input& in) {
+        static const uint32_t kTierToNgxShared[5] = {
+            static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_UltraPerformance),
+            static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_MaxPerf),
+            static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_Balanced),
+            static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_MaxQuality),
+            static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_DLAA),
+        };
+        int resolvedTier = s.requestedQuality;  // -1 = 未指定：按比例挑
+        if (resolvedTier == 4 &&
+            (in.renderWidth != in.targetWidth || in.renderHeight != in.targetHeight)) {
+            resolvedTier = 2;  // DLAA 只在 1:1 有意义
+        }
+        if (resolvedTier < 0 && in.renderWidth > 0 && in.targetWidth > 0) {
+            // 没有显式档位时按实际比例挑最接近的一档（Streamline 路径拿不到 NGX 参数表，
+            // 所以用名义倍率表，而不是 NGX_DLSS_GET_OPTIMAL_SETTINGS）。
+            const double factor = static_cast<double>(in.targetWidth) / static_cast<double>(in.renderWidth);
+            double bestErr = 1e9;
+            for (int32_t t = 0; t <= 4; ++t) {
+                const double err = std::abs(kTierNominalFactor[t] - factor);
+                if (err < bestErr) { bestErr = err; resolvedTier = t; }
+            }
+        }
+        if (resolvedTier >= 0 && resolvedTier <= 4 && in.renderWidth > 0 && in.targetWidth > 0) {
+            const double factor = static_cast<double>(in.targetWidth) / static_cast<double>(in.renderWidth);
+            const double nominal = kTierNominalFactor[resolvedTier];
+            // P291f：显式档位与实际比例差超过 10% 时，以实际比例为准改判到能覆盖它的最紧一档。
+            if (s.requestedQuality >= 0 && factor > nominal * 1.10) {
+                int32_t adopted = resolvedTier;
+                for (int32_t t = 0; t <= 4; ++t) {
+                    if (kTierNominalFactor[t] >= factor) { adopted = t; break; }
+                }
+                if (adopted != resolvedTier) {
+                    if (!s.tooSmallWarned) {
+                        s.tooSmallWarned = true;
+                        logError("P291n: tier %d (%.2fx nominal) cannot describe render %dx%d -> target %dx%d (%.2fx); asking for tier %d instead",
+                                 resolvedTier, nominal, in.renderWidth, in.renderHeight,
+                                 in.targetWidth, in.targetHeight, factor, adopted);
+                    }
+                    resolvedTier = adopted;
+                }
+            }
+            // P291f 尺寸守卫：render 小于该档名义输入时 NGX 只报一行 dynamic scaling error 并交出空纹理。
+            const uint32_t needW = static_cast<uint32_t>(std::ceil(static_cast<double>(in.targetWidth) / kTierNominalFactor[resolvedTier]));
+            const uint32_t needH = static_cast<uint32_t>(std::ceil(static_cast<double>(in.targetHeight) / kTierNominalFactor[resolvedTier]));
+            const auto tooSmall = [](uint32_t have, uint32_t need) {
+                return static_cast<double>(have) < static_cast<double>(need) * 0.995;
+            };
+            if (tooSmall(static_cast<uint32_t>(in.renderWidth), needW) ||
+                tooSmall(static_cast<uint32_t>(in.renderHeight), needH)) {
+                if (!s.tooSmallWarned) {
+                    s.tooSmallWarned = true;
+                    logError("P291f: render %ux%u is smaller than tier %d nominal input (%ux%u at %.2fx) — NGX answers with a dynamic scaling error and an empty texture, i.e. a black world with a working GUI; raise the render scale",
+                             in.renderWidth, in.renderHeight, resolvedTier, needW, needH,
+                             kTierNominalFactor[resolvedTier]);
+                }
+            } else {
+                s.tooSmallWarned = false;
+            }
+            s.qualityValue = kTierToNgxShared[resolvedTier];
+            s.qualityIsExplicit = (s.requestedQuality >= 0);
+            return s.qualityValue;
+        }
+        s.qualityValue = static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_MaxQuality);
+        s.qualityIsExplicit = false;
+        return s.qualityValue;
+    }
+
     void destroyFeature() {
         if (s.feature != nullptr) {
             const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_ReleaseFeature(s.feature);
@@ -1299,6 +1414,56 @@ namespace
                         in.renderWidth, in.renderHeight, in.targetWidth, in.targetHeight);
             }
         }
+        // P291f：显式挡位与实际比例差得太远时（超过 10%），以实际比例为准重选一档 ——
+        // 实测用户那次 NGX 是按 MaxPerf（min 1280x667）评价的，而 UI 说的是极致性能（3.0x），
+        // 844x440 两边都不满足，于是每帧只拿到一张空纹理。这里把"挡位说不出的比例"改判到
+        // 能覆盖它的最紧一档；10% 的门槛保证只在挡位明显错配时动手（33% vs 3.0x 只差 1.1%，
+        // 交给下面的尺寸守卫）。
+        if (resolvedTier >= 0 && resolvedTier <= 4 && in.renderWidth > 0 && in.targetWidth > 0) {
+            const double factor = static_cast<double>(in.targetWidth) / static_cast<double>(in.renderWidth);
+            const double nominal = kTierNominalFactor[resolvedTier];
+            if (factor > nominal * 1.10) {
+                int32_t adopted = resolvedTier;
+                for (int32_t t = 0; t <= 4; ++t) {
+                    if (kTierNominalFactor[t] >= factor) {
+                        adopted = t;
+                        break;
+                    }
+                }
+                if (adopted != resolvedTier) {
+                    logWarn("P291f: tier %d (%.2fx nominal) cannot describe render %dx%d -> target %dx%d "
+                            "(%.2fx); asking NGX for tier %d instead",
+                            resolvedTier, nominal, in.renderWidth, in.renderHeight, in.targetWidth,
+                            in.targetHeight, factor, adopted);
+                    resolvedTier = adopted;
+                }
+            }
+        }
+        // P291f（用户 m03752）：render 比该档名义输入还小时，NGX 只报一行「Dynamic scaling error ...
+        // outside of Min ... Max」然后交出一张空纹理 —— 世界全黑、GUI 正常。JVM 已经把极致性能档
+        // 从 33% 改成 34%，这里留一条守卫：同类配置错误必须在日志里一眼可见，而不是又变成一块黑屏。
+        if (in.renderWidth > 0 && in.targetWidth > 0 && resolvedTier >= 0 && resolvedTier <= 4) {
+            const double nominal = kTierNominalFactor[resolvedTier];
+            const uint32_t needW = static_cast<uint32_t>(std::ceil(static_cast<double>(in.targetWidth) / nominal));
+            const uint32_t needH = static_cast<uint32_t>(std::ceil(static_cast<double>(in.targetHeight) / nominal));
+            // 0.5% 容差：实测 33%（844 vs 需要 854，差 1.1%）会被 NGX 拒绝并给出黑屏，
+            // 而 58%（1484 vs 需要 1489，差 0.34%）一直正常 —— 阈值落在两者之间。
+            const auto tooSmall = [](uint32_t have, uint32_t need) {
+                return static_cast<double>(have) < static_cast<double>(need) * 0.995;
+            };
+            if (tooSmall(static_cast<uint32_t>(in.renderWidth), needW) ||
+                tooSmall(static_cast<uint32_t>(in.renderHeight), needH)) {
+                if (!s.tooSmallWarned) {
+                    s.tooSmallWarned = true;
+                    logError("P291f: render %ux%u is smaller than tier %d nominal input (%ux%u at %.2fx) — "
+                             "NGX answers with a dynamic scaling error and an empty texture, i.e. a black "
+                             "world with a working GUI; raise the render scale",
+                             in.renderWidth, in.renderHeight, resolvedTier, needW, needH, nominal);
+                }
+            } else {
+                s.tooSmallWarned = false;
+            }
+        }
         const bool qualityChanged =
             (resolvedTier >= 0) && (resolvedTier != s.effectiveQuality);
         // P108ac (user m08033): the render preset (the DLSS "model") is a CreateFeature input as
@@ -1335,7 +1500,8 @@ namespace
             // P112 (2026-10-24, user m07529): five tiers — Ultra Performance is now the first
             // entry of `QUALITY_NAMES` on the Java side, so the table order must match that list,
             // not NGX's enum order. 4 is still DLAA (reached through the AA mode, not the list).
-            static const uint32_t kTierToNgx[5] = {
+            
+static const uint32_t kTierToNgx[5] = {
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_UltraPerformance),
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_MaxPerf),
                 static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_Balanced),
@@ -1719,6 +1885,15 @@ void mcdr_dlss_query(char* note, int32_t noteCap, char* optimal, int32_t optimal
                           s.failure.empty() ? "an earlier stage" : s.failure.c_str());
         } else if (!s.initAttempted) {
             std::snprintf(note, static_cast<std::size_t>(noteCap), "DLSS not initialised yet");
+        } else if (dlssImplStreamline() && !s.initOk) {
+            // P291n：Streamline 模式下 NGX 归 SL 所有，我们自己的 NGX init 从不执行，
+            // 所以 `initOk` 永远是 false。旧文案因此对这条路径永远报"not initialised yet"，
+            // 而实际上 DLSS 可能正在正常工作 —— 状态行必须说清"谁在拥有 NGX"。
+            std::snprintf(note, static_cast<std::size_t>(noteCap),
+                          "Streamline owns NGX; DLSS switch is %s; tier=%u (%s), %llu evaluates so far",
+                          s.enabled ? "ON" : "OFF", s.qualityValue,
+                          s.qualityIsExplicit ? "explicit tier" : "closest to the ratio",
+                          static_cast<unsigned long long>(s.submitCount));
         } else if (!s.initOk) {
             std::snprintf(note, static_cast<std::size_t>(noteCap), "NGX init failed (%s)",
                           s.failure.empty() ? "unknown" : s.failure.c_str());
@@ -1766,6 +1941,9 @@ int32_t mcdr_dlss_create(void* commandList, const mcdr_dlss_input* in, DlssTrans
         // 返回 1 表示"特征已就绪"，JVM 才会继续调用 mcdr_dx12EvaluateDlss；返回 0 会被
         // 当成"特征未就绪"而跳过 evaluate（P112 实测）。
         if (dlssImplStreamline()) {
+            // P291n：先解析档位再下发选项 —— 否则 s.qualityValue 还是初值 0（=MaxPerf）。
+            (void)resolveQualityValue(*in);
+            s.initAttempted = true;  // 状态串用：SL 拥有 NGX，我们自己的 init 永远不会跑
             (void)streamlineApplyOptions(*in);
             return 1;
         }
@@ -1948,8 +2126,15 @@ sl::FrameToken* gLastFrameToken = nullptr;
             int32_t mode = 1;
             bool resolved = false;
             bool optionsApplied = false;
+            // P247：slReflexSetOptions 上一次是否真的成功。只有成功才允许 slReflexSleep /
+            // PCL 标记 —— 否则 SL 每帧都会打 "Reflex feature not yet initialized; call
+            // slReflexSetOptions() first"，而且那本来就是必然失败的调用。
+            bool optionsOk = false;
+            uint32_t setOptsFailures = 0;
             uint32_t frameLimitUs = 0;
             uint32_t markerFailures = 0;
+            uint32_t sleepFailures = 0;
+            bool sleepOkLogged = false;
             // P213d：上一次真正下发的生效模式与限帧，用来判断“要不要重发”。
             int32_t appliedMode = -1;
             uint32_t appliedFrameLimitUs = 0;
@@ -2002,8 +2187,12 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 gReflex.getState = reinterpret_cast<decltype(gReflex.getState)>(raw);
             }
         }
-        void applyReflexOptions() {
-            if (gReflex.setOptions == nullptr) return;
+        // P247：返回 true 表示“本帧 Reflex 选项已确认下发成功”，调用方据此决定要不要
+        // slReflexSleep / 发 PCL 标记。改动前这里无条件把 optionsApplied 置 true，
+        // 早期（slInit/slSetDevice 完成前）那次失败的调用就把状态 latch 住了，
+        // 之后每帧都走“已下发”的短路分支，SL 收到的永远是无效状态。
+        bool applyReflexOptions() {
+            if (gReflex.setOptions == nullptr) return false;
             // P213d：帧生成必须开 Reflex —— Reflex 关闭时 Streamline 直接拒绝插帧
             // （sl.log 里是 "DLSS-G disabled"）。用户选的 OFF 在 FG 打开期间按 ON 生效，
             // FG 关掉后自动回到用户原值。
@@ -2014,7 +2203,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             }
             if (gReflex.optionsApplied && effective == gReflex.appliedMode &&
                 gReflex.frameLimitUs == gReflex.appliedFrameLimitUs) {
-                return;
+                return gReflex.optionsOk;
             }
             sl::ReflexOptions opt{};
             opt.mode = effective == 2 ? sl::ReflexMode::eLowLatencyWithBoost
@@ -2022,12 +2211,29 @@ sl::FrameToken* gLastFrameToken = nullptr;
                                                         : sl::ReflexMode::eOff);
             opt.frameLimitUs = gReflex.frameLimitUs;  // 0 = 不限帧（文档：与 mode 独立）
             const sl::Result r = gReflex.setOptions(opt);
+            if (r != sl::Result::eOk) {
+                // 失败不要 latch：下一帧重试（设备/交换链就绪后通常会成功），
+                // 期间把 sleep/标记拦住，避免 SL 侧每帧刷同一条错误。
+                gReflex.optionsOk = false;
+                gReflex.optionsApplied = false;
+                if (gReflex.setOptsFailures < 3) {
+                    ++gReflex.setOptsFailures;
+                    logWarn("P247 reflex: slReflexSetOptions(mode=%d limit=%uus) failed=0x%X; "
+                            "holding slReflexSleep until it succeeds",
+                            effective, gReflex.frameLimitUs, static_cast<unsigned>(r));
+                }
+                return false;
+            }
+            gReflex.optionsOk = true;
             gReflex.optionsApplied = true;
             gReflex.appliedMode = effective;
             gReflex.appliedFrameLimitUs = gReflex.frameLimitUs;
-
+            return true;
         }
         void emitMarker(sl::PCLMarker marker) {
+            // P247：Reflex/PCL 只有在 slReflexSetOptions 成功之后才有效，否则 SL 同样会
+            // 回 “feature not yet initialized” 并刷日志。
+            if (!gReflex.optionsOk) return;
             if (gReflex.marker == nullptr || gLastFrameToken == nullptr) return;
             const sl::Result r = gReflex.marker(marker, *gLastFrameToken);
             if (r != sl::Result::eOk && gReflex.markerFailures < 3) {
@@ -2088,7 +2294,8 @@ sl::FrameToken* gLastFrameToken = nullptr;
     void mcdr_reflex_before_present(void) {
         if (!reflexEnabled()) return;
         resolveReflexApi();
-        applyReflexOptions();
+        // P247：只有 setOptions 确认成功后才有资格 sleep / 发标记。
+        const bool reflexReady = applyReflexOptions();
         // P131：JVM 的 frame-begin 钩子没跑到时（例如 DLSS 没在渲染），这一帧还没有 token。
         // Reflex 的 sleep/限帧/标记全都要 token，缺了就整条链路静默失效；这里就地补一个。
         if (gLastFrameToken == nullptr && gReflex.newFrameToken != nullptr) {
@@ -2098,10 +2305,21 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 gLastFrameToken = token;
             }
         }
-        emitMarker(sl::PCLMarker::eRenderSubmitEnd);  // 本帧所有提交已完成，接着 Present
-        emitMarker(sl::PCLMarker::ePresentStart);
-        if (gReflex.sleep != nullptr && gLastFrameToken != nullptr) {
-            (void)gReflex.sleep(*gLastFrameToken);
+        if (reflexReady) {
+            emitMarker(sl::PCLMarker::eRenderSubmitEnd);  // 本帧所有提交已完成，接着 Present
+            emitMarker(sl::PCLMarker::ePresentStart);
+        }
+        if (reflexReady && gReflex.sleep != nullptr && gLastFrameToken != nullptr) {
+            const sl::Result r = gReflex.sleep(*gLastFrameToken);
+            if (r != sl::Result::eOk && gReflex.sleepFailures < 3) {
+                ++gReflex.sleepFailures;
+                logWarn("P247 reflex: slReflexSleep failed=0x%X (options were applied OK)",
+                        static_cast<unsigned>(r));
+            } else if (r == sl::Result::eOk && !gReflex.sleepOkLogged) {
+                gReflex.sleepOkLogged = true;
+                logInfo("P247 reflex: slReflexSleep ok (mode=%d) — Reflex/PCL markers active",
+                        gReflex.appliedMode);
+            }
         }
     }
 
@@ -2485,6 +2703,10 @@ sl::FrameToken* gLastFrameToken = nullptr;
             case NVSDK_NGX_PerfQuality_Value_DLAA:       opt.mode = sl::DLSSMode::eDLAA; break;
             case NVSDK_NGX_PerfQuality_Value_MaxQuality: opt.mode = sl::DLSSMode::eMaxQuality; break;
             case NVSDK_NGX_PerfQuality_Value_Balanced:   opt.mode = sl::DLSSMode::eBalanced; break;
+            // P291（用户 m03752）：极致性能 = 3x。它原先落进 default 被当成 MaxPerformance（2x），
+            // Streamline 于是按 2x 规划特征，我们却喂 3x 的输入 —— 评价结果全黑（只有 GUI 正常），
+            // 而 50% / 58% / 67% 恰好都与 default 的 eMaxPerformance 或已有分支吻合，所以只有这一档坏。
+            case NVSDK_NGX_PerfQuality_Value_UltraPerformance: opt.mode = sl::DLSSMode::eUltraPerformance; break;
             default:                                     opt.mode = sl::DLSSMode::eMaxPerformance; break;
         }
         opt.outputWidth = static_cast<uint32_t>(in.targetWidth);
@@ -2528,6 +2750,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
         sl::Result evalResult = sl::Result::eOk;
         evalResult = api.evaluate(sl::kFeatureDLSS, *token, evalInputs, 1, cmd);
         ++s.submitCount;
+
 
         // 4.5) handover：只有当 SL 写的那张纹理不是 GUI 目标时才需要拷回（同尺寸、同格式）。
         // P115：`outResource == out` 说明两者已经是同一张纹理，这一拷贝可以直接省掉。
@@ -2632,8 +2855,25 @@ sl::FrameToken* gLastFrameToken = nullptr;
             // P213c：每帧问一次（只在 FG 开着时）presented 数，F3 的 output 要用它累积。
             if (api.getFgState != nullptr) {
                 sl::DLSSGState stFrame{};
-                if (api.getFgState(viewport, stFrame, nullptr) == sl::Result::eOk) {
+                const sl::Result stRes = api.getFgState(viewport, stFrame, nullptr);
+                if (stRes == sl::Result::eOk) {
                     gFgPresented.store(static_cast<int32_t>(stFrame.numFramesActuallyPresented));
+                    // P248：RTSS OSD 与"帧生成是否真的走 SL"互为前提 —— 秒级打一次状态，
+                    // 用 numFramesActuallyPresented > 1 证明插帧真的发生（而不是我们只是下发过选项）。
+                    static uint64_t fgLogTick = 0;
+                    if (++fgLogTick % 600 == 0) {
+                        logInfo("P248 fg state: status=%d presented=%u maxGen=%u tick=%llu",
+                                static_cast<int>(stFrame.status),
+                                static_cast<unsigned>(stFrame.numFramesActuallyPresented),
+                                static_cast<unsigned>(stFrame.numFramesToGenerateMax),
+                                static_cast<unsigned long long>(fgLogTick));
+                    }
+                } else {
+                    static bool warnedFgState = false;
+                    if (!warnedFgState) {
+                        warnedFgState = true;
+                        logWarn("P248 slDLSSGGetState failed=0x%X", static_cast<unsigned>(stRes));
+                    }
                 }
             }
 
@@ -2800,6 +3040,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // `mcdr_dx12SetDlssOutput`), use it and never build a private one. The private texture stays
     // only as a fallback for older JVM builds / older DLL pairings.
     ID3D12Resource* ngxTarget = out;
+    bool viaHandover = false;
     if (s.externalOutput != nullptr) {
         const D3D12_RESOURCE_DESC ed = s.externalOutput->GetDesc();
         const bool fits = (ed.Width == static_cast<UINT64>(in->targetWidth)) &&
@@ -2807,6 +3048,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
                           (ed.Format == out->GetDesc().Format);
         if (fits) {
             ngxTarget = s.externalOutput;
+            viaHandover = true;
             transition(out, D3D12_RESOURCE_STATE_COPY_DEST);
             transition(ngxTarget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         } else {
@@ -2832,6 +3074,17 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         }
     }
 
+    // P291b: never ask NGX to write into a texture this module did not create with
+    // ALLOW_UNORDERED_ACCESS. The JVM GUI target has no UAV flag, so transitioning it to
+    // UNORDERED_ACCESS is what removes the device (user m04140: turning the hand-over off
+    // crashed the game). If neither the hand-over texture nor a private one is usable, skip
+    // the frame instead of removing the device.
+    if (ngxTarget == out) {
+        logError("P291b: no usable DLSS output texture this frame (the hand-over texture was "
+                 "rejected and the private one could not be created); skipping the evaluate "
+                 "instead of transitioning a non-UAV target to UNORDERED_ACCESS");
+        return 0;
+    }
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep{};
     ep.Feature.pInColor = color;
     ep.Feature.pInOutput = ngxTarget;
@@ -2893,7 +3146,10 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
                 in->renderWidth, in->renderHeight, in->targetWidth, in->targetHeight,
                 mvIsRg16 ? "RG16 straight through" : "copied into an RG16 intermediate");
     }
-    return 1;
+    // P291b: 1 = the result went into the JVM hand-over texture (or straight into the JVM
+    // target); 2 = it went into the module private texture, which the JVM must NOT treat as
+    // "the GUI target already carries the world layer" - that is the black-screen path.
+    return viaHandover ? 1 : 2;
 }
 
     // Called from destroyDevice() BEFORE the D3D12 device goes away: NGX must release its
@@ -3024,11 +3280,38 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
 
 }  // mcdr_dlss_shutdown
 
+// P249：DXGI 工厂升级入口。设备模块建工厂后立刻调一次，把 swapchain 交给 SL 的代理工厂
+// （否则 DLSS-G 一次都不出帧；见 mcdr_dlss_impl.h 里那段说明）。
+int32_t mcdr_sl_upgrade_interface(void** baseInterface) {
+#if MCDR_DLSS_HAVE_STREAMLINE
+    if (!dlssImplStreamline()) {
+        return 0;
+    }
+    // P253（2026-10-26，用户 m04053 的对照实验）：**只要 DLSS 实现是 STREAMLINE，链就一律走
+    // SL 代理工厂**，不再按帧生成开关决定。依据是同一台机器上的 A/B：
+    //   dev（FG 开 ⇒ 代理链，Present 槽 owner=sl.interposer.dll）: RTSS OSD 正常；
+    //   用户 Prism 实例（FG 关 ⇒ P250 保持原生链，owner=DXGI.DLL+jmp）: OSD 不显示。
+    // 两边的 RTSSHooks64 基址、两个 D3D12Core、swapchain 描述、窗口模式全部一致，唯一测到的
+    // 差异就是链是否被 SL 代理 —— 所以先按“代理链才让 RTSS 的 OSD 生效”验证。
+    const int32_t fgModeForLog = gDlssgMode.load();
+    const int32_t upgraded = streamlineUpgradeInterface(baseInterface);
+    if (upgraded != 0) {
+        logInfo("P249: DXGI factory upgraded to the Streamline proxy factory "
+                "(eUseDXGIFactoryProxy) - swapchain creation now goes through SL (fg=%d)",
+                fgModeForLog);
+    }
+    return upgraded;
+#else
+    (void)baseInterface;
+    return 0;
+#endif
+}
+
 
 }  // extern "C"
 
 // P213：帧生成的开关（C++ 链接，与 mcdr_dlss_impl.h 的声明一致）。
-// P213：帧生成的开关。0 = off，1 = on（固定倍率），2 = dynamic（多帧，驱动 ≥ 595.41）。
+// 0 = off，1 = on（固定倍率），2 = dynamic（多帧，驱动 ≥ 595.41）。
 // 真正的下发在 streamlineEvaluate() 里（那里才有 frame token 与 viewport，且必须在呈现线程上调用）。
 void mcdr_dlss_set_fg_mode(int32_t mode, int32_t numFrames) {
     gDlssgMode.store(mode);

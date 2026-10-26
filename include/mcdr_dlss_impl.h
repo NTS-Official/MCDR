@@ -198,6 +198,20 @@ int32_t mcdr_dlss_set_enabled(int32_t enabled);
 // 释放特征与自建资源并 Shutdown NGX。必须在**设备还活着**时调用（destroyDevice 里）。
 void mcdr_dlss_shutdown(void);
 
+// P249：把原生 DXGI 工厂原地升级成 Streamline 的代理工厂，返回 1=已换成代理。
+//
+// 为什么需要它：slInit 置了 `sl::PreferenceFlags::eUseDXGIFactoryProxy` 之后，SL 不再改写
+// 工厂/交换链的 v-table，而是要求**调用方拿着它给的代理工厂**去建 swapchain
+// （ProgrammingGuideManualHooking.md:190-207：「Therefore here we are using proxy factory and
+// not a native one!」，sl_core_api.h:265-275 slUpgradeInterface 必须在接口创建后立刻调用）。
+// 我们原来的做法是直接 `CreateDXGIFactory1` 拿原生工厂 —— 那时 chain 不被 SL 接管：
+// `slDLSSGSetOptions` 返回 eOk 但一帧都不生成（`slDLSSGGetState.numFramesActuallyPresented`
+// 恒 0），sl.log 报 `Streamline presentCommon() was not observed`。
+//
+// 只动指针、不加引用：SL 是“替换”而不是“再包一层”（文档原文 replace in place），
+// 调用方手里那一个引用直接变成代理的引用。SL 未启用/未初始化时返回 0 且不碰 *baseInterface。
+int32_t mcdr_sl_upgrade_interface(void** baseInterface);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

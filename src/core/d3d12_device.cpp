@@ -467,16 +467,36 @@ static int gLogLevel = 0;
 // 推进来。默认 true：destroyDevice/destroySurface 一旦卡住，这些行是唯一线索。
 static bool gShutdownTraceAlways = true;
 
+// P250：配置项 `[logging] nativeLogFile`（JVM 经 mcdrSetLogFile 推进来）。原生日志默认只走
+// stderr，而 Prism 之类的启动器不把子进程 stdout/stderr 落盘 —— 于是"用户端出问题，却拿不到
+// native 行"成了常态。这里提供一条文件镜像：设了路径就逐行追加（带 fflush，进程被强杀也不丢）。
+static std::mutex gMirrorMutex;
+static std::string gConfiguredLogPath;
+static FILE* gMirrorFile = nullptr;
+
 static void mirrorLogToFile(const char* line) {
-    static FILE* s_mirrorFile = nullptr;
-    const char* path = std::getenv("DX12_NATIVE_LOG_FILE");
-    if (!path || !*path) return;
-    if (!s_mirrorFile) {
-        s_mirrorFile = std::fopen(path, "a");
-        if (!s_mirrorFile) return;
+    const std::lock_guard<std::mutex> lock(gMirrorMutex);
+    // 配置项优先；旧环境变量 `DX12_NATIVE_LOG_FILE` 只作为**已弃用的逃生口**保留，且仅在配置为空
+    // 时生效（AGENTS.md：环境变量不得成为功能的唯一入口）。两者都为空 ⇒ 不写文件。
+    const char* path = !gConfiguredLogPath.empty() ? gConfiguredLogPath.c_str()
+                                                  : std::getenv("DX12_NATIVE_LOG_FILE");
+    if (path == nullptr || path[0] == '\0') return;
+    if (gMirrorFile == nullptr) {
+        gMirrorFile = std::fopen(path, "a");
+        if (gMirrorFile == nullptr) return;
     }
-    std::fprintf(s_mirrorFile, "%s\n", line);
-    std::fflush(s_mirrorFile);
+    std::fprintf(gMirrorFile, "%s\n", line);
+    std::fflush(gMirrorFile);
+}
+
+void setLogFile(const char* utf8Path) {
+    // 空路径 = 关闭镜像并释放句柄；换路径同样先关旧句柄，下一次写日志时按新路径重开。
+    const std::lock_guard<std::mutex> lock(gMirrorMutex);
+    gConfiguredLogPath = (utf8Path != nullptr) ? utf8Path : "";
+    if (gMirrorFile != nullptr) {
+        std::fclose(gMirrorFile);
+        gMirrorFile = nullptr;
+    }
 }
 
 // JVM 侧是 log4j 的行格式；这里逐字复刻同样的形状（见 mcdr_device.cppm 的声明），
@@ -2345,7 +2365,14 @@ void streamlineInitEarly() {
                 sl::PreferenceFlags::eDisableDebugText |
                 // 文档 ProgrammingGuide.md:853：使用 slSetTagForFrame 必须置这一位，
                 // 否则 tag 调用返回 eErrorMissingInputParameter(0x13)（P112 实测）。
-                sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+                sl::PreferenceFlags::eUseFrameBasedResourceTagging |
+                // P248：让 SL 走「DXGI 工厂代理」而不是改写 base interface 的 v-table。
+                // sl_core_types.h:539-542 原文：'If specified SL will create DXGI factory proxy
+                // rather than modifying the v-table for the base interface. This can help with 3rd
+                // party overlays which are NOT integrated with the host application but rather
+                // operate via injection.' —— 正是 RTSS/Afterburner 的 OSD 场景：改写 v-table 的方式
+                // 会把 Present 槽指到 sl.interposer.dll，注入式 overlay 拿不到钩子，OSD 消失。
+                sl::PreferenceFlags::eUseDXGIFactoryProxy;
     gSlInitResult = (*pInit)(pref, sl::kSDKVersion);
     if (probe) { fwprintf(probe, L"init=0x%X\n", static_cast<unsigned>(gSlInitResult)); fclose(probe); }
     dbgLogWarn("P111 streamline: slInit=0x%X (early, before any DXGI/D3D12 call)", 
@@ -2498,17 +2525,32 @@ mcdr::Result<void> ensureDevice() {
     // P66：先按 GPU 偏好顺序挑一块支持 12_2 的适配器，再在它上面建设备。
     ComPtr<ID3D12Device> device;
     {
-        ComPtr<IDXGIAdapter1> chosen;
         auto selectRes = selectDeviceAdapter();
         bool ok = static_cast<bool>(selectRes);
         std::string selectError = selectRes ? std::string() : selectRes.error().message;
-        if (ok && FAILED(createD3D12Device(chosen.Get(), kRequiredFeatureLevel,
-                                           IID_PPV_ARGS(&device)))) {
-            // 探测通过却建不出设备（极罕见）：当成选择失败，走同一条错误路径。
-            ok = false;
-            selectError = "D3D12CreateDevice(12_2) failed on the selected adapter";
-        } else if (ok) {
-            chosen = *selectRes;
+        // P241：chosen 必须**先**拿到选中的适配器再建设备。原来这里直接把默认构造的
+        // `chosen` 交给 createD3D12Device —— 那是一枚空 ComPtr，而 D3D12CreateDevice(NULL)
+        // 的含义是「用系统默认适配器」：好不容易探测到的 12_2 卡被丢掉，实际落在进程默认
+        // 的那块卡上。Optimus 笔电上进程默认卡常是核显（只有 12_1），于是创建必然失败。
+        // 开发机默认卡恰好是 dGPU(RTX 5070)，所以长期未暴露；独立启动器里 FML 早期窗口先在
+        // Intel 核显上建 GL 上下文（日志 "GL info: Intel(R) RaptorLake-S Mobile Graphics
+        // Controller"），进程默认适配器随之被钉在 iGPU 上 ⇒ D3D12CreateDevice(NULL, 12_2)
+        // 失败 ⇒ 自检拿不到纹理 ⇒ P73 致命崩溃。
+        if (ok) {
+            ComPtr<IDXGIAdapter1> chosen = *selectRes;
+            const HRESULT hr = createD3D12Device(chosen.Get(), kRequiredFeatureLevel,
+                                                IID_PPV_ARGS(&device));
+            if (FAILED(hr)) {
+                DXGI_ADAPTER_DESC1 desc{};
+                const std::string name = SUCCEEDED(chosen->GetDesc1(&desc))
+                    ? adapterDescName(desc) : std::string("<unknown>");
+                char hrText[16] = {};
+                std::snprintf(hrText, sizeof(hrText), "0x%08X", static_cast<unsigned>(hr));
+                selectError = "D3D12CreateDevice(12_2) failed on selected adapter '" + name +
+                              "' (hr=" + hrText + ")";
+                dbgLogError("P66 %s", selectError.c_str());
+                ok = false;
+            }
         }
         if (!ok && debugEnabled) {
             // 调试层偶尔会让设备创建失败：关掉调试层重选一次（与旧行为一致）。
@@ -2516,12 +2558,21 @@ mcdr::Result<void> ensureDevice() {
             selectError.clear();
             auto selectRes2 = selectDeviceAdapter();
             if (selectRes2) {
-                chosen = *selectRes2;
-                ok = SUCCEEDED(createD3D12Device(chosen.Get(), kRequiredFeatureLevel,
+                const ComPtr<IDXGIAdapter1> chosen2 = *selectRes2;
+                ok = SUCCEEDED(createD3D12Device(chosen2.Get(), kRequiredFeatureLevel,
                                                  IID_PPV_ARGS(&device)));
             } else {
                 ok = false;
                 selectError = selectRes2.error().message;
+            }
+        }
+        if (!ok) {
+            // P241 兜底：选中的适配器建不出设备时，退回 P66 之前的旧行为（系统默认适配器），
+            // 免得一台本来能跑的机器因为枚举/选择环节出岔子而直接崩掉。
+            if (SUCCEEDED(createD3D12Device(nullptr, kRequiredFeatureLevel, IID_PPV_ARGS(&device)))) {
+                dbgLogWarn("P241 using the system default adapter after: %s",
+                           selectError.c_str());
+                ok = true;
             }
         }
         if (!ok) {
@@ -3298,6 +3349,14 @@ static const char* stateNameFor(D3D12_RESOURCE_STATES s) {
 
 void resourceBarrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res, D3D12_RESOURCE_STATES from,
                      D3D12_RESOURCE_STATES to) {
+    // P277：res 为空时 ResourceBarrier 会记一条非法调用，随后 Close() 直接 E_INVALIDARG，
+    // 而日志里只剩 "Close HRESULT 0x80070057" 这句——查不到是谁把空指针塞进了状态表。
+    // 这里挡掉并报错，让症状落在真正的调用点上。
+    if (res == nullptr) {
+        dbgLogError("resourceBarrier: null resource (%s -> %s) ignored", stateNameFor(from),
+                    stateNameFor(to));
+        return;
+    }
     // D3D12 要求 StateBefore != StateAfter；相同状态发出 barrier 会触发
     // ID3D12CommandList::ResourceBarrier 验证 ERROR（0x80004005）。
     // 此处做保护性跳过，并记录诊断日志。
@@ -3849,6 +3908,10 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
     // fenceValue % 4 保证帧 N+2 写入的半区 ≠ 帧 N/N+1 GPU 正在读的半区。
     ctx->drawHeapSlotBase = static_cast<UINT>(ctx->fenceValue % kDrawHeapSections) * kDrawHeapPerFrame;
     ctx->nextDrawSlot = 0;
+    // P243：新列表 ⇒ 段内槽位从头分配，上一列表的 SRV 复用缓存作废。
+    ctx->lastSrvSlotOffset = 0;
+    ctx->lastSrvCount = 0;
+    ctx->lastSrvViews.clear();
     // RTV/DSV 是 CPU-only 描述符堆：命令列表提交时驱动已捕获描述符内容，
     // 双 allocator + value-2 完成等待保证旧命令已结束，可每帧从 0 复用。
     // P24：仅帧级瞬态堆（frameRtvHeap/dsvHeap）每帧清零；rtvHeap 上的
@@ -3866,6 +3929,14 @@ mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForV
     ID3D12DescriptorHeap* drawHeaps[] = {gCtx.drawHeap.Get()};
     ctx->commandList->SetDescriptorHeaps(1, drawHeaps);
     return {};
+}
+
+void restoreDrawHeap(CommandContext* ctx) {
+    if (ctx == nullptr || ctx->commandList == nullptr || gCtx.drawHeap == nullptr) {
+        return;
+    }
+    ID3D12DescriptorHeap* drawHeaps[] = {gCtx.drawHeap.Get()};
+    ctx->commandList->SetDescriptorHeaps(1, drawHeaps);
 }
 
 mcdr::Result<void> endCommandList(CommandContext* ctx) {
@@ -3915,6 +3986,10 @@ mcdr::Result<void> endCommandList(CommandContext* ctx) {
         // （UPLOAD heap 非法 transition、未绑定/越界描述符、root 参数未设置、
         // PSO 与 root signature 不匹配等）。附加 InfoQueue 最近消息定位具体
         // 非法调用——这是 Close 失败时唯一的确定性证据。
+        // P277：原来只在 deviceStatusText() 里带一行设备状态，而 0x80070057 这种
+        // **非设备移除**的失败根本不会出现在那里（GetDeviceRemovedReason=0）。调试层
+        // 开着时必须把 InfoQueue 的原文打出来，否则这条日志没有信息量。
+        dumpInfoQueueMessages();
         return mcdr::err("endCommandList",
                          "endCommandList: Close " + hrText(hr) + " — " + deviceStatusText());
     }
@@ -5242,6 +5317,10 @@ int dispatchCompute(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* uavTe
     }
     list->Dispatch(static_cast<UINT>(x), static_cast<UINT>(y), static_cast<UINT>(z));
     transitionTextureTo(ctx, uavTexture, D3D12_RESOURCE_STATE_COMMON);
+    // P273：上面把堆切成了 computeUavHeap。命令列表级状态不回退，同一列表里后续
+    // 走瞬时 SRV 的绘制会因此撞 P24 那条 "descriptor heap ... different" 报错。
+    // 这里立刻把主堆绑回来（Dispatch 已经按顺序录制完，执行期仍用 computeUavHeap）。
+    restoreDrawHeap(ctx);
     return 1;
 }
 
@@ -5263,8 +5342,8 @@ mcdr::Result<void*> createComputePipelineShadingRate(const void* dxil, int32_t d
 
     D3D12_DESCRIPTOR_RANGE srvRange{};
     srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRange.NumDescriptors = 2;
-    srvRange.BaseShaderRegister = 0;  // t0, t1
+    srvRange.NumDescriptors = 3;
+    srvRange.BaseShaderRegister = 0;  // t0 深度, t1 速度, t2 上一帧图像（P236 时间钳制）
     srvRange.RegisterSpace = 0;
     srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -5331,14 +5410,15 @@ mcdr::Result<void*> createComputePipelineShadingRate(const void* dxil, int32_t d
         return mcdr::err("createComputePipelineShadingRate", text);
     }
 
-    dbgLogInfo("createComputePipelineShadingRate: PSO handle=%p dxil=%d bytes (srv t0/t1 + uav u0 + b0)",
+    dbgLogInfo("createComputePipelineShadingRate: PSO handle=%p dxil=%d bytes (srv t0/t1/t2 + uav u0 + b0)",
                static_cast<void*>(obj.get()), dxilSize);
     return static_cast<void*>(obj.release());
 }
 
 int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* srvDepth,
-                              Dx12Object* srvMotion, Dx12Object* image, const int32_t* constants,
-                              int32_t constantCount, int32_t x, int32_t y, int32_t z) {
+                              Dx12Object* srvMotion, Dx12Object* srvPrevious, Dx12Object* image,
+                              const int32_t* constants, int32_t constantCount, int32_t x, int32_t y,
+                              int32_t z) {
     if (ctx == nullptr || !ctx->commandList || !ctx->listOpen) {
         dbgLogError("dispatchComputeShadingRate: called without an open command list");
         return -2;
@@ -5348,9 +5428,9 @@ int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Ob
         dbgLogError("dispatchComputeShadingRate: handle is not a compute pipeline");
         return 0;
     }
-    if (srvDepth == nullptr || srvMotion == nullptr || image == nullptr || !image->resource
-        || image->kind != Dx12Object::Kind::Texture) {
-        dbgLogError("dispatchComputeShadingRate: depth/motion view or image missing");
+    if (srvDepth == nullptr || srvMotion == nullptr || srvPrevious == nullptr || image == nullptr
+        || !image->resource || image->kind != Dx12Object::Kind::Texture) {
+        dbgLogError("dispatchComputeShadingRate: depth/motion/previous view or image missing");
         return 0;
     }
     if ((image->usage & 32) == 0) {
@@ -5372,10 +5452,10 @@ int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Ob
     if (!ensureComputeHeap()) return 0;
     ID3D12GraphicsCommandList* list = ctx->commandList;
 
-    // 两张 SRV 必须落在同一条连续区间（根参数 [0] 是 2 个描述符的表）。
+    // 三张 SRV 必须落在同一条连续区间（根参数 [0] 是 3 个描述符的表）。
     const UINT srvSlot = computeHeapSlot();
-    const UINT uavSlot = srvSlot + 1;
-    gCtx.computeUavNext = srvSlot + 2;
+    const UINT uavSlot = srvSlot + 3;
+    gCtx.computeUavNext = srvSlot + 4;
     const D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = computeHeapCpu(srvSlot);
     const D3D12_CPU_DESCRIPTOR_HANDLE uavCpu = computeHeapCpu(uavSlot);
     if (srvDepth->cpuHandle.ptr != 0) {
@@ -5388,6 +5468,17 @@ int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Ob
         gCtx.device->CopyDescriptorsSimple(1, second, srvMotion->cpuHandle,
                                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
+    // t2 = 上一帧的着色率图像（P236 时间钳制）。没有历史时也要放一张有效描述符：
+    // 着色器里由 constants 的 bit1 决定要不要读它。
+    if (srvPrevious->cpuHandle.ptr != 0) {
+        D3D12_CPU_DESCRIPTOR_HANDLE third{};
+        third.ptr = srvCpu.ptr + 2 * gCtx.computeUavStride;
+        gCtx.device->CopyDescriptorsSimple(1, third, srvPrevious->cpuHandle,
+                                           D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    } else {
+        dbgLogError("dispatchComputeShadingRate: previous image view has no CPU handle");
+        return 0;
+    }
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
     uavDesc.Format = image->dxgiFormat;
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -5395,13 +5486,17 @@ int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Ob
     uavDesc.Texture2D.PlaneSlice = 0;
     gCtx.device->CreateUnorderedAccessView(image->resource.Get(), nullptr, &uavDesc, uavCpu);
 
-    // 两张输入必须可读；状态跟踪走 transitionTo（同一命令上下文内自洽）。
+    // 三张输入必须可读；状态跟踪走 transitionTo（同一命令上下文内自洽）。
     if (srvDepth->sourceTexture && srvDepth->sourceTexture->resource) {
         transitionTo(ctx, srvDepth->sourceTexture->resource.Get(), D3D12_RESOURCE_STATE_COMMON,
                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     if (srvMotion->sourceTexture && srvMotion->sourceTexture->resource) {
         transitionTo(ctx, srvMotion->sourceTexture->resource.Get(), D3D12_RESOURCE_STATE_COMMON,
+                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    if (srvPrevious->sourceTexture && srvPrevious->sourceTexture->resource) {
+        transitionTo(ctx, srvPrevious->sourceTexture->resource.Get(), D3D12_RESOURCE_STATE_COMMON,
                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     transitionTextureTo(ctx, image, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -5423,7 +5518,8 @@ int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Ob
 
 // 建一张 R8_UINT 的着色率图像。尺寸是 **tile 数**（宽高各自 ceil(pixel / tile)），
 // 因为 SRI 的每个 texel 管一整块 tile；tile 边长见 caps.shadingRateImageTileSize
-// （NVIDIA 16、AMD 8）。usage 34 = 32(UAV) | 2(COPY_SRC，供自检读回)。
+// （NVIDIA 16、AMD 8）。usage 38 = 32(UAV，写) | 4(TEXTURE_BINDING，上一帧当 t2 读) |
+// 2(COPY_SRC，供自检读回)。
 mcdr::Result<void*> createShadingRateImage(int32_t width, int32_t height) {
     if (auto d = ensureDevice(); !d) return mcdr::err("createShadingRateImage", errorMessage(d.error()));
     if (!gCtx.caps.shadingRateImageSupported()) {
@@ -5448,7 +5544,7 @@ mcdr::Result<void*> createShadingRateImage(int32_t width, int32_t height) {
 
     auto obj = std::make_unique<Dx12Object>();
     obj->kind = Dx12Object::Kind::Texture;
-    obj->usage = 34;
+    obj->usage = 38;
     obj->dxgiFormat = DXGI_FORMAT_R8_UINT;
     obj->size = static_cast<long long>(width) * height;
     HRESULT hr = gCtx.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
@@ -6191,15 +6287,52 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
             ++srvCount;
         }
     }
-    if (ctx->nextDrawSlot + srvCount > syncRingCapacity()) {
-        // 诊断：带上槽位画像，便于定位是哪条路径的 burst 超限（图集上传等）。
-        return mcdr::err("pushDescriptors",
-                         "pushDescriptors: draw descriptor heap exhausted for this frame (next="
-                             + std::to_string(static_cast<long long>(ctx->nextDrawSlot))
-                             + " need=" + std::to_string(static_cast<long long>(srvCount))
-                             + " cap=" + std::to_string(static_cast<long long>(syncRingCapacity()))
-                             + " section=" + std::to_string(static_cast<long long>(kDrawHeapPerFrame))
-                             + " fence=" + std::to_string(static_cast<long long>(ctx->fenceValue)) + ")");
+    // P243：SRV 集合与同一命令列表上一次推送完全一致（且全是 texture view）⇒ 复用旧槽位。
+    // 加载屏（ELSDrawCollector）与图集动画上传会在**一次不提交**的命令列表里推上万个相同的
+    // SRV 表（整张图集只有一张 view），旧逻辑每次新分配槽位，最终把每帧段用尽并抛异常。
+    // 槽位在列表内只增不减，旧内容不会被覆写，所以复用是安全的；CBV 仍逐次重写 root 描述符。
+    bool reuseSrvTable = false;
+    if (srvCount > 0 && ctx->lastSrvCount == srvCount) {
+        reuseSrvTable = true;
+        size_t viewIndex = 0;
+        for (const DrawBinding& b : bindings) {
+            if (b.type == 0) {
+                continue;
+            }
+            if (b.type != 1 || viewIndex >= ctx->lastSrvViews.size()
+                || ctx->lastSrvViews[viewIndex].first != b.view
+                || !b.view || ctx->lastSrvViews[viewIndex].second != b.view->cpuHandle.ptr) {
+                reuseSrvTable = false;
+                break;
+            }
+            ++viewIndex;
+        }
+    }
+    if (!reuseSrvTable && ctx->nextDrawSlot + srvCount > syncRingCapacity()) {
+        // 兜底：真到上限也不要把渲染线程打死。复用上一张同样大的表并告警——这一批 draw 的
+        // 贴图可能不对（加载屏阶段可接受），但不会像旧逻辑那样抛异常让客户端崩掉。
+        static int p243ExhaustWarned = 0;
+        if (p243ExhaustWarned < 8) {
+            ++p243ExhaustWarned;
+            dbgLogWarn("P243 descriptor ring exhausted (next=%u need=%u cap=%u fence=%llu) - "
+                       "reusing previous SRV table",
+                       static_cast<unsigned>(ctx->nextDrawSlot), static_cast<unsigned>(srvCount),
+                       static_cast<unsigned>(syncRingCapacity()),
+                       static_cast<unsigned long long>(ctx->fenceValue));
+        }
+        if (ctx->lastSrvCount == srvCount && srvCount > 0) {
+            reuseSrvTable = true;
+        } else {
+            // 诊断：带上槽位画像，便于定位是哪条路径的 burst 超限（图集上传等）。
+            return mcdr::err("pushDescriptors",
+                             "pushDescriptors: draw descriptor heap exhausted for this frame (next="
+                                 + std::to_string(static_cast<long long>(ctx->nextDrawSlot))
+                                 + " need=" + std::to_string(static_cast<long long>(srvCount))
+                                 + " cap=" + std::to_string(static_cast<long long>(syncRingCapacity()))
+                                 + " section=" + std::to_string(static_cast<long long>(kDrawHeapPerFrame))
+                                 + " fence=" + std::to_string(static_cast<long long>(ctx->fenceValue))
+                                 + ")");
+        }
     }
     // P16 诊断：每帧首 pushDescriptors 打印 binding 数量（确认 uniform/texture 被推送）
     static int pdFrameCount = 0;
@@ -6220,7 +6353,8 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                         (bj.buffer ? bj.buffer->heapType : -1));
         }
     }
-    SIZE_T base = static_cast<SIZE_T>(ctx->drawHeapSlotBase + ctx->nextDrawSlot) * gCtx.drawInc;
+    const UINT srvSlotOffset = reuseSrvTable ? ctx->lastSrvSlotOffset : ctx->nextDrawSlot;
+    SIZE_T base = static_cast<SIZE_T>(ctx->drawHeapSlotBase + srvSlotOffset) * gCtx.drawInc;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = gCtx.drawHeap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += base;
     // 稠密编号：cbvIdx -> root 参数索引；srvIdx -> SRV 堆槽 / SRV 表内序号。
@@ -6328,8 +6462,10 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                                             | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 }
-                gCtx.device->CopyDescriptorsSimple(1, dst, b.view->cpuHandle,
-                                                   D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                if (!reuseSrvTable) {
+                    gCtx.device->CopyDescriptorsSimple(1, dst, b.view->cpuHandle,
+                                                       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                }
                 ++srvIdx;
                 break;
             }
@@ -6362,7 +6498,19 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                                  "pushDescriptors: unknown binding type " + std::to_string(b.type));
         }
     }
-    ctx->nextDrawSlot += srvCount;
+    if (srvCount > 0 && !reuseSrvTable) {
+        // P243：记下这次分配，供后续同集合的 push 复用同一张表。
+        ctx->lastSrvSlotOffset = srvSlotOffset;
+        ctx->lastSrvCount = srvCount;
+        ctx->lastSrvViews.clear();
+        ctx->lastSrvViews.reserve(srvCount);
+        for (const DrawBinding& b : bindings) {
+            if (b.type == 1) {
+                ctx->lastSrvViews.emplace_back(b.view, b.view ? b.view->cpuHandle.ptr : 0);
+            }
+        }
+        ctx->nextDrawSlot += srvCount;
+    }
     // SRV 表位于 root 参数索引 cbvCount（在 CBV root descriptor 之后）。
     // gpuRoot 必须指向本帧实际写入位置（ring buffer 偏移 base），
     // 而不是 heap 起始处。否则多帧飞环时每帧的命令列表都把根表绑定到
@@ -10463,3 +10611,5 @@ void asyncSendCommandsReady(CommandContext* ctx) {
 void clearAsyncRenderCtx() { gAsyncRenderCtx = nullptr; }
 
 }  // namespace d3d12_mc
+
+

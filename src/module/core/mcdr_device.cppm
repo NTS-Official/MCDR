@@ -95,6 +95,9 @@ void dbgLogDebug(const char* fmt, ...);
 void setLogLevel(int level);
 // 进度标记是否恒定输出（配置 `[logging] shutdownTrace`，默认 true）。
 void setShutdownTraceAlways(bool always);
+// 把每条 native 日志同时镜像到该文件（配置项 `[logging] nativeLogFile`，mcdrSetLogFile）。
+// 空指针/空串 = 关闭镜像并关掉句柄。相对路径按进程工作目录（游戏目录）解析，追加写。
+void setLogFile(const char* utf8Path);
 
 // PIX GPU 捕获层：请求在进程内载入 WinPixGpuCapturer.dll。必须在**首个 D3D12 设备创建
 // 之前**调用（捕获层靠挂钩 D3D12 工作），幂等；返回 1=已载入 0=未请求 -1=请求了但没载入。
@@ -532,11 +535,13 @@ mcdr::Result<void*> createComputePipeline(const void* dxil, int32_t dxilSize);
 
 // 在已打开的命令列表上派发一次（内部做 COMMON → UNORDERED_ACCESS → COMMON 的转换）。
 // 返回 1=已派发 0=参数/资源状态不对 -2=没有打开的命令列表（与 setShadingRateNow 同一套码）。
-// P235：着色率图像（tier 2 SRI）。布局 = 2 张 SRV（t0/t1）+ 1 张 UAV（u0）+ b0 根常量。
+// P235：着色率图像（tier 2 SRI）。布局 = 3 张 SRV（t0 深度 / t1 速度 / t2 上一帧图像）
+// + 1 张 UAV（u0）+ b0 根常量。
 mcdr::Result<void*> createComputePipelineShadingRate(const void* dxil, int32_t dxilSize);
 int dispatchComputeShadingRate(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* srvDepth,
-                               Dx12Object* srvMotion, Dx12Object* image, const int32_t* constants,
-                               int32_t constantCount, int32_t x, int32_t y, int32_t z);
+                               Dx12Object* srvMotion, Dx12Object* srvPrevious, Dx12Object* image,
+                               const int32_t* constants, int32_t constantCount, int32_t x, int32_t y,
+                               int32_t z);
 mcdr::Result<void*> createShadingRateImage(int32_t width, int32_t height);
 int setShadingRateImage(CommandContext* ctx, Dx12Object* image);
 int dispatchCompute(CommandContext* ctx, Dx12Object* pipeline, Dx12Object* uavTexture,
@@ -693,6 +698,17 @@ struct CommandContext {
     UINT drawHeapSlotBase = 0;
     UINT nextDrawSlot = 0;
 
+    // P243：同一命令列表内"SRV 集合与上次完全一致"的连续 push 复用上一次的描述符槽位。
+    // 加载屏（ELSDrawCollector）与图集动画上传会在**一次不提交**的命令列表里推上万个
+    // 相同的 SRV 表（整张图集只有一张 view），旧逻辑每次都新分配槽位，长加载最终把
+    // 每帧段（kAsyncSyncRingReserve=131072）用尽 ⇒ "draw descriptor heap exhausted"。
+    // 槽位在列表内只增不减，所以复用是安全的：旧槽位从未被覆写。
+    UINT lastSrvSlotOffset = 0;   // 上次分配的段内偏移（相对 drawHeapSlotBase）
+    UINT lastSrvCount = 0;        // 上次分配的 SRV 个数（0 = 本列表还没推过）
+    // 上次的 texture view 序列：view 指针 + 它当时的描述符 CPU 句柄。句柄一起比是必要的：
+    // view 对象释放后地址可能被新 view 复用，只比指针会把"已销毁的旧描述符"当成命中。
+    std::vector<std::pair<Dx12Object*, SIZE_T>> lastSrvViews;
+
     // P33 async：记录上一次 submitCommandList 写入的 queue fence 值。
     // beginCommandListWithWait 据此等待 GPU 完成上一帧后再 Reset allocator，
     // 避免异步线程并发提交时的 use-after-free（ACCESS_VIOLATION 根因）。
@@ -753,6 +769,16 @@ mcdr::Result<void> beginCommandList(CommandContext* ctx);
 mcdr::Result<void> beginCommandListWithWait(CommandContext* ctx, UINT64 waitForValue);
 // 结束录制：Close list（之后可提交）。
 mcdr::Result<void> endCommandList(CommandContext* ctx);
+
+// P273：把主描述符堆（本帧的 drawHeap）无条件重新绑到命令列表上。
+// 背景：SetDescriptorHeaps 是命令列表级状态，不会随根签名 / PSO / 根描述符表复位。
+// 三个厂商 SDK 的 Evaluate 内部都可能绑定自己的堆（Streamline 尤甚），compute 通路
+// （dispatchCompute）也会临时切到 computeUavHeap —— 之后任何走瞬时 SRV 的绘制都会撞上
+// P24 记录的那条运行时错误："descriptor heap containing handle is different from
+// currently set descriptor heap"（dx12-native.log 658 行）。
+// 重复绑同一张堆完全合法、代价可忽略，所以这里不做"是否已经绑对"的查询：
+// GetDescriptorHeaps 在调用方数组容量不足时的行为各版本不一致，查询反而引入分支风险。
+void restoreDrawHeap(CommandContext* ctx);
 // 提交：ExecuteCommandLists + Signal(fence, ++fenceValue)。
 // 非阻塞（GPU 异步执行）；fence 信号值同时写入当前 active surface 的 per-backbuffer 记录。
 // 返回本次提交的 fence value。
@@ -1068,6 +1094,94 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in);
 int queryDlss(char* out, int cap);
 
 // ---------------------------------------------------------------------------
+// P272：超分（SR）Provider 接口层
+//
+// 目的：把「一次超分提交」从厂商实现里剥出来。P271 的 8 个 ABI 入口只做参数校验与
+// 填表，真正干活的对象在本模块内部按 backend id 选出来。DLSS 是第一个实现
+// （`src\core\d3d12_sr.cpp` 的 `DlssSrProvider`，行为与 P108 的 `applyDlssToTexture`
+// 逐字等价 —— 它就是把原来的翻译 + 调用原样搬过去），FSR / XeSS 在 P277 / P278 各加
+// 一个实现，**不必再动 ABI 编号**。
+//
+// 为什么接口放在本模块里而不是再切一个模块：provider 要能结束一个还开着的 render pass、
+// 按跟踪状态转 barrier、解包 `Dx12Object` —— 这三件事只有本模块能做（见
+// `mcdr_dlss_impl.h` 的约束段）。所以它是本模块的内部抽象，不是跨模块的 ABI。
+//
+// 接口签名只用 POD（`mcdr_sr_caps` / `mcdr_sr_dispatch` / `CommandContext*`），不引入
+// 新的跨模块类型：ABI 的两个 C 结构在全局模块片段里已经可见（本文件 :32 include 了
+// `mcdr_abi.h`），各实现直接读写它们，避免再造一份会漂移的镜像。
+// ---------------------------------------------------------------------------
+enum class SrBackendId : int32_t {
+    None = 0,
+    Dlss = 1,
+    Fsr = 2,
+    XeSS = 3,
+};
+
+class IUpscaleProvider {
+public:
+    IUpscaleProvider() = default;
+    IUpscaleProvider(const IUpscaleProvider&) = delete;
+    IUpscaleProvider& operator=(const IUpscaleProvider&) = delete;
+    virtual ~IUpscaleProvider() = default;
+
+    virtual SrBackendId backend() const = 0;
+    // 填能力表（`note` 由实现写；清零与 `backend` 字段由注册表负责）。
+    virtual void fillCaps(mcdr_sr_caps& out) const = 0;
+    // 建。失败时不得留下任何设备状态改动（调用方会保持既有路径）。
+    // `seed` 带首批尺寸，因为 DLSS 的 feature 创建只能发生在命令列表打开时，
+    // 真正的创建推迟到第一次 evaluate —— 这里只需要记下上限尺寸。
+    virtual bool initialize(CommandContext* ctx, const mcdr_sr_dispatch& seed) = 0;
+    virtual void onResize(int32_t renderWidth, int32_t renderHeight, int32_t displayWidth,
+                          int32_t displayHeight) = 0;
+    virtual bool evaluate(CommandContext* ctx, const mcdr_sr_dispatch& desc) = 0;
+    // ^ 资源与屏障的责任分工（P273，实现方必须遵守）：
+    //   1) **过渡归 provider**：它自己把输入过渡到后端要的状态、把输出过渡到 UAV / RT。
+    //      必须走 transitionTextureTo / transitionTo 的跟踪路径，不许自己写裸 ResourceBarrier
+    //      —— 本模块的 endRenderPass 每次都把附件显式回切 COMMON（P11），实现方猜不到
+    //      Before 状态（mcdr_dlss_impl.h 的约束①）。
+    //   2) **返回时 pColorOutput 必须处于 RENDER_TARGET**：GUI 的目标纹理紧接着就被
+    //      render pass 以 RENDER_TARGET 重新 attach（d3d12_dlss.cpp:2967-2969 就是这么收尾的）。
+    //   3) **描述符堆由调用方收尾**：srEvaluateFrame 在 evaluate 返回后无条件
+    //      restoreDrawHeap(ctx)，所以 provider 不必自己把主堆绑回去。
+    //   4) 私有纹理一律由 provider 在**模块内**创建并登记到跟踪表（P108 教训：实现单元自建、
+    //      未登记的纹理曾导致 RemoveDevice）。
+    // 释放。**不保证**能清掉后端自己的全局状态（DLSS 的 `mcdr_dlss_shutdown` 会连带
+    // 把老路径一起关掉，所以 DLSS 的实现是空操作）。
+    virtual void shutdown() = 0;
+};
+
+// ---- 注册表（P280 的热切换在「期望 → 生效」这两级之间完成）----
+// 返回 1=记住 0=非法 id（会把原因记进 status 行）。
+int32_t srPickBackend(int32_t backendId);
+// 填能力表；`backendId` 必须是 0..3。不改注册表状态，只用一次查询。
+void srFillCaps(int32_t backendId, mcdr_sr_caps& out);
+// 返回 1=已生效 0=后端不可用 -1=参数非法。重复调用同一个后端是幂等的。
+int32_t srCreateProvider(CommandContext* ctx, int32_t backendId, int32_t maxRenderWidth,
+                         int32_t maxRenderHeight, int32_t displayWidth, int32_t displayHeight);
+int32_t srResizeProvider(int32_t renderWidth, int32_t renderHeight, int32_t displayWidth,
+                         int32_t displayHeight);
+int32_t srEvaluateFrame(CommandContext* ctx, const mcdr_sr_dispatch& desc);
+// P274：后端报告它期望的 jitter 相位长度（0 = 不适用）。上层据此决定是"让后端接受我们
+// 的序列"（DLSS/SL）还是"切到后端序列"（FSR/XeSS），见 `D3D12Temporal.adoptPhaseCount`。
+int32_t srJitterPhaseCount(int32_t backendId, int32_t renderWidth, int32_t displayWidth);
+// 释放当前 provider（幂等）。调用后生效后端回到 None。
+void srReleaseProvider(void);
+std::string srStatusText(void);
+
+// ---- 后端工厂（P277 起：每个后端一个实现单元，注册表按需懒建）----
+// FSR 在 `src\core\d3d12_fsr.cpp`，XeSS 在 P278 加进来。工厂返回 nullptr 表示"运行库不在"，
+// 注册表把原因写进 status 行后让 Evaluate 走"没有超分"的老路径。
+std::unique_ptr<IUpscaleProvider> makeFsrProvider();
+// caps 的 FSR 分支。**不建上下文**：caps 只回答"这个后端能不能用"。
+void fillFsrCaps(mcdr_sr_caps& out);
+// 运行库是否载入成功。给"没有上下文也要回答"的地方用（例如相位长度/诊断行）。
+bool fsrRuntimeAvailable();
+// XeSS（P278，`src\core\d3d12_xess.cpp`）。
+std::unique_ptr<IUpscaleProvider> makeXessProvider();
+void fillXessCaps(mcdr_sr_caps& out);
+bool xessRuntimeAvailable();
+
+// ---------------------------------------------------------------------------
 // Draw 命令录制（P6）：渲染 pass 内的 draw 全链路。
 // 对应官方 VulkanRenderPass：setPipeline / bindTexture / setUniform /
 // enableScissor / setVertexBuffer / setIndexBuffer / drawIndexed / draw /
@@ -1138,6 +1252,11 @@ struct Dx12Surface {
     // OutputWindow 为空，RTSS 因此无法定位覆盖层。为 nullptr 时走旧行为（直接
     // 用 hwnd，或 composition 回退）。
     HWND presentWindow = nullptr;
+    // P267 SeamlessWindowHost：承载 swapchain 的子窗口宿主（mcdr_window_host.h 的不透明句柄）。
+    // 非空表示 presentWindow 是它创建的、从未接触过 GL 的子窗口；销毁 surface 时 release。
+    void* host = nullptr;
+    // P267：宿主子窗口是否已经显示（第一帧 Present 成功后置真，见 presentSurface）。
+    bool hostRevealed = false;
     UINT width = 1;
     UINT height = 1;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;

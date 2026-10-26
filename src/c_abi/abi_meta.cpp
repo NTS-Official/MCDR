@@ -151,6 +151,53 @@ const std::vector<mcdr_abi_field>& layoutTable() {
         MCDR_FIELD(mcdr_dlss_input, pInOutput),
         MCDR_FIELD(mcdr_dlss_input, _pad1),
         MCDR_FIELD(mcdr_dlss_input, _pad2),
+
+        // P271 SR 抽象层的两张新表。与上面同理：Kotlin 的 MCDR_Layout.kt 逐字段镜像，
+        // verify() 双向比对，任何一侧漏字段都会在设备创建时 abort。字段名必须与
+        // mcdr_abi.h 的 typedef 逐字一致（含 _pad1）。
+        MCDR_FIELD(mcdr_sr_caps, backend),
+        MCDR_FIELD(mcdr_sr_caps, available),
+        MCDR_FIELD(mcdr_sr_caps, coupledDenoise),
+        MCDR_FIELD(mcdr_sr_caps, needsExposure),
+        MCDR_FIELD(mcdr_sr_caps, takesMasks),
+        MCDR_FIELD(mcdr_sr_caps, externalHeap),
+        MCDR_FIELD(mcdr_sr_caps, jitterPhaseCount),
+        MCDR_FIELD(mcdr_sr_caps, minRenderWidth),
+        MCDR_FIELD(mcdr_sr_caps, minRenderHeight),
+        MCDR_FIELD(mcdr_sr_caps, maxRenderWidth),
+        MCDR_FIELD(mcdr_sr_caps, maxRenderHeight),
+        MCDR_FIELD(mcdr_sr_caps, nativeAA),
+        MCDR_FIELD(mcdr_sr_caps, reserved),
+        MCDR_FIELD(mcdr_sr_caps, note),
+
+        MCDR_FIELD(mcdr_sr_dispatch, renderWidth),
+        MCDR_FIELD(mcdr_sr_dispatch, renderHeight),
+        MCDR_FIELD(mcdr_sr_dispatch, displayWidth),
+        MCDR_FIELD(mcdr_sr_dispatch, displayHeight),
+        MCDR_FIELD(mcdr_sr_dispatch, jitterOffsetX),
+        MCDR_FIELD(mcdr_sr_dispatch, jitterOffsetY),
+        MCDR_FIELD(mcdr_sr_dispatch, motionVectorScaleX),
+        MCDR_FIELD(mcdr_sr_dispatch, motionVectorScaleY),
+        MCDR_FIELD(mcdr_sr_dispatch, preExposure),
+        MCDR_FIELD(mcdr_sr_dispatch, frameTimeDeltaMs),
+        MCDR_FIELD(mcdr_sr_dispatch, cameraNear),
+        MCDR_FIELD(mcdr_sr_dispatch, cameraFar),
+        MCDR_FIELD(mcdr_sr_dispatch, cameraVerticalFov),
+        MCDR_FIELD(mcdr_sr_dispatch, sharpness),
+        MCDR_FIELD(mcdr_sr_dispatch, reset),
+        MCDR_FIELD(mcdr_sr_dispatch, hdrInput),
+        MCDR_FIELD(mcdr_sr_dispatch, backend),
+        MCDR_FIELD(mcdr_sr_dispatch, flags),
+        MCDR_FIELD(mcdr_sr_dispatch, pColorInput),
+        MCDR_FIELD(mcdr_sr_dispatch, pColorOutput),
+        MCDR_FIELD(mcdr_sr_dispatch, pDepth),
+        MCDR_FIELD(mcdr_sr_dispatch, pMotionVectors),
+        MCDR_FIELD(mcdr_sr_dispatch, pReactiveMask),
+        MCDR_FIELD(mcdr_sr_dispatch, pExposure),
+        MCDR_FIELD(mcdr_sr_dispatch, depthFormatOrdinal),
+        MCDR_FIELD(mcdr_sr_dispatch, cameraAspectRatio),
+        MCDR_FIELD(mcdr_sr_dispatch, viewSpaceToMetersFactor),
+        MCDR_FIELD(mcdr_sr_dispatch, _pad2),
     };
     return table;
 }
@@ -201,6 +248,14 @@ void MCDR_CALL mcdrSetShutdownTraceAlways(int32_t always) {
     // 进度标记无视 logLevel 恒定输出（退出卡死时唯一的线索）；0 = 它们退回普通 INFO。
     // 日志语义（INFO）不变，只是"是否被 logLevel 过滤"由 Java 侧决定。
     d3d12_mc::setShutdownTraceAlways(always != 0);
+}
+
+int32_t MCDR_CALL mcdrSetLogFile(const char* utf8Path) {
+    // P250：配置项 `[logging] nativeLogFile`。启动器（Prism 等）不把子进程 stdout/stderr 落盘，
+    // 所以"用户端出问题却拿不到 native 行"是常态；这条导出让 Java 侧把镜像文件的路径推进来。
+    // 真正的 fopen 发生在下一次写日志时（见 d3d12_device.cpp 的 mirrorLogToFile）。
+    d3d12_mc::setLogFile(utf8Path);
+    return (utf8Path != nullptr && utf8Path[0] != '\0') ? 1 : 0;
 }
 
 void MCDR_CALL mcdr_dx12SetEnvironment(const char* name, const char* value) {
@@ -359,8 +414,7 @@ int32_t MCDR_CALL mcdr_dx12SetDlssOutput(mcdr_object* tex) {
     return d3d12_mc::setDlssOutput(tex);
 }
 
-int32_t MCDR_CALL mcdr_dx12SetDlssVendorDir(const char* utf8Dir) {
-    // P108. The Java side announces <user.dir>\dxrmc\ (the directory it extracted MCDR.dll
+int32_t MCDR_CALL mcdr_dx12SetDlssVendorDir(const char* utf8Dir) {    // P108. The Java side announces <user.dir>\dxrmc\ (the directory it extracted MCDR.dll
     // and the vendor DLLs into). The native side widens the process DLL search path with it,
     // because that directory is not on the default search order: the process working
     // directory is the game directory while the executable is the JDK's java.exe, so the
