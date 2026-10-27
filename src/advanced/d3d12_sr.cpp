@@ -282,6 +282,22 @@ int32_t srPickBackend(int32_t backendId) {
     return 1;
 }
 
+// P300（补 P281 的已知缺口）：让帧生成那边能问「超分现在**跑着**的是哪家」。
+// 为什么需要：SR=FSR/XeSS 时 DLSS-G 拿不到 Streamline 的 `ScalingOutputColor` tag
+// （那条 tag 只有走 SL 的超分才有），于是它会静默不插帧。界面挡住了，配置文件挡不住 ——
+// `[sr] backend` 与 `[dlss] framegen` 是两个独立键，所以要在 native 侧给一句可用性判断。
+//
+// 为什么问 `gSrActive` 而不是 `gSrPicked`（2026-10-27 实测纠正）：JVM 侧**从不调**
+// `mcdr_dx12SrPick`，它走的是 `mcdr_dx12SrCreate(encoder, backend, …)`（`SuperResolution.kt:951`），
+// 于是 `gSrPicked` 永远是 NONE —— 拿它做门控等于没有门控。`gSrActive` 才是 create 成功后真正
+// 在用的那家；SR 还没建出来时它是 NONE，此时放行帧生成是对的（启动早期），后面真换成 FSR/XeSS
+// 时由 P300 的自动回滚（60 帧滞回）收场。
+// 用户选的那一家（`mcdr_dx12SrPick` 写进来的）。JVM 现在会在 `load` / `currentBackend` /
+// `requestBackend` 三处推一次（`pushBackendToNative`），所以这个值在启动早期就可信。
+int32_t srSelectedBackend(void) { return gSrPicked; }
+
+int32_t srActiveBackend(void) { return gSrActive; }
+
 void srFillCaps(int32_t backendId, mcdr_sr_caps& out) {
     out = mcdr_sr_caps{};
     out.backend = backendId;

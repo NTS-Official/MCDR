@@ -91,6 +91,11 @@ HRESULT createDxgiFactory(ComPtr<T>& factory) {
     if (mcdr_sl_upgrade_interface(&raw) != 0 && raw != nullptr) {
         // 成功时是 replace in place：原生那一个引用已经变成代理的引用，Attach 不 AddRef。
         factory.Attach(static_cast<T*>(raw));
+        // P293：把链的归属登记成"SL 代理"，供 mcdr_fg_caps.chainOwner / FgStatus 查询。
+        // 注意 P253 实测的语义：代理工厂**不是** v-table 接管（见上面 :72-78），所以
+        // Present 槽仍然解析到我们这条链，RTSS 的 OSD 照样能画 —— 这正是"升级代理"与
+        // "让 interposer 改写 v-table" 两种集成方式的区别。
+        fgNoteChainOwner(MCDR_FG_CHAIN_SL_PROXY);
     }
     return hr;
 }
@@ -1116,6 +1121,9 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
     }
     // P35：配置完成后才设为 active surface，确保渲染线程不会在 backBuffers 未就绪时 acquire。
     setActiveSurface(s);
+    // P297：resize 是 provider 必须知道的事件（FSR-FG / XeSS-FG 的内部历史要按新尺寸重建）。
+    // 放在 setActiveSurface 之后：provider 万一要查 surface 状态，看到的是新链。
+    fgOnResize(static_cast<int32_t>(width), static_cast<int32_t>(height));
     dbgLogInfo("configureSurface: registered active surface=%p bbCount=%u", reinterpret_cast<void*>(s),
                static_cast<UINT>(s->backBuffers.size()));
     {
@@ -1126,6 +1134,118 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
         dbgLogInfo("P98 configureSurface: %dx%d total=%.1f ms (waitRender=%.1f waitPresents=%.1f idle=%.1f resize+rest=%.1f)",
                width, height, p98total, p98waitRenderMs, p98waitPresentsMs, p98idleMs, p98other);
     }
+    return {};
+}
+
+// P296（D13）：开关帧生成时按官方检查表重建交换链（同尺寸、同 HWND、同呈现模式）。
+//
+// 为什么单独一条路径、不复用 configureSurface 里的 resize 兜底：那条路径的参数来自
+// 「用户/窗口要求的新尺寸」，与 P98 计时、「尺寸没变就跳过」、ResizeBuffers 十次重试
+// 缠在一起；FG 开关要的恰是「尺寸不变、只是把链换成一份全新的」，共用会让两条语义
+// 互相污染（尺寸没变会被跳过 —— 而那正是 FG 的场景）。
+//
+// 调用点必须是**帧首**（acquireSurface 开头），不能在 Present 里：Present 时本帧的
+// back buffer 刚画完，重建等于丢掉这一帧；帧首则是「上一帧已上屏、本帧还没开画」。
+// 独占全屏一律拒绝：P196 记录过「重建 + SetFullscreenState」会让画面冻结，FG 开关不
+// 值得押上这个风险 —— 拒绝后链保持原样，只是少了官方建议的那次重建。
+mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why) {
+    if (s == nullptr || s->swapChain == nullptr) {
+        return mcdr::err("rebuildSwapChainForFg", "surface not created");
+    }
+    if (s->hwnd == 0) {
+        return mcdr::err("rebuildSwapChainForFg", "surface has no window");
+    }
+    if (s->exclusive) {
+        return mcdr::err("rebuildSwapChainForFg",
+                         "refused in exclusive fullscreen (P196: rebuild + fullscreen can freeze)");
+    }
+    DeviceContext& ctx = deviceContext();
+    // 与 configureSurface 的重建分支同一收尾顺序：先把残留的 acquired back buffer 用
+    // Present(0,0) 交还（只用 bufferHeld 判定，避免对已 present 的 buffer 再推一帧），
+    // 再等 GPU 真空闲 —— 旧链的 back buffer 仍被上一帧命令引用时，DWM 会拒绝同一 HWND
+    // 上的新链（E_ACCESSDENIED）。
+    if (s->bufferHeld.exchange(false)) {
+        s->swapChain->Present(0, 0);
+    }
+    s->currentImageIndex = -1;
+    (void)deviceWaitIdle();
+    s->swapChain.Reset();
+    s->backBuffers.clear();
+    // P71：不清 rtvHandles —— 句柄在 rtvHeap 上是 bump 分配、可复用；清了反复重建会把
+    // kRtvHeapSize 用尽（"RTV descriptor heap exhausted"）。
+    s->lastBlitIndex = -1;
+
+    ComPtr<IDXGIFactory4> factory;
+    HRESULT hr = createDxgiFactory(factory);
+    if (FAILED(hr)) {
+        return mcdr::err("rebuildSwapChainForFg", "CreateDXGIFactory1 failed " + hrText(hr));
+    }
+    // composition 模式下 composition 对象属于 HWND，只能复用不能重建（对同一 HWND 重复
+    // CreateTargetForHwnd 会返回 WINDOW_ALREADY_COMPOSED）。
+    SwapChainBundle reuse;
+    if (s->compositionMode) {
+        reuse.composition = true;
+        reuse.dcompDevice = s->dcompDevice;
+        reuse.dcompTarget = s->dcompTarget;
+        reuse.dcompVisual = s->dcompVisual;
+    }
+    SwapChainBundle bundle;
+    const UINT w = s->width == 0 ? 1u : s->width;
+    const UINT h = s->height == 0 ? 1u : s->height;
+    auto made = createSwapChainForWindow(factory.Get(), ctx.queue.Get(),
+                                         reinterpret_cast<HWND>(s->hwnd), s->presentWindow, w, h,
+                                         s->compositionMode ? &reuse : nullptr, bundle,
+                                         s->swapChainFormat);
+    if (!made) {
+        return mcdr::err("rebuildSwapChainForFg", made.error().message);
+    }
+    if (bundle.composition && s->presentWindow != nullptr) {
+        // 重建时退化成 composition：呈现子窗口只会盖住合成画面，销毁它。
+        paintParentBlackBeforeDestroy(s->presentWindow);
+        DestroyWindow(s->presentWindow);
+        s->presentWindow = nullptr;
+    }
+    if (FAILED(bundle.swapChain.As(&s->swapChain))) {
+        return mcdr::err("rebuildSwapChainForFg", "swapchain does not support IDXGISwapChain3");
+    }
+    s->compositionMode = bundle.composition;
+    s->dcompDevice = bundle.dcompDevice;
+    s->dcompTarget = bundle.dcompTarget;
+    s->dcompVisual = bundle.dcompVisual;
+    s->allowTearing = bundle.allowTearing;
+    if (s->compositionMode) {
+        auto rebind = setCompositionContent(s->dcompVisual.Get(), s->dcompDevice.Get(), s->swapChain.Get());
+        if (!rebind) {
+            return mcdr::err("rebuildSwapChainForFg", "rebind composition content failed: " +
+                                                          rebind.error().message);
+        }
+    }
+    // 重新取 back buffer + RTV（句柄持久复用，见上）。
+    s->backBuffers.resize(kSurfaceBufferCount);
+    s->surfaceFences.assign(kSurfaceBufferCount, 0);
+    if (s->rtvHandles.size() != kSurfaceBufferCount) {
+        s->rtvHandles.clear();
+        for (UINT i = 0; i < kSurfaceBufferCount; ++i) {
+            auto rtv = allocRtvHandle();
+            if (!rtv) return std::unexpected<mcdr::Error>(std::move(rtv.error()));
+            s->rtvHandles.push_back(rtv.value());
+        }
+    }
+    for (UINT i = 0; i < kSurfaceBufferCount; ++i) {
+        const HRESULT gb = s->swapChain->GetBuffer(i, IID_PPV_ARGS(&s->backBuffers[i]));
+        if (FAILED(gb)) {
+            return mcdr::err("rebuildSwapChainForFg", "GetBuffer failed " + hrText(gb));
+        }
+        ctx.device->CreateRenderTargetView(s->backBuffers[i].Get(), nullptr, s->rtvHandles[i]);
+    }
+    setActiveSurface(s);
+    // P297：FG 开关引发的重建对 provider 来说也是一次 resize（它自己的历史资源尺寸跟着链走）。
+    // 注意这是**同尺寸**的重建（尺寸没变，只是链换了），provider 必须能接受这种调用。
+    fgOnResize(static_cast<int32_t>(w), static_cast<int32_t>(h));
+    dbgLogInfo("P296 rebuildSwapChainForFg: %ux%u done (why=%s composition=%d tearing=%d chainOwner=%d)",
+               static_cast<unsigned>(w), static_cast<unsigned>(h), why == nullptr ? "?" : why,
+               static_cast<int>(s->compositionMode), static_cast<int>(s->allowTearing),
+               static_cast<int>(fgChainOwner()));
     return {};
 }
 
@@ -1145,6 +1265,25 @@ mcdr::Result<void> acquireSurface(Dx12Surface* s) {
     }
     if (!s || !s->swapChain) {
         return mcdr::err("acquireSurface", "surface not created");
+    }
+    // P296（D13）：帧生成开关挂起的链重建必须在这里消费 —— 帧首、上一帧已上屏、本帧
+    // 还没开画。放 Present 里会丢掉刚画完的那一帧；放 blit 里会与已 acquire 的 back
+    // buffer 冲突。失败不自动重试：`fgNoteChainRebuildDone(..., 0, msg)` 会撤销请求，
+    // 用户下次改开关才会再试一次。
+    if (fgChainRebuildPending()) {
+        auto rebuiltFgChain = rebuildSwapChainForFg(s, "fg-toggle");
+        if (!rebuiltFgChain) {
+            // 重建的前半程已经 Reset 过旧链：此刻 surface 手上没有任何 back buffer，绝不能
+            // 继续往下走（下面第一件事就是 GetCurrentBackBufferIndex，空指针即崩）。返回
+            // 失败让 JVM 跳过本帧 blit，同时置 suboptimal 让它走 surface 重建 —— 与
+            // waitForPendingPresents 超时那条既有路径同一语义。
+            s->suboptimal = true;
+            const std::string why = rebuiltFgChain.error().message;
+            fgNoteChainRebuildDone(fgChainOwner(), 0, why.c_str());
+            return mcdr::err("acquireSurface",
+                             "frame generation swapchain rebuild failed: " + why);
+        }
+        fgNoteChainRebuildDone(fgChainOwner(), 1, nullptr);
     }
     // P48（多帧飞行）：Present 尚未完成时 GetCurrentBackBufferIndex 不会轮转，会返回
     // 上一帧已 Present 的同一个 back buffer（两帧写同一处 → 闪帧/撕裂）。真实 acquire
@@ -1651,6 +1790,16 @@ void presentSurface(Dx12Surface* s) {
         }
     }
     // P113：Reflex 要求 Present 之前 sleep（文档 ProgrammingGuideReflex.md §5）。
+    //
+    // P296：帧生成的两侧钩子就套在 Reflex 这一点上 —— 顺序是 fgBeforePresent →
+    // reflex_before_present → Present → reflex_after_present → fgAfterPresent：
+    //   * `fgBeforePresent` 先下发本帧的 FG 选项（`slDLSSGSetOptions` 的生效点是「下一次
+    //     Present」，官方 ProgrammingGuideDLSS_G.md §6），因此它必须在本帧 Present 之前；
+    //     放在 Reflex sleep 之前还顺带避开了 sleep 本身的时间被算进选项下发。
+    //   * `fgAfterPresent` 在呈递之后记账（本轮 R2 的 presented 统计），不碰资源。
+    // 两家都是空操作以外的东西吗？v1 的 DLSS-G provider 里 afterPresent 仍是空的，见
+    // `d3d12_framegen.cpp` 的注释：本项目的 FG 状态全在 present 之前决定。
+    fgBeforePresent();
     mcdr_reflex_before_present();
     HRESULT hr = s->swapChain->Present(syncInterval, flags);
     // P267: only now that a real frame reached the screen do we show the child window that
@@ -1687,6 +1836,8 @@ void presentSurface(Dx12Surface* s) {
         }
     }
     mcdr_reflex_after_present();  // P115：PCL 的 ePresentEnd 标记
+    // P296：呈递之后的钩子（与上面 fgBeforePresent 成对，顺序见那里的注释）。
+    fgAfterPresent();
     // present 后 backbuffer 所有权已释放（vanilla 每帧 acquire->blit->present，
     // 若此处不重置，configureSurface 的 ResizeBuffers 会误以为仍有 acquired
     // backbuffer 而返回 DXGI_ERROR_NOT_CURRENTLY_AVAILABLE -> 画面冻结）。

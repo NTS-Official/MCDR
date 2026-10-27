@@ -10,6 +10,7 @@ module;
 module mcdr.abi.common;
 
 #include "mcdr_abi.h"   // public C ABI：extern "C" 声明无法从模块导出，故保持头文件
+#include "mcdr_dlss_impl.h"  // P291e: mcdr_dlss_output_state()（DLSS 输出纹理的真实状态）
 #include "mcdr_hdr_state.h"  // P198: 建链时实际用掉的 HDR 模式（普通 TU 的 C 状态）
 #include "mcdr_rt_state.h"  // P117: 光追可见性分层总开关（普通 TU 的 C 状态）
 #include "mcdr_surface_opts_state.h"  // P251: 交换链建链选项（普通 TU 的 C 状态）
@@ -66,8 +67,15 @@ int32_t bindErr(const mcdr::Result<void>& r, std::string& err) {
 
 // Reads a 3x3 sample grid out of `res` and writes 9 pixels x RGBA as 36 ints.
 // Values are the raw bytes (0-255), not normalised — matching the original.
+// P291e：`fromState` 必须是这张纹理**当前真实所处的状态**。原来写死 COMMON，只对
+// "建完就没被 GPU 写过"的纹理成立；被 DLSS 写过的输出纹理在帧末停在 COPY_SOURCE
+// （d3d12_dlss.cpp:2758）或 UNORDERED_ACCESS（:2783，FG 开时），按 COMMON 转过去是
+// 状态不匹配的非法 barrier，取回的内容未定义 —— 实测恒为 0，于是"全黑"判据一直是
+// 在拿垃圾做决定（2026-10-27 用户 m01721 的抖动就是这么来的：DLSS 输出明明正常，
+// 却被熔断成永久线性 blit）。
 int32_t readbackSamples36(ID3D12Resource* res, UINT w, UINT h, UINT bpp, DXGI_FORMAT fbFmt,
-                          D3D12_RESOURCE_STATES finalState, int32_t* out, std::string& err) {
+                          D3D12_RESOURCE_STATES fromState, D3D12_RESOURCE_STATES finalState,
+                          int32_t* out, std::string& err) {
     DeviceContext& ctx = deviceContext();
     if (!ctx.device || !ctx.queue || !res) {
         err = "device not initialized";
@@ -123,7 +131,7 @@ int32_t readbackSamples36(ID3D12Resource* res, UINT w, UINT h, UINT bpp, DXGI_FO
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = res;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateBefore = fromState;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     cl->ResourceBarrier(1, &b);
 
@@ -295,15 +303,19 @@ uint64_t MCDR_CALL mcdr_dx12GetBackBufferHandle(mcdr_surface* surface) {
     return static_cast<uint64_t>(getBackBufferHandle(surface));
 }
 
-int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixels(mcdr_object* texture, int32_t* out) {
+// P291e：两个公开导出共用这一段。`fromState` 由调用方给出**这张纹理当前的真实状态**
+// （见 readbackSamples36 上方注释）；读回之后恢复成同一个状态，所以对 native 内部的
+// 状态跟踪没有净影响。
+static int32_t readbackTexturePixelsCore(mcdr_object* texture, int32_t* out, int32_t fromState,
+                                         const char* fn) {
     if (!out) {
-        return mcdr::abi::failWith("mcdr_dx12ReadbackTexturePixels", "out buffer is null");
+        return mcdr::abi::failWith(fn, "out buffer is null");
     }
     DeviceContext& ctx = deviceContext();
     Dx12Object* tex = texture;
     if (!ctx.device || !ctx.queue || !tex || tex->kind != Dx12Object::Kind::Texture || !tex->resource) {
         return mcdr::abi::failWith(
-            "mcdr_dx12ReadbackTexturePixels",
+            fn,
             "invalid handle (kind=" + std::to_string(tex ? static_cast<int>(tex->kind) : -1) + ")");
     }
     ID3D12Resource* r = tex->resource.Get();
@@ -311,7 +323,7 @@ int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixels(mcdr_object* texture, int32_t* 
     const UINT w = static_cast<UINT>(td.Width);
     const UINT h = static_cast<UINT>(td.Height);
     if (w == 0 || h == 0 || w > 16384 || h > 16384) {
-        return mcdr::abi::failWith("mcdr_dx12ReadbackTexturePixels",
+        return mcdr::abi::failWith(fn,
                                    "bad dims " + std::to_string(w) + "x" + std::to_string(h));
     }
     UINT bpp = 4;
@@ -355,8 +367,9 @@ int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixels(mcdr_object* texture, int32_t* 
         fbFmt = td.Format;
     }
     std::string err;
-    if (!readbackSamples36(r, w, h, bpp, fbFmt, D3D12_RESOURCE_STATE_COMMON, out, err)) {
-        return mcdr::abi::failWith("mcdr_dx12ReadbackTexturePixels", err);
+    const auto from = static_cast<D3D12_RESOURCE_STATES>(fromState);
+    if (!readbackSamples36(r, w, h, bpp, fbFmt, from, from, out, err)) {
+        return mcdr::abi::failWith(fn, err);
     }
     // Grid index of the centre sample is (yi=1, xi=1) -> element offset (1*3+1)*4 = 16.
     constexpr int kCenter = (1 * 3 + 1) * 4;
@@ -366,6 +379,24 @@ int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixels(mcdr_object* texture, int32_t* 
                (out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0) ? 1 : 0);
     return 1;
 }
+
+int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixels(mcdr_object* texture, int32_t* out) {
+    return readbackTexturePixelsCore(texture, out, static_cast<int32_t>(D3D12_RESOURCE_STATE_COMMON),
+                                     "mcdr_dx12ReadbackTexturePixels");
+}
+
+// P291e：已知起始状态版本。给"被 GPU 写过、当前不在 COMMON"的纹理用 —— 典型场景是
+// DLSS 的输出纹理（帧末停在 COPY_SOURCE 或 UNORDERED_ACCESS）。状态传错读回的就是
+// 未定义内容，所以调用方必须先问 native 这张纹理现在在哪（例如
+// `mcdr_dx12DlssOutputState`），不要凭猜。
+int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixelsIn(mcdr_object* texture, int32_t fromState,
+                                                   int32_t* out) {
+    return readbackTexturePixelsCore(texture, out, fromState, "mcdr_dx12ReadbackTexturePixelsIn");
+}
+
+// P291e：DLSS 输出纹理当前所处的状态（D3D12_RESOURCE_STATES 数值）。
+// 0 (COMMON) = 这一帧没有输出纹理/未知，调用方不要据此采样。
+int32_t MCDR_CALL mcdr_dx12DlssOutputState(void) { return mcdr_dlss_output_state(); }
 
 void MCDR_CALL mcdr_dx12DumpTextureToFile(mcdr_object* texture, const char* tag) {
     // Reuses dbgReadbackTexturePixels (waitIdle + its own command list +
@@ -436,7 +467,9 @@ int32_t MCDR_CALL mcdr_dx12ReadbackSurfacePixels(mcdr_surface* surface, int32_t*
     std::string err;
     // The back buffer is always R8G8B8A8_UNORM, and after the copy it must go back
     // to PRESENT (not COMMON) or the next Present fails.
-    if (!readbackSamples36(bb, w, h, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, out, err)) {
+    // P291e：Present 之后 back buffer 就停在 PRESENT，barrier 的 StateBefore 必须照实写。
+    if (!readbackSamples36(bb, w, h, 4, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT,
+                           D3D12_RESOURCE_STATE_PRESENT, out, err)) {
         return mcdr::abi::failWith("mcdr_dx12ReadbackSurfacePixels", err);
     }
     dbgLogInfo("[dx12-java] readback %ux%u center=(%d,%d)=(%d,%d,%d,%d) corners=%d black=%d", w,

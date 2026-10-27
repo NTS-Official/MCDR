@@ -1153,6 +1153,12 @@ public:
 // ---- 注册表（P280 的热切换在「期望 → 生效」这两级之间完成）----
 // 返回 1=记住 0=非法 id（会把原因记进 status 行）。
 int32_t srPickBackend(int32_t backendId);
+// P300：超分现在**跑着**的是哪一家（`MCDR_SR_BACKEND_*`；还没 create 时是 NONE）。
+// 注意是 `gSrActive` 而不是 pick 值：JVM 侧从不调 `mcdr_dx12SrPick`，只调 `SrCreate`。
+// 帧生成用它做互斥判断：SR 不是 DLSS 时 DLSS-G 拿不到 Streamline 的 `ScalingOutputColor` tag。
+// 用户选的那一家（mcdr_dx12SrPick 写的），启动早期就可信。
+int32_t srSelectedBackend(void);
+int32_t srActiveBackend(void);
 // 填能力表；`backendId` 必须是 0..3。不改注册表状态，只用一次查询。
 void srFillCaps(int32_t backendId, mcdr_sr_caps& out);
 // 返回 1=已生效 0=后端不可用 -1=参数非法。重复调用同一个后端是幂等的。
@@ -1180,6 +1186,102 @@ bool fsrRuntimeAvailable();
 std::unique_ptr<IUpscaleProvider> makeXessProvider();
 void fillXessCaps(mcdr_sr_caps& out);
 bool xessRuntimeAvailable();
+
+// ---------------------------------------------------------------------------
+// 帧生成（FG）Provider 接口层（P293）
+// ---------------------------------------------------------------------------
+// 为什么和 SR 放在同一个模块、同一份接口单元里（D15）：provider 必须在 Present 的两侧
+// 插钩子（要能读交换链、要能解包 Dx12Object、要能改 present 的同步间隔），这三件事只有
+// 本模块能做 —— 与 P272 把 IUpscaleProvider 留在这里是同一条理由（见上面 :1105-1107）。
+//
+// 与 IUpscaleProvider 的**形状差异**（有意为之）：
+//   - 没有 evaluate：帧生成不往我们的命令列表里录东西，它插在呈现路径上；
+//   - 没有 fillCaps 之外的"尺寸查询"：尺寸从 dispatch 逐帧给；
+//   - 多一对 beforePresent / afterPresent：Present 是唯一必须由调用方驱动的时刻。
+// 原稿 §5 的 8 方法（begin_frame / submit_inputs / end_frame …）没有采纳，见 fg_plan.md E6。
+enum class FgBackendId : int32_t {
+    None = MCDR_FG_BACKEND_NONE,
+    DlssG = MCDR_FG_BACKEND_DLSSG,
+    FsrFg = MCDR_FG_BACKEND_FSRFG,
+    XessFg = MCDR_FG_BACKEND_XESSFG,
+};
+
+class IFrameGenProvider {
+public:
+    IFrameGenProvider() = default;
+    IFrameGenProvider(const IFrameGenProvider&) = delete;
+    IFrameGenProvider& operator=(const IFrameGenProvider&) = delete;
+    virtual ~IFrameGenProvider() = default;
+
+    virtual FgBackendId backend() const = 0;
+    // 填能力表（`note` 由实现写；清零与 backend 字段由注册表负责）。
+    virtual void fillCaps(mcdr_fg_caps& out) const = 0;
+    // 设期望值。**只记录**：真正下发发生在下一次 beforePresent（渲染线程）。
+    // 返回 true = 已接受（不代表已生效，生效看 presented()）。
+    virtual bool setMode(const mcdr_fg_dispatch& desc) = 0;
+    // Present 之前 / 之后各一次，都在渲染线程。**不许在这里 Present**（D4）：
+    // 链的所有权见 chainOwner()，provider 只做"Present 之前该做的准备"。
+    virtual void beforePresent() = 0;
+    virtual void afterPresent() = 0;
+    // 上一次 Present 真正提交的帧数（1 = 没插帧）。
+    virtual int32_t presented() const = 0;
+    virtual void onResize(int32_t displayWidth, int32_t displayHeight) = 0;
+    // 关。**必须先显式下发 eOff 再允许链回原生**（E10 / P213e），否则会留下
+    // 「界面说关了、后端还在插帧」。实现不得改动链本身的所有权。
+    virtual void shutdown() = 0;
+};
+
+// ---- 注册表（与 SR 注册表同风格：期望 → 生效两级）----
+// 返回 1=记住 0=非法 id（原因进 status 行）。
+int32_t fgPickBackend(int32_t backendId);
+// 填能力表；`backendId` 必须是 0..3。不改注册表状态。
+void fgFillCaps(int32_t backendId, mcdr_fg_caps& out);
+// 懒建当前生效后端。返回 1=就绪 0=不可用（原因进 status 行）。重复调用幂等。
+int32_t fgEnsureProvider(void);
+// 记下期望值并转给 provider（provider 未建时按需建）。返回 1=已接受 0=不可用 -1=参数非法。
+int32_t fgSetMode(const mcdr_fg_dispatch& desc);
+// 由 presentSurface 在 Present 前后调用（渲染线程）。没有生效后端时是空操作。
+void fgBeforePresent(void);
+void fgAfterPresent(void);
+// 上一次真正提交的帧数；没有生效后端时返回 1（= 没插帧），与老语义一致。
+int32_t fgPresented(void);
+void fgOnResize(int32_t displayWidth, int32_t displayHeight);
+// P297：三轨帧号的中间那条。provider 真正向后端提交了一帧时调一次，把**自己**的严格 +1 计数
+// 写进注册表（present id 是 FSR-FG / XeSS-FG 的硬要求，跳号会让它们静默丢帧）。
+// DLSS-G 不提交 —— 帧 token 由 SL 自己管，所以它从不调这里，backendFrameId 恒为 0。
+void fgNoteBackendFrame(uint64_t backendFrameId);
+// 释放（幂等）。等 GPU 追平的做法与 P280 一致：只等已提交的 fence 值，不等 +1。
+void fgReleaseProviderWithWait(CommandContext* ctx);
+std::string fgStatusText(void);
+// P300：状态打包成 int32（位布局见 `include\mcdr_abi.h` 的 `mcdr_dx12FgState`）。
+// 存在理由：回滚会在 native 侧把期望的 mode 清成 0，而 JVM 的 options.txt 仍写着「开」，
+// 只读 options.txt 的界面会说假话 —— 给它一个整数值比让它解析状态文本可靠。
+int32_t fgStatePacked(void);
+
+// ---- 链归属（P296 的可查询状态，P253 之后由「建链那一刻」决定）----
+// `d3d12_surface.cpp` 在 DXGI 工厂被升级成 SL 代理工厂成功之后写一次；provider 改不动它。
+void fgNoteChainOwner(int32_t owner);
+int32_t fgChainOwner(void);
+
+// ---- 链重建请求（P296 / D13）----
+// 官方检查表要求「每次开关 DLSS-G 都重建 swapchain」，否则关掉之后 SL 的呈现路径上
+// 还留着一层本该省掉的中间开销。做成两段式而不是在 setMode 里直接重建，是因为重建必须
+// 发生在**帧首**：Present 时本帧的 back buffer 刚画完，那一刻重建等于把这一帧丢掉。
+//   1. `fgSetMode` 发现期望的「开/关」与链建成时的状态不一致 → 挂请求（任意线程）；
+//   2. `acquireSurface`（帧首、上一帧已上屏、本帧未开画）调 `fgChainRebuildPending()`
+//      取走并重建，然后 `fgNoteChainRebuildDone(...)` 记账。
+bool fgChainRebuildPending(void);
+// ok != 0：链已按新的开关状态重建（`chainMode` 追平期望值、`rebuilds` +1、`ownerAfterRebuild`
+// 覆盖当前归属）；ok == 0：重建失败，请求撤销但 `chainMode` 不动 —— 下次用户改开关时会再试一次。
+void fgNoteChainRebuildDone(int32_t ownerAfterRebuild, int32_t ok, const char* reason);
+
+// ---- 后端工厂（P293 起：每家一个实现单元，注册表按需懒建）----
+// DLSS-G 的 provider 在 `src\core\d3d12_framegen.cpp` 里，是对既有
+// `mcdr_dlss_set_fg_mode` / `mcdr_dlss_fg_presented`（`include\mcdr_dlss_impl.h`）的薄包装：
+// P293/P295 只新增抽象，不搬动已经在跑的实现（行为等价性优先）。
+std::unique_ptr<IFrameGenProvider> makeDlssGProvider();
+// caps 的 DLSS-G 分支。**不建上下文**：只回答"能不能用、为什么不能"。
+void fillDlssGCaps(mcdr_fg_caps& out);
 
 // ---------------------------------------------------------------------------
 // Draw 命令录制（P6）：渲染 pass 内的 draw 全链路。

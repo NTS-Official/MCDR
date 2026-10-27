@@ -57,14 +57,26 @@ extern "C" {
 //   3. 完成 1、2 之后把这里改成 2u，并同步 MCDR_ABI.kt 的 MCDR_ABI_VERSION = 2。
 //
 // v2 -> v3（P271，超分抽象层）：
-//   - 新增 mcdr_sr_caps（sizeof = 80 / align = 4）与 mcdr_sr_dispatch（sizeof = 128 /
+//   - 新增 mcdr_sr_caps（sizeof = 80 / align = 4）与 mcdr_sr_dispatch（sizeof = 136 /
 //     align = 8）两张表，以及 8 个 mcdr_dx12Sr* 入口（声明见本文件 P271 段）。
+//     注：这里原来写 128，是笔误 —— 结构体自身的注释（P275 段）与 abi_meta.cpp 的
+//     MCDR_FIELD 表都按 136 走（末尾 _pad2 在 132，align 8 再补 4）。
 //   - 老导出一个都没删、一个签名都没改；DLSS 的既有路径原样保留，SrEvaluate 在 v1 里
 //     就是把载荷翻译成 mcdr_dlss_input 后转发给同一条实现。
 //   - **必须同一次改齐**：MCDR_ABI.kt 的 MCDR_ABI_VERSION = 3、两张表的 FFM 镜像、
 //     MCDR_Layout.kt 的 SR_CAPS / SR_DISPATCH 与 EXPECTED_C_SIZES 行、以及
 //     abi_meta.cpp 的 layoutTable()（那边少一个字段，Kotlin 的 verify() 会直接 abort）。
-#define MCDR_ABI_VERSION 3u
+//
+// v3 -> v4（P293–P295，帧生成抽象层）：
+//   - 新增 mcdr_fg_caps（sizeof = 80 / align = 4）与 mcdr_fg_dispatch（sizeof = 96 /
+//     align = 8）两张表，以及 5 个 mcdr_dx12Fg* 入口（声明见本文件 P293 段）。
+//   - 老导出仍然一个没删：mcdr_dx12SetDlssgMode / mcdr_dx12GetDlssgPresented 降级为
+//     **转发**（组一个 dispatch 调 FgSetMode / 直接回 FgPresented），语义与签名不变，
+//     Kotlin 侧 MCDR_ABI.kt 的既有绑定不用改。
+//   - 同一次改齐的四件：MCDR_ABI.kt 的 MCDR_ABI_VERSION = 4 + 5 个新绑定、
+//     MCDR_Layout.kt 的 FG_CAPS / FG_DISPATCH 与 EXPECTED_C_SIZES 行、
+//     abi_meta.cpp 的 layoutTable()（两张新表）、以及本文件的 FG 段。
+#define MCDR_ABI_VERSION 4u
 
 // The same value at runtime, so a stale Java-side constant cannot be optimised
 // away and a mismatched pair fails at load time rather than at first draw.
@@ -763,6 +775,120 @@ MCDR_API void MCDR_CALL mcdr_dx12SrDestroy(void);
 MCDR_API int32_t MCDR_CALL mcdr_dx12SrQuery(char* note, int32_t noteCap);
 
 // ---------------------------------------------------------------------------
+// P293：帧生成（Frame Generation）抽象层 —— ABI v4
+//
+// 与 SR 段同构：一张能力表 + 一份逐帧载荷 + 5 个入口。区别在于**没有 Evaluate**：
+// 帧生成的工作发生在 Present 的两侧（DLSS-G 自己插在 SL 的呈现路径里），不由我们的
+// 命令列表录制，所以这里没有"提交一帧"的入口，只有"设期望值"与"问上次真提交了几帧"。
+//
+// 三家的形态差异（详见 fg_plan.md §2.2）：
+//   - DLSS-G（Streamline）：占走 Present，链必须是 SL 代理工厂产出的；必须 Reflex；
+//     HUDless 复用 SR 的输出（v1 常态，不需要外部喂）。
+//   - FSR-FG / XeSS-FG：**接管交换链**（Wrap/New 或 InitFromSwapChain），与 SL 代理链
+//     二选一。v1 只有编号与能力位，不实现（见 fg_plan.md 的 v1 范围裁剪）。
+// ---------------------------------------------------------------------------
+
+#define MCDR_FG_BACKEND_NONE 0
+#define MCDR_FG_BACKEND_DLSSG 1
+#define MCDR_FG_BACKEND_FSRFG 2
+#define MCDR_FG_BACKEND_XESSFG 3
+
+// 呈现链当前归谁（可查询状态，不再是隐含的 if）。v1 里只有前两态可达。
+#define MCDR_FG_CHAIN_APP_NATIVE 0
+#define MCDR_FG_CHAIN_SL_PROXY 1
+#define MCDR_FG_CHAIN_FSR_WRAP 2  // 占位：v1 不实现
+#define MCDR_FG_CHAIN_XESS_WRAP 3 // 占位：v1 不实现
+
+// 本后端架构上对应的低延迟方案（P298；能力面，不是「运行时可用」）。
+// 现实核对（2026-10-27）：Reflex 现役且 FG 依赖它；Anti-Lag 2 只有头文件（`external\fidelityfx`
+// 下两份 `ffx_antilag2_dx12.h`），全仓没有任何 antilag DLL；XeLL 的 DLL 在
+// （`external\xess\bin\libxell.dll`）但契约没接。所以后两者的位**恒为 0 / 原因写清**。
+#define MCDR_FG_LATENCY_NONE 0
+#define MCDR_FG_LATENCY_REFLEX 1
+#define MCDR_FG_LATENCY_ANTILAG2 2
+#define MCDR_FG_LATENCY_XELL 3
+
+// 后端能力面。sizeof = 80、align = 4。Kotlin 侧镜像见 MCDR_Layout.kt 的 FG_CAPS。
+// 与 mcdr_sr_caps 一样：note 是给 UI 与日志的短原因（UTF-8，NUL 结尾），机器判断只看数值。
+typedef struct mcdr_fg_caps {
+    int32_t backend;            // 0  MCDR_FG_BACKEND_*
+    int32_t available;          // 4  1 = 本机此刻可启用（唯一结论位）
+    int32_t runtimeLoaded;      // 8  运行库已加载（头文件在 ≠ 这个）
+    int32_t deviceSupported;    // 12 设备/驱动支持
+    int32_t chainCompatible;    // 16 当前呈现链兼容
+    int32_t needsReflex;        // 20 1 = 必须 Reflex 开（DLSS-G 恒 1）
+    int32_t needsUiResource;    // 24 1 = 需要独立 UI 资源（FSR/XeSS）
+    int32_t needsHudless;       // 28 1 = 需要独立 HUDless（FSR/XeSS）
+    int32_t transitionsInputs;  // 32 1 = provider 自己转输入输出屏障
+    int32_t maxGeneratedFrames; // 36 1..N（DLSS-G 当前 5）
+    int32_t chainOwner;         // 40 MCDR_FG_CHAIN_*（当前实际状态，不是期望）
+    int32_t reserved;           // 44 保留，必须为 0
+    char note[28];              // 48 短原因，NUL 结尾（48 + 28 = 76）
+    // P298：本后端**架构上**该配哪个低延迟方案。注意这是「该用哪个」而不是「能不能用 ——
+    // 能不能用看 available / note（原稿 §1.3 的要求：不许把架构上可表达说成运行时已支持）。
+    // 值取 MCDR_FG_LATENCY_*。v4 就地扩这一格（v4 未发布，80 B / align 4 不变）。
+    int32_t latencyProvider;    // 76 MCDR_FG_LATENCY_*
+} mcdr_fg_caps;
+
+// 与厂商无关的"设期望值"载荷。sizeof = 96、align = 8。
+// Kotlin 侧镜像见 MCDR_Layout.kt 的 FG_DISPATCH。
+//
+// 语义约定（别改）：
+//   - mode 与老的 mcdr_dx12SetDlssgMode 完全一致：0=off 1=固定倍率 2=dynamic；
+//     numFrames 只在 mode=1 时有意义，mode=2 由 provider 自己算（P225/P226）。
+//   - 三轨帧号（fg_plan.md §3.5）：appFrameId 是应用帧、backendFrameId 是给后端用
+//     （严格 +1）、presentId 是给 present 用（严格 +1）。三者不同源，别混用。
+//   - 资源指针仍然是**JVM 创建的纹理句柄**，与 SR 段一致；0 表示"这张没有"。
+//   - pHudlessColor 给 0 是 v1 的常态：DLSS-G 复用 SR 的输出当 HUDless（P213），
+//     只有 FSR/XeSS 才需要外部喂。
+typedef struct mcdr_fg_dispatch {
+    int32_t displayWidth;    // 0
+    int32_t displayHeight;   // 4
+    int32_t backend;         // 8  MCDR_FG_BACKEND_*（0 = 用 FgPick 记下的那个）
+    int32_t mode;            // 12 0/1/2
+    int32_t numFrames;       // 16 仅 mode=1 有意义
+    int32_t reset;           // 20 1 = 丢弃历史
+    uint64_t appFrameId;     // 24
+    uint64_t backendFrameId; // 32
+    uint64_t presentId;      // 40
+    void* pBackbuffer;       // 48
+    void* pHudlessColor;     // 56 可 0
+    void* pDepth;            // 64
+    void* pMotionVectors;    // 72
+    void* pUiColor;          // 80 可 0
+    int32_t _pad2[2];        // 88 / 92：align 8 要显式填满（只留一个 int32 会多出 4 B 尾填充）
+} mcdr_fg_dispatch;
+
+// 记录期望后端。纯记录：不建、不销毁（与 SrPick 一致）。返回 1 = 已记录，0 = 未知编号。
+MCDR_API int32_t MCDR_CALL mcdr_dx12FgPick(int32_t backend);
+
+// 查询后端能力面。out 必须非空；*out 整体覆盖（先清零再填）。返回 1 = 已填，-1 = 参数非法。
+MCDR_API int32_t MCDR_CALL mcdr_dx12FgQueryCaps(int32_t backend, mcdr_fg_caps* out);
+
+// 设期望值（mode/numFrames/帧号/资源）。**只记录，不立即下发**：真正的
+// slDLSSGSetOptions 在渲染线程的下一次 present 前下发（P296），这样跨线程调用不会
+// 落到不确定的那次 Present 上（SL 官方文档 §6 明确说了这一点）。
+// 返回 1 = 已记录 0 = 后端不可用（原因进 FgStatus）-1 = 参数非法。
+MCDR_API int32_t MCDR_CALL mcdr_dx12FgSetMode(const mcdr_fg_dispatch* desc);
+
+// 上一次 Present 真正提交的帧数（1 = 没插帧，与 mcdr_dx12GetDlssgPresented 同义）。
+MCDR_API int32_t MCDR_CALL mcdr_dx12FgPresented(void);
+
+// 一行状态文本：期望/生效后端、可用性、链归属、最近一次失败原因。
+// 返回 1 = 已写（NUL 结尾），0 = 没有内容，-1 = 参数非法。
+MCDR_API int32_t MCDR_CALL mcdr_dx12FgStatus(char* note, int32_t noteCap);
+
+// P300：帧生成的状态，压进一个 int32（位布局就是契约，JVM 侧按位读，不要解析文本）。
+//   [ 0.. 7] desiredMode   0=关 1=开（固定倍率） 2=dynamic —— **native 侧的期望值**
+//   [ 8..15] chainMode     链是在哪个 mode 下建成的（0=关的链 1=开的链）
+//   [16..23] active        1 = 现在有一个活着的后端（0 = 没有后端，也就没有插帧）
+//   [24..31] rebuilds      min(重建次数, 255)
+// 为什么需要它：P300 的回滚会在 native 侧把 desiredMode 清成 0（例如 SR 后端从 DLSS 换成
+// FSR/XeSS 之后 DLSS-G 再也拿不到合法输入），而 JVM 的 options.txt 仍然写着「开」—— 只看
+// options.txt 的界面就会说假话。返回 -1 不会发生（这是纯读）。
+MCDR_API int32_t MCDR_CALL mcdr_dx12FgState(void);
+
+// ---------------------------------------------------------------------------
 // P112：DLSS 的每帧相机常量（Streamline 的 sl::Constants 逐字段对应；
 //       ProgrammingGuide.md §2.11.1 / ProgrammingGuideDLSS.md §6.0）
 // ---------------------------------------------------------------------------
@@ -1180,6 +1306,19 @@ MCDR_API mcdr_surface* MCDR_CALL mcdr_dx12GetActiveSurfaceHandle(void);
 // return 1 on success, 0 on failure.
 MCDR_API int32_t MCDR_CALL mcdr_dx12ReadbackSurfacePixels(mcdr_surface* surface, int32_t* out);
 MCDR_API int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixels(mcdr_object* texture, int32_t* out);
+
+/* P291e：已知起始状态的读回（ABI v4 纯追加导出）。
+ * `fromState` 是这张纹理**当前真实所处**的 D3D12_RESOURCE_STATES 数值，不是"我希望它在哪"。
+ * 传错 → barrier 的 StateBefore 不匹配 → 读回内容未定义（实测恒 0）。上面那个不带状态的
+ * 旧导出按 COMMON 处理，只对"建完没被 GPU 写过"的纹理成立；DLSS 的输出纹理在帧末停在
+ * COPY_SOURCE（FG 关，d3d12_dlss.cpp）或 UNORDERED_ACCESS（FG 开），必须走这一条。
+ * 读回结束后纹理被恢复成 fromState，对 native 的状态跟踪没有净影响。 */
+MCDR_API int32_t MCDR_CALL mcdr_dx12ReadbackTexturePixelsIn(mcdr_object* texture, int32_t fromState,
+                                                            int32_t* out);
+
+/* P291e：DLSS 输出纹理上一帧结束时停在哪个状态（D3D12_RESOURCE_STATES 数值）。
+ * 0 (COMMON) = 这一帧没有输出纹理/未知 —— 调用方不要据此采样。 */
+MCDR_API int32_t MCDR_CALL mcdr_dx12DlssOutputState(void);
 
 MCDR_API void MCDR_CALL mcdr_dx12DumpTextureToFile(mcdr_object* texture, const char* tag);
 

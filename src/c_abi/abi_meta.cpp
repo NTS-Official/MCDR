@@ -198,6 +198,40 @@ const std::vector<mcdr_abi_field>& layoutTable() {
         MCDR_FIELD(mcdr_sr_dispatch, cameraAspectRatio),
         MCDR_FIELD(mcdr_sr_dispatch, viewSpaceToMetersFactor),
         MCDR_FIELD(mcdr_sr_dispatch, _pad2),
+
+        // P295 FG 抽象层的两张新表。与 SR 同理：Kotlin 的 MCDR_Layout.kt 逐字段镜像，
+        // verify() 双向比对，任何一侧漏字段都会在设备创建时 abort。字段名必须与
+        // mcdr_abi.h 的 typedef 逐字一致（含两个 _pad）。
+        MCDR_FIELD(mcdr_fg_caps, backend),
+        MCDR_FIELD(mcdr_fg_caps, available),
+        MCDR_FIELD(mcdr_fg_caps, runtimeLoaded),
+        MCDR_FIELD(mcdr_fg_caps, deviceSupported),
+        MCDR_FIELD(mcdr_fg_caps, chainCompatible),
+        MCDR_FIELD(mcdr_fg_caps, needsReflex),
+        MCDR_FIELD(mcdr_fg_caps, needsUiResource),
+        MCDR_FIELD(mcdr_fg_caps, needsHudless),
+        MCDR_FIELD(mcdr_fg_caps, transitionsInputs),
+        MCDR_FIELD(mcdr_fg_caps, maxGeneratedFrames),
+        MCDR_FIELD(mcdr_fg_caps, chainOwner),
+        MCDR_FIELD(mcdr_fg_caps, reserved),
+        MCDR_FIELD(mcdr_fg_caps, note),
+        MCDR_FIELD(mcdr_fg_caps, latencyProvider),
+
+        MCDR_FIELD(mcdr_fg_dispatch, displayWidth),
+        MCDR_FIELD(mcdr_fg_dispatch, displayHeight),
+        MCDR_FIELD(mcdr_fg_dispatch, backend),
+        MCDR_FIELD(mcdr_fg_dispatch, mode),
+        MCDR_FIELD(mcdr_fg_dispatch, numFrames),
+        MCDR_FIELD(mcdr_fg_dispatch, reset),
+        MCDR_FIELD(mcdr_fg_dispatch, appFrameId),
+        MCDR_FIELD(mcdr_fg_dispatch, backendFrameId),
+        MCDR_FIELD(mcdr_fg_dispatch, presentId),
+        MCDR_FIELD(mcdr_fg_dispatch, pBackbuffer),
+        MCDR_FIELD(mcdr_fg_dispatch, pHudlessColor),
+        MCDR_FIELD(mcdr_fg_dispatch, pDepth),
+        MCDR_FIELD(mcdr_fg_dispatch, pMotionVectors),
+        MCDR_FIELD(mcdr_fg_dispatch, pUiColor),
+        MCDR_FIELD(mcdr_fg_dispatch, _pad2),
     };
     return table;
 }

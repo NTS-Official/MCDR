@@ -103,6 +103,10 @@ void mcdr_dlss_set_fg_mode(int32_t mode, int32_t numFrames);
 // P213c：上一次 Present 真正提交的帧数（1 = 没插帧），F3 的 output 用。
 int32_t mcdr_dlss_fg_presented(void);
 
+// P291e：上一帧结束时 DLSS 输出纹理停在哪个 D3D12_RESOURCE_STATES（0 = 未知/没有输出纹理）。
+// 读回必须用它做 barrier 的 StateBefore —— 按 COMMON 硬转会拿到未定义内容。
+int32_t mcdr_dlss_output_state(void);
+
 // P122：Reflex 模式（0=off 1=eLowLatency 2=eLowLatencyWithBoost）与可用性查询。
 void mcdr_reflex_set_mode(int32_t mode);
 int32_t mcdr_reflex_available(void);

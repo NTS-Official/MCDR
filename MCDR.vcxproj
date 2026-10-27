@@ -233,7 +233,6 @@
          are likewise detected as implementation units of mcdr.abi.common even
          though they keep the .cpp extension.) -->
     <ClCompile Include="src\advanced\smaa_luts.cpp" />
-    <ClCompile Include="src\core\d3d12_window_host.cpp" />
     <ClCompile Include="src\module\c_abi\mcdr_abi_common.cppm" />
     <!-- 叶子模块：Error / Result<T>，不 import 任何 mcdr.* 模块 -->
     <ClCompile Include="src\module\core\mcdr_error.cppm" />
@@ -263,6 +262,7 @@
     <!-- P271：超分抽象层的 C ABI 外壳（8 个 mcdr_dx12Sr* 入口）。纯追加单元，
          不碰老路径；P272 之后厂商逻辑才会从这一层下沉到 Provider。 -->
     <ClCompile Include="src\c_abi\abi_sr.cpp" />
+    <ClCompile Include="src\c_abi\abi_framegen.cpp" />
     <!-- DLL 入口点：普通 TU（不属于任何命名模块），见文件内注释 -->
     <ClCompile Include="src\core\dllmain.cpp" />
     <ClCompile Include="src\core\d3d12_descriptor_allocator.cpp" />
@@ -270,15 +270,16 @@
     <ClCompile Include="src\core\d3d12_surface.cpp" />
     <!-- P272：超分 Provider 接口层（能力表 + DLSS provider + 注册表）。与 d3d12_device.cpp
          同属模块 mcdr.d3d12.device 的实现单元，所以不需要额外设置。 -->
-    <ClCompile Include="src\core\d3d12_sr.cpp" />
-    <ClCompile Include="src\core\d3d12_fsr.cpp" />
-    <ClCompile Include="src\core\d3d12_xess.cpp" />
+    <ClCompile Include="src\advanced\d3d12_sr.cpp" />
+    <ClCompile Include="src\advanced\d3d12_framegen.cpp" />
+    <ClCompile Include="src\advanced\d3d12_fsr.cpp" />
+    <ClCompile Include="src\advanced\d3d12_xess.cpp" />
     <!-- P267：SeamlessWindowHost（呈现子窗口 + GL 隔离），普通 TU -->
     <ClCompile Include="src\core\d3d12_window_host.cpp" />
     <!-- P197：HDR 状态单元。普通 TU（surface 是模块单元、DLSS 是普通 TU，
          模块 purview 里的定义无法被普通 TU 链接，故状态单拎出来）。 -->
-    <ClCompile Include="src\core\d3d12_hdr_state.cpp" />
-    <ClCompile Include="src\core\d3d12_rt_state.cpp" />
+    <ClCompile Include="src\advanced\d3d12_hdr_state.cpp" />
+    <ClCompile Include="src\advanced\d3d12_rt_state.cpp" />
     <!-- P251：交换链建链选项（allowTearing / presentChild）状态单元，同为普通 TU。 -->
     <ClCompile Include="src\core\d3d12_surface_opts_state.cpp" />
     <ClCompile Include="src\core\d3d12_async_descriptor.cpp" />

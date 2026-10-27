@@ -2361,6 +2361,10 @@ sl::FrameToken* gLastFrameToken = nullptr;
     std::atomic<int32_t> gDlssgFrames{1};
     // P213c：最近一次 Present 真正提交了几帧（1 = 只有应用帧，2+ = 插帧生效）。给 F3 的 output 用。
     std::atomic<int32_t> gFgPresented{1};
+    // P291e：上一帧结束时输出纹理停在哪个 D3D12_RESOURCE_STATES（0 = 未知/没有输出纹理）。
+    // JVM 侧的黑帧采样要拿它做"已知起始状态"的读回 —— 按 COMMON 硬转是非法 barrier，
+    // 读回来的是未定义内容（实测恒 0，于是 DLSS 明明正常却被熔断成永久线性 blit）。
+    std::atomic<int32_t> gDlssOutputState{0};
 
     // P112 阶段 2：Streamline 的每帧调用面（全部运行时解析，不引入静态导入）。
     struct StreamlineEvalApi {
@@ -2827,22 +2831,33 @@ sl::FrameToken* gLastFrameToken = nullptr;
                             wantFrames, maxFrames, gReflex.frameLimitUs);
                 }
             }
-            if (appliedFgMode != fgMode || appliedFgFrames != (fgMode == 2 && gReflex.frameLimitUs == 0 ? -1 : wantFrames) ||
+            // P226（用户 m10065）：DYNAMIC 且没有 Reflex 限帧时，交回 SL 的 eDynamic —— 它知道
+            // 显示器刷新率，会自己往刷新率上追；有 Reflex 限帧时才用 P225 的显式帧数（让限帧成为目标）。
+            const bool fgDynamic = (fgMode == 2) && (gReflex.frameLimitUs == 0);
+            // P296b：dynamic 下用 -1 当"帧数不由我们决定"的哨兵。原来条件里比的是哨兵、写的却是
+            // wantFrames，于是**每帧都判不等**→ 每帧一次 `slDLSSGSetOptions`。P199 已经量过同类调用
+            // 每帧一次的代价（进程私有提交内存 750 MB/min 线性上涨），所以这里存哨兵、比哨兵。
+            const int32_t appliedFramesWanted = fgDynamic ? -1 : wantFrames;
+            if (appliedFgMode != fgMode || appliedFgFrames != appliedFramesWanted ||
                 appliedFgW != in.targetWidth || appliedFgH != in.targetHeight) {
                 sl::DLSSGOptions fg{};
-                // P226（用户 m10065）：DYNAMIC 且没有 Reflex 限帧时，交回 SL 的 eDynamic —— 它知道
-                // 显示器刷新率，会自己往刷新率上追；有 Reflex 限帧时才用 P225 的显式帧数（让限帧成为目标）。
-                const bool fgDynamic = (fgMode == 2) && (gReflex.frameLimitUs == 0);
                 fg.mode = fgDynamic ? sl::DLSSGMode::eDynamic : sl::DLSSGMode::eOn;
                 fg.numFramesToGenerate = fgDynamic ? 1u : static_cast<uint32_t>(wantFrames);
 
                 const sl::Result fgOptResult = api.setFgOptions(viewport, fg);
                 if (fgOptResult == sl::Result::eOk) {
                     appliedFgMode = fgMode;
-                    appliedFgFrames = wantFrames;
+                    appliedFgFrames = appliedFramesWanted;
                     appliedFgW = in.targetWidth;
                     appliedFgH = in.targetHeight;
-
+                    // P296：只在本函数真的下发过选项时打一行（上面的 if 已经按"值变了才下发"过滤），
+                    // 验收时用它证明"开关确实到过 SL"，不需要去 sl.log 里猜 —— 那份日志只记
+                    // "slDLSSGSetOptions() is called on the thread N"，不记 mode/numFrames。
+                    logInfo("P296 fg options -> %s frames=%u (%ux%u)",
+                            fgDynamic ? "dynamic" : "on",
+                            static_cast<unsigned>(fg.numFramesToGenerate),
+                            static_cast<unsigned>(in.targetWidth),
+                            static_cast<unsigned>(in.targetHeight));
                 } else {
                     static bool warnedFgOpt = false;
                     if (!warnedFgOpt) {
@@ -2883,9 +2898,23 @@ sl::FrameToken* gLastFrameToken = nullptr;
             if (appliedFgMode != 0) {
                 sl::DLSSGOptions fg{};
                 fg.mode = sl::DLSSGMode::eOff;
-                if (api.setFgOptions(viewport, fg) == sl::Result::eOk) {
+                const sl::Result offResult = api.setFgOptions(viewport, fg);
+                if (offResult == sl::Result::eOk) {
                     appliedFgMode = 0;
                     appliedFgFrames = 0;
+                    // P296（验收 A6）：关掉时到底有没有真的下发 eOff，只能由我们自己证明 ——
+                    // sl.log 不记 mode/numFrames。这行打在"刚关掉"的那一帧，之后 fgMode 一直是 0
+                    // 且 appliedFgMode 也是 0，不会再进这个分支。
+                    logInfo("P213e fg options -> off (applied)");
+                } else {
+                    // 失败时 appliedFgMode 保持非 0，下一帧还会再试；这里只警告一次，
+                    // 免得"SL 不认 eOff"变成每秒几十行的垃圾日志。
+                    static bool warnedFgOff = false;
+                    if (!warnedFgOff) {
+                        warnedFgOff = true;
+                        logWarn("P213e slDLSSGSetOptions(eOff) failed=0x%X",
+                                static_cast<unsigned>(offResult));
+                    }
                 }
             }
             // P213c（用户 m01219）：关着时“上一次真正提交的帧数”必须是 1。原来这里不复位，
@@ -2893,6 +2922,14 @@ sl::FrameToken* gLastFrameToken = nullptr;
             // 于是出现“RTSS 实测 120、F3 却显示 120/240 (FG 2.0x)”。
             gFgPresented.store(1);
         }
+
+        // P291e：记下这一帧结束时"那张被 DLSS 写过的输出纹理"停在哪个状态，
+        // 供 JVM 做状态正确的读回（0 = 本帧没有 handover 纹理，别采样）。
+        gDlssOutputState.store(
+            (copyBack && outResource != out && evalResult == sl::Result::eOk)
+                ? static_cast<int32_t>(wantFg ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                             : D3D12_RESOURCE_STATE_COPY_SOURCE)
+                : 0);
 
         if (evalResult != sl::Result::eOk) {
             logWarn("P112: streamline evaluate tags=0x%X options=0x%X evaluate=0x%X "
@@ -3326,4 +3363,9 @@ void mcdr_dlss_set_fg_mode(int32_t mode, int32_t numFrames) {
 // “presented fps”，否则一次 slPresent 只被 JVM 看到一次，两个数字永远相等。
 int32_t mcdr_dlss_fg_presented(void) {
     return gFgPresented.load();
+}
+// P291e：DLSS 输出纹理当前所处的 D3D12_RESOURCE_STATES（0 = 未知/没有 handover 纹理）。
+// 读回采样必须带这个状态，否则 barrier 的 StateBefore 是错的、内容未定义。
+int32_t mcdr_dlss_output_state(void) {
+    return gDlssOutputState.load();
 }
