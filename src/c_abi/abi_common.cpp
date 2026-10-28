@@ -66,7 +66,7 @@ void failVoid(const char* what, const std::string& err) {
                       err.c_str());
         std::fprintf(stderr, "%s\n", line);
     } else {
-        std::fprintf(stderr, "[mcdr] %s: %s\n", what ? what : "?", err.c_str());
+        std::fprintf(stderr, "%s: %s\n", what ? what : "?", err.c_str());
     }
     std::fflush(stderr);
 }

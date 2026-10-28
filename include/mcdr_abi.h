@@ -841,6 +841,20 @@ typedef struct mcdr_fg_caps {
 //   - 资源指针仍然是**JVM 创建的纹理句柄**，与 SR 段一致；0 表示"这张没有"。
 //   - pHudlessColor 给 0 是 v1 的常态：DLSS-G 复用 SR 的输出当 HUDless（P213），
 //     只有 FSR/XeSS 才需要外部喂。
+/* P305z：帧常量（`xess_fg_developer_guide_english.md:678-681` 把 View/Projection 列为必需输入）。
+ * 归属 FG 抽象层自己 —— 不去翻 DLSS 的 mcdr_dlss_constants，那是另一条通路的私有状态。
+ * 矩阵按行主序（与 XeSS-FG 的 `xefg_swapchain_frame_constant_data_t` 一致），JVM 侧直接交。 */
+typedef struct mcdr_fg_constants
+{
+    float view[16];
+    float projection[16];
+    float jitterX;
+    float jitterY;
+    float mvScaleX;
+    float mvScaleY;
+    int32_t resetHistory;
+    float frameRenderTime;
+} mcdr_fg_constants;
 typedef struct mcdr_fg_dispatch {
     int32_t displayWidth;    // 0
     int32_t displayHeight;   // 4
@@ -873,6 +887,7 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12FgSetMode(const mcdr_fg_dispatch* desc);
 
 // 上一次 Present 真正提交的帧数（1 = 没插帧，与 mcdr_dx12GetDlssgPresented 同义）。
 MCDR_API int32_t MCDR_CALL mcdr_dx12FgPresented(void);
+MCDR_API void MCDR_CALL mcdr_dx12FgSetConstants(const mcdr_fg_constants* constants);
 
 // 一行状态文本：期望/生效后端、可用性、链归属、最近一次失败原因。
 // 返回 1 = 已写（NUL 结尾），0 = 没有内容，-1 = 参数非法。
@@ -887,6 +902,50 @@ MCDR_API int32_t MCDR_CALL mcdr_dx12FgStatus(char* note, int32_t noteCap);
 // FSR/XeSS 之后 DLSS-G 再也拿不到合法输入），而 JVM 的 options.txt 仍然写着「开」—— 只看
 // options.txt 的界面就会说假话。返回 -1 不会发生（这是纯读）。
 MCDR_API int32_t MCDR_CALL mcdr_dx12FgState(void);
+
+/* P305c：把 GUI 合成目标交给帧生成后端当「UI 纹理」用（用户 2026-10-27 裁决）。
+ *
+ * 包装型后端（XeSS-FG / FSR-FG）要把「无 HUD 的世界层」与「UI」分开插值，否则准星/文字会被
+ * 插帧拉扯。我们的 GUI 合成进 D3D12GuiSplit 的窗口尺寸目标，没有独立 UI 纹理，所以直接把那张
+ * 目标当 UI 纹理交出去（XeSS 用 `XEFG_SWAPCHAIN_UI_MODE_BACKTEXTURE_UITEXTURE`，FSR 用
+ * `RegisterUiResourceDX12`）。
+ *
+ * `object` 是 `Dx12Object*` 句柄（就是 `D3D12GpuTexture.handle()` 那个值），传 0 = 撤销。
+ * **只在 GPU 目标创建/重建时推一次**，不要每帧推。 */
+MCDR_API void MCDR_CALL mcdr_dx12FgSetUiTexture(void* object);
+
+/* P306ac：hudless 呈现开关，以及"UI 会由 SDK 合成"的可查询状态。
+ *
+ * `mcdr_dx12FgSetUiComposition(1)` 的含义：应用接下来 Present 的 backbuffer **只含世界层**
+ *（不含 GUI），UI 单独作为一张"透明底 + 预乘 alpha"的纹理交给后端合成 —— 那张纹理就是
+ * `mcdr_dx12FgSetUiTexture` 推过来的句柄。0 = 老路径：应用自己把 GUI 画进 backbuffer，
+ * 后端**不得**再注册 UI（否则同一份 HUD 会被合成两遍，P306aa）。
+ *
+ * `mcdr_dx12FgUiCompositionReady()` 返回 1 时，调用方才敢 Present 一张不含 UI 的图；0 表示
+ * "没有人替我们合成 UI"，必须继续 Present 合成层。它**不保证**这一帧 UI 已经登记（登记发生在
+ * 同一个 Present 之前），所以调用方要用它做**每帧一次**的 latch，不要在帧中途换模式。
+ *
+ * P306ad 起判据收紧成"**链已包 + UI 纹理已交过去 + 已经发生过一次插帧 dispatch**"：只包链不算数，
+ * 因为包链与启用插帧是两步 —— 没有逐帧输入（没开超分 / 倍率还是 100%）时 provider 只是建了上下文，
+ * 代理链一次 Present 都没跑过。那种状态下若 Present 世界层，UI 注册落在一条没人 Present 的链上，
+ * 界面会整层消失（2026-10-28 19:26 实测）。
+ *
+ * 为什么由 JVM 决定：只有它知道"这一帧有没有 3D 世界层"。菜单 / 加载屏没有可插帧的世界层，
+ * 应当直通（合成层呈现），而不是让 SDK 对着一张纯 UI 图插帧。 */
+MCDR_API void MCDR_CALL mcdr_dx12FgSetUiComposition(int32_t enabled);
+MCDR_API int32_t MCDR_CALL mcdr_dx12FgUiCompositionReady(void);
+
+/* P305ag：native **内部**调用口，不是给 JVM 的（JVM 不要绑这个符号）。
+ *
+ * 为什么需要它：逐帧 tag 原来只有 `srEvaluateFrame` 成功后一个触发点，而 `d3d12_dlss.cpp`
+ * 是普通翻译单元（故意不 import 设备模块，保持 DLSS 那条路的隔离），DLSS 超分路径因此
+ * 交不出本帧输入 —— `sr.backend = DLSS` 时 XeSS-FG 一帧都拿不到（实机：4561 帧 tagCalls=0）。
+ *
+ * 参数全是 POD（命令列表 + 三个资源 + 各自**当前**状态），实现见 `abi_framegen.cpp`；
+ * 状态值就是 `D3D12_RESOURCE_STATES` 的整数形式。 */
+MCDR_API void MCDR_CALL mcdr_fgTagDlssInputs(void* cmdList, void* color, int32_t colorState,
+                                             void* depth, int32_t depthState,
+                                             void* motionVectors, int32_t motionVectorState);
 
 // ---------------------------------------------------------------------------
 // P112：DLSS 的每帧相机常量（Streamline 的 sl::Constants 逐字段对应；

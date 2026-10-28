@@ -300,7 +300,7 @@ public:
         if (dispatch.renderWidth < 320 || dispatch.renderHeight < 180) {
             if (!tooSmallLogged_) {
                 tooSmallLogged_ = true;
-                dbgLogError("P291i: render %dx%d is below the %s minimum of 320x180; skipping "
+                dbgLogError("render %dx%d is below the %s minimum of 320x180; skipping "
                             "the evaluate (raise the render scale)",
                             dispatch.renderWidth, dispatch.renderHeight, "Intel XeSS");
             }
@@ -352,7 +352,7 @@ public:
             problem_ = "xessD3D12Execute failed rc=";
             problem_ += std::to_string(static_cast<int>(rc));
             if (!logged_) {
-                dbgLogWarn("P278 XeSS execute failed: %s", problem_.c_str());
+                dbgLogWarn("XeSS execute failed: %s", problem_.c_str());
                 logged_ = true;
             }
             return false;
@@ -412,7 +412,7 @@ private:
                 inputMax_ = maxSize;
                 optimalOut = optimal;
                 if (candidate != XESS_QUALITY_SETTING_QUALITY) {
-                    dbgLogInfo("P279b XeSS quality %d fits render %dx%d (range %ux%u..%ux%u)",
+                    dbgLogInfo("XeSS quality %d fits render %dx%d (range %ux%u..%ux%u)",
                                static_cast<int>(candidate), renderW_, renderH_, minSize.x,
                                minSize.y, maxSize.x, maxSize.y);
                 }
@@ -432,7 +432,7 @@ private:
         std::string why;
         if (!isAvailable(why)) {
             if (!logged_) {
-                dbgLogWarn("P278 XeSS unavailable: %s", why.c_str());
+                dbgLogWarn("XeSS unavailable: %s", why.c_str());
                 logged_ = true;
             }
             problem_ = why.empty() ? std::string("libxess unavailable") : why;
@@ -470,14 +470,14 @@ private:
             problem_ = "xessD3D12CreateContext failed rc=";
             problem_ += std::to_string(static_cast<int>(createRc));
             if (!logged_) {
-                dbgLogWarn("P278 XeSS context creation failed: %s", problem_.c_str());
+                dbgLogWarn("XeSS context creation failed: %s", problem_.c_str());
                 logged_ = true;
             }
             return false;
         }
         if (runtime().api.isOptimalDriver != nullptr &&
             runtime().api.isOptimalDriver(handle_) == XESS_RESULT_WARNING_OLD_DRIVER) {
-            dbgLogWarn("P278 XeSS: driver is older than recommended (XESS_RESULT_WARNING_OLD_DRIVER)");
+            dbgLogWarn("XeSS: driver is older than recommended (XESS_RESULT_WARNING_OLD_DRIVER)");
         }
 
         // 质量档真正决定的是"允许的输入区间"，而 Dynamic Input Resolution 要求每帧实际输入
@@ -521,7 +521,7 @@ private:
             problem_ = "xessD3D12Init failed rc=";
             problem_ += std::to_string(static_cast<int>(initRc));
             if (!logged_) {
-                dbgLogWarn("P278 XeSS init failed: %s (render=%dx%d display=%dx%d quality=%d)",
+                dbgLogWarn("XeSS init failed: %s (render=%dx%d display=%dx%d quality=%d)",
                            problem_.c_str(), renderW_, renderH_, displayW_,
                            static_cast<int>(quality));
                 logged_ = true;
@@ -537,7 +537,7 @@ private:
             std::lock_guard<std::mutex> guard(runtime().lock);
             version = runtime().version;
         }
-        dbgLogInfo("P278 XeSS ready: libxess %s render %dx%d display %dx%d quality=%d flags=0x%x "
+        dbgLogInfo("XeSS ready: libxess %s render %dx%d display %dx%d quality=%d flags=0x%x "
                    "inputRange %ux%u..%ux%u",
                    version.empty() ? "?" : version.c_str(), renderW_, renderH_, displayW_,
                    displayH_, static_cast<int>(quality), flags, inputMin_.x, inputMin_.y,
@@ -594,7 +594,7 @@ private:
 
         tempBufferHeap_ = bufferHeap;
         tempTextureHeap_ = textureHeap;
-        dbgLogInfo("P279 XeSS external heaps: buffer=%.1f MB texture=%.1f MB (descriptors=%u)",
+        dbgLogInfo("XeSS external heaps: buffer=%.1f MB texture=%.1f MB (descriptors=%u)",
                    static_cast<double>(props.tempBufferHeapSize) / (1024.0 * 1024.0),
                    static_cast<double>(props.tempTextureHeapSize) / (1024.0 * 1024.0),
                    props.requiredDescriptorCount);
@@ -603,7 +603,7 @@ private:
     void warnHeapOnce(const char* what, HRESULT hr, uint64_t bytes) {
         if (heapWarned_) { return; }
         heapWarned_ = true;
-        dbgLogWarn("P279 XeSS: could not create the %s heap (%llu B, hr=0x%08lx); "
+        dbgLogWarn("XeSS: could not create the %s heap (%llu B, hr=0x%08lx); "
                    "falling back to XeSS-allocated memory",
                    what, static_cast<unsigned long long>(bytes), static_cast<unsigned long>(hr));
     }
@@ -658,7 +658,7 @@ void fillXessCaps(mcdr_sr_caps& out) {
 std::unique_ptr<IUpscaleProvider> makeXessProvider() {
     std::string why;
     if (!isAvailable(why)) {
-        dbgLogInfo("P278 XeSS provider not created: %s", why.c_str());
+        dbgLogInfo("XeSS provider not created: %s", why.c_str());
         return nullptr;
     }
     return std::make_unique<XessSrProvider>();

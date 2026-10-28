@@ -232,6 +232,15 @@ const std::vector<mcdr_abi_field>& layoutTable() {
         MCDR_FIELD(mcdr_fg_dispatch, pMotionVectors),
         MCDR_FIELD(mcdr_fg_dispatch, pUiColor),
         MCDR_FIELD(mcdr_fg_dispatch, _pad2),
+        // P305z：FG 自己的帧常量。数组字段也走 MCDR_FIELD（offsetof + sizeof 取到整段）。
+        MCDR_FIELD(mcdr_fg_constants, view),
+        MCDR_FIELD(mcdr_fg_constants, projection),
+        MCDR_FIELD(mcdr_fg_constants, jitterX),
+        MCDR_FIELD(mcdr_fg_constants, jitterY),
+        MCDR_FIELD(mcdr_fg_constants, mvScaleX),
+        MCDR_FIELD(mcdr_fg_constants, mvScaleY),
+        MCDR_FIELD(mcdr_fg_constants, resetHistory),
+        MCDR_FIELD(mcdr_fg_constants, frameRenderTime),
     };
     return table;
 }

@@ -137,7 +137,7 @@ ffxReturnCode_t fsrHeapAlloc(uint32_t /*effectId*/, const D3D12_HEAP_DESC* desc,
     ++b.sharedHits;
     if (!b.logged) {
         b.logged = true;
-        dbgLogInfo("P279 FSR external heap: %.1f MB reserved (first request %.1f MB, offset %llu)",
+        dbgLogInfo("FSR external heap: %.1f MB reserved (first request %.1f MB, offset %llu)",
                    static_cast<double>(b.capacity) / (1024.0 * 1024.0),
                    static_cast<double>(need) / (1024.0 * 1024.0),
                    static_cast<unsigned long long>(*offset));
@@ -169,7 +169,7 @@ void fsrMessage(uint32_t type, const wchar_t* message) {
     const int written = ::WideCharToMultiByte(CP_UTF8, 0, message, -1, narrow,
                                               static_cast<int>(sizeof(narrow)) - 1, nullptr, nullptr);
     if (written <= 0) { return; }
-    dbgLogWarn("P277 ffx message type=0x%08x: %s", type, narrow);
+    dbgLogWarn("ffx message type=0x%08x: %s", type, narrow);
 }
 
 // 本模块所在目录。P108 的教训：GetModuleFileNameA(nullptr) 拿到的是宿主 exe（java.exe），
@@ -388,7 +388,7 @@ public:
         if (dispatch.renderWidth < 320 || dispatch.renderHeight < 180) {
             if (!tooSmallLogged_) {
                 tooSmallLogged_ = true;
-                dbgLogError("P291i: render %dx%d is below the %s minimum of 320x180; skipping "
+                dbgLogError("render %dx%d is below the %s minimum of 320x180; skipping "
                          "the evaluate (raise the render scale)",
                          dispatch.renderWidth, dispatch.renderHeight, "AMD FidelityFX");
             }
@@ -467,7 +467,7 @@ public:
             problem_ = "ffxDispatch failed rc=";
             problem_ += std::to_string(static_cast<int>(rc));
             if (!logged_) {
-                dbgLogWarn("P277 FSR dispatch failed: %s", problem_.c_str());
+                dbgLogWarn("FSR dispatch failed: %s", problem_.c_str());
                 logged_ = true;
             }
             return false;
@@ -496,7 +496,7 @@ private:
         std::string why;
         if (!isAvailable(why)) {
             if (!logged_) {
-                dbgLogWarn("P277 FSR unavailable: %s", why.c_str());
+                dbgLogWarn("FSR unavailable: %s", why.c_str());
                 logged_ = true;
             }
             problem_ = why.empty() ? std::string("fidelityfx runtime unavailable") : why;
@@ -566,7 +566,7 @@ private:
             problem_ = "ffxCreateContext failed rc=";
             problem_ += std::to_string(static_cast<int>(rc));
             if (!logged_) {
-                dbgLogWarn("P277 FSR context creation failed: %s (render=%dx%d display=%dx%d)",
+                dbgLogWarn("FSR context creation failed: %s (render=%dx%d display=%dx%d)",
                            problem_.c_str(), maxRenderW_, maxRenderH_, maxDisplayW_, maxDisplayH_);
                 logged_ = true;
             }
@@ -625,7 +625,7 @@ void fillFsrCaps(mcdr_sr_caps& out) {
 std::unique_ptr<IUpscaleProvider> makeFsrProvider() {
     std::string why;
     if (!isAvailable(why)) {
-        dbgLogInfo("P277 FSR provider not created: %s", why.c_str());
+        dbgLogInfo("FSR provider not created: %s", why.c_str());
         return nullptr;
     }
     return std::make_unique<FsrSrProvider>();

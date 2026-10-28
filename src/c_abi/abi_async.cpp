@@ -74,7 +74,7 @@ void logFail(const char* what) {
         std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n), "%s failed", what);
         std::fprintf(stderr, "%s\n", line);
     } else {
-        std::fprintf(stderr, "[dx12] %s failed\n", what);
+        std::fprintf(stderr, "%s failed\n", what);
     }
     std::fflush(stderr);
 }
@@ -91,7 +91,7 @@ void logAlignmentFail(const char* what, long long offset) {
                       "%s: CBV is not 256-byte aligned (buffer offset=%lld)", what, offset);
         std::fprintf(stderr, "%s\n", line);
     } else {
-        std::fprintf(stderr, "[dx12] %s: CBV is not 256-byte aligned (offset=%lld)\n", what, offset);
+        std::fprintf(stderr, "%s: CBV is not 256-byte aligned (offset=%lld)\n", what, offset);
     }
     std::fflush(stderr);
 }

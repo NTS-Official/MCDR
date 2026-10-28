@@ -22,6 +22,10 @@ import mcdr.error;
 using namespace d3d12_mc;
 
 extern "C" {
+void MCDR_CALL mcdr_dx12FgSetConstants(const mcdr_fg_constants* constants)
+{
+    fgSetFrameConstants(constants);
+}
 
 // P293：记录期望后端。不建也不销毁 —— 重建在下一帧的 fgEnsureProvider 里，与 P280 同构。
 int32_t MCDR_CALL mcdr_dx12FgPick(int32_t backend) {
@@ -78,4 +82,28 @@ int32_t MCDR_CALL mcdr_dx12FgState(void) {
     return fgStatePacked();
 }
 
+// P305c：UI 纹理（用户的裁决 = GUI 合成目标当 UI 纹理）。
+void MCDR_CALL mcdr_dx12FgSetUiTexture(void* object) { fgSetUiTexture(object); }
+
+// P306ac：hudless 呈现开关与"UI 由谁合成"的查询。语义全在 `mcdr_abi.h` 的声明处，
+// 这一层只做转发（P272 的纪律：abi 文件里不出现任何厂商名）。
+void MCDR_CALL mcdr_dx12FgSetUiComposition(int32_t enabled) { fgSetUiComposition(enabled); }
+int32_t MCDR_CALL mcdr_dx12FgUiCompositionReady(void) { return fgUiCompositionReady(); }
+
+// P305ag：DLSS 超分路径的逐帧 tag 桥（**内部**，JVM 不调）。
+// 为什么要在 C ABI 里绕一下：`d3d12_dlss.cpp` 是普通翻译单元、不 import 设备模块，直接声明
+// 模块函数会踩 `d3d12_mesh_base.cpp` 记录过的"模块私有名 vs 公共名"链接坑。这里只过 POD，
+// 类型全都落在 C ABI 上，两侧修饰名一致。
+void MCDR_CALL mcdr_fgTagDlssInputs(void* cmdList, void* color, int32_t colorState, void* depth,
+                                    int32_t depthState, void* motionVectors, int32_t motionVectorState) {
+    FgFrameInputs in{};
+    in.cmdList = static_cast<ID3D12GraphicsCommandList*>(cmdList);
+    in.pColorOutput = color;
+    in.colorState = static_cast<D3D12_RESOURCE_STATES>(colorState);
+    in.pDepth = depth;
+    in.depthState = static_cast<D3D12_RESOURCE_STATES>(depthState);
+    in.pMotionVectors = motionVectors;
+    in.motionVectorState = static_cast<D3D12_RESOURCE_STATES>(motionVectorState);
+    fgTagFrameInputs(in);
+}
 }  // extern "C"

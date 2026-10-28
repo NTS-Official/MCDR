@@ -34,6 +34,8 @@ module;
 // P199c：内存分类采样需要 GetProcessMemoryInfo（psapi）。
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
+#include <dbghelp.h>  // P306c：崩溃栈符号化（MCDR.pdb 与 DLL 同目录时解析到 文件:行）
+#pragma comment(lib, "dbghelp.lib")
 
 // P111：Streamline（SL）interposer。头文件来自 external\streamline（git 子模块 @v2.14.16），
 // 导入库与运行时 DLL 来自 NVIDIA 的 SDK 压缩包（解到 lib\streamline，git 不记录这些二进制）。
@@ -377,6 +379,13 @@ void logDeviceStatus(const char* tag) {
     dbgLogError("%s: device status: %s", tag, s.c_str());
 }
 
+// 设备是否已被移除/重置。每帧在 Present 前后各查一次（`GetDeviceRemovedReason()` 是
+// 纯查询，不同步 GPU），用它在设备失效时跳过 FG/DLSS-G/FFX 的调用。
+bool deviceRemoved() {
+    if (!gCtx.device) return true;
+    return gCtx.device->GetDeviceRemovedReason() != S_OK;
+}
+
 void flushPendingDeletes(bool force) {
     if (InterlockedExchange(&gPdInProgress, 1) != 0) {
         dbgLog("flushPendingDeletes: concurrent/re-entrant call skipped (pending=%lld)",
@@ -520,7 +529,7 @@ int formatLogPrefix(char* out, size_t outSize, const char* level, const char* lo
 // 单行出口：前缀 + 正文 + 换行，同时写 stderr 与（可选的）镜像文件。
 static void emitLogLine(const char* level, const char* line) {
     char full[2304];
-    const int n = formatLogPrefix(full, sizeof(full), level, "dx12");
+    const int n = formatLogPrefix(full, sizeof(full), level, "dxr_mc");
     if (n <= 0 || static_cast<size_t>(n) >= sizeof(full)) return;  // 前缀都放不下：丢行，不写半行
     std::snprintf(full + n, sizeof(full) - static_cast<size_t>(n), "%s", line);
     std::fprintf(stderr, "%s\n", full);
@@ -602,13 +611,82 @@ static void CALLBACK dx12DebugMessageCallback(D3D12_MESSAGE_CATEGORY /*category*
     // 分级按 severity：0=CORRUPTION / 1=ERROR / 2=WARNING 默认可见；
     // 3=INFO / 4=MESSAGE 只在 INFO 级别以上输出（原先这两级被无条件丢弃）。
     if (si <= static_cast<int>(D3D12_MESSAGE_SEVERITY_ERROR)) {
-        dbgLogError("[D3D12 %s #%d] %s", sevName, static_cast<int>(id), text);
+        dbgLogError("D3D12 %s #%d: %s", sevName, static_cast<int>(id), text);
     } else if (si == static_cast<int>(D3D12_MESSAGE_SEVERITY_WARNING)) {
-        dbgLogWarn("[D3D12 %s #%d] %s", sevName, static_cast<int>(id), text);
+        dbgLogWarn("D3D12 %s #%d: %s", sevName, static_cast<int>(id), text);
     } else {
-        dbgLogInfo("[D3D12 %s #%d] %s", sevName, static_cast<int>(id), text);
+        dbgLogInfo("D3D12 %s #%d: %s", sevName, static_cast<int>(id), text);
     }
 }
+
+namespace {
+
+// P306c：崩溃栈符号化（只解析本模块）。
+//
+// Release 构建会在 MCDR.dll 旁边生成 MCDR.pdb，于是崩溃现场可以把
+// "MCDR.dll+0x5dc6f" 还原成 "d3d12_fsffg.cpp:271 FsrFgFrameGenProvider::beforePresent+0x15"。
+// 关键约束：符号加载要读文件、拿加载器锁，**不能**放在异常处理路径上 —— 崩溃线程很可能
+// 正握着那把锁，一做 I/O 就死等。所以 PDB 在安装处理器时预热进内存，过滤器里只查表。
+bool gCrashSymbolsReady = false;
+HMODULE gCrashOwnModule = nullptr;
+
+void prepareCrashSymbols(HMODULE ownModule) {
+    if (ownModule == nullptr) return;
+    char imagePath[MAX_PATH] = {};
+    if (::GetModuleFileNameA(ownModule, imagePath, MAX_PATH) == 0) return;
+    // 搜索路径固定成 DLL 自己所在的目录：只认同目录的 PDB，绝不因为机器上设了
+    // _NT_SYMBOL_PATH 就去连符号服务器（那会让首次建建设备时卡在网络上）。
+    std::string searchPath(imagePath);
+    const size_t slash = searchPath.find_last_of("\\/");
+    if (slash == std::string::npos) return;
+    searchPath.resize(slash);
+    ::SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    HANDLE process = ::GetCurrentProcess();
+    if (!::SymInitialize(process, searchPath.c_str(), FALSE)) return;
+    if (::SymLoadModuleEx(process, nullptr, imagePath, nullptr,
+                          reinterpret_cast<DWORD64>(ownModule), 0, nullptr, 0) == 0) {
+        return;
+    }
+    // 一次成功解析足以把整份 PDB 读进内存；没有 PDB 时这里失败，回退成 模块+偏移。
+    alignas(SYMBOL_INFO) char storage[sizeof(SYMBOL_INFO) + 256] = {};
+    auto* info = reinterpret_cast<SYMBOL_INFO*>(storage);
+    info->SizeOfStruct = sizeof(SYMBOL_INFO);
+    info->MaxNameLen = 255;
+    DWORD64 displacement = 0;
+    gCrashSymbolsReady = ::SymFromAddr(process, reinterpret_cast<DWORD64>(&prepareCrashSymbols),
+                                       &displacement, info) != FALSE;
+}
+
+// 只查表；查不到就返回 false，调用方退回 “模块+偏移”。
+bool describeOwnFrame(void* address, char* text, size_t cap) {
+    if (!gCrashSymbolsReady) return false;
+    HANDLE process = ::GetCurrentProcess();
+    alignas(SYMBOL_INFO) char storage[sizeof(SYMBOL_INFO) + 256] = {};
+    auto* info = reinterpret_cast<SYMBOL_INFO*>(storage);
+    info->SizeOfStruct = sizeof(SYMBOL_INFO);
+    info->MaxNameLen = 255;
+    DWORD64 displacement = 0;
+    const DWORD64 addr = reinterpret_cast<DWORD64>(address);
+    if (!::SymFromAddr(process, addr, &displacement, info)) return false;
+    IMAGEHLP_LINE64 line{};
+    line.SizeOfStruct = sizeof(line);
+    DWORD lineDisplacement = 0;
+    if (::SymGetLineFromAddr64(process, addr, &lineDisplacement, &line) && line.FileName != nullptr) {
+        // PDB 里是构建机上的绝对路径，只留文件名。
+        const char* file = line.FileName;
+        for (const char* p = line.FileName; *p; ++p) {
+            if (*p == '\\' || *p == '/') file = p + 1;
+        }
+        std::snprintf(text, cap, "%s:%lu %s+0x%llx", file,
+                      static_cast<unsigned long>(line.LineNumber), info->Name,
+                      static_cast<unsigned long long>(displacement));
+        return true;
+    }
+    std::snprintf(text, cap, "%s+0x%llx", info->Name, static_cast<unsigned long long>(displacement));
+    return true;
+}
+
+}  // namespace
 
 static LONG WINAPI dx12CrashFilter(EXCEPTION_POINTERS* ep) {
     if (ep != nullptr && ep->ExceptionRecord != nullptr) {
@@ -620,30 +698,30 @@ static LONG WINAPI dx12CrashFilter(EXCEPTION_POINTERS* ep) {
                                reinterpret_cast<LPCSTR>(rec->ExceptionAddress), &mod)) {
             GetModuleFileNameA(mod, modPath, MAX_PATH);
         }
-        std::fprintf(stderr, "[dx12] FATAL native exception code=0x%08X addr=%p tid=%lu module=%s\n",
+        std::fprintf(stderr, "FATAL native exception code=0x%08X addr=%p tid=%lu module=%s\n",
                      static_cast<unsigned>(rec->ExceptionCode), rec->ExceptionAddress,
                      static_cast<unsigned long>(GetCurrentThreadId()), modPath);
         std::fprintf(stderr,
-                     "[dx12] FATAL context: pendingDeletes=%lld openList=%d flushInProgress=%ld "
+                     "FATAL context: pendingDeletes=%lld openList=%d flushInProgress=%ld "
                      "deletingObj=%p deletingIndex=%ld deletingTotal=%ld\n",
                      static_cast<long long>(gPendingDeletes.size()), gOpenListCount, gPdInProgress,
                      reinterpret_cast<void*>(gPdDeletingObj), gPdDeletingIndex, gPdDeletingTotal);
         Dx12Object* dObj = gPdDeletingObj;
         if (dObj) {
             std::fprintf(stderr,
-                         "[dx12] FATAL deletingObj: kind=%d descSlot=%d resource=%p "
+                         "FATAL deletingObj: kind=%d descSlot=%d resource=%p "
                          "sourceTexture=%p mappedPtr=%p size=%lld\n",
                          static_cast<int>(dObj->kind), dObj->descSlot,
                          reinterpret_cast<void*>(dObj->resource.Get()),
                          reinterpret_cast<void*>(dObj->sourceTexture), dObj->mappedPtr, dObj->size);
         }
         if (gCtx.device) {
-            std::fprintf(stderr, "[dx12] FATAL deviceRemovedReason=0x%08X\n",
+            std::fprintf(stderr, "FATAL deviceRemovedReason=0x%08X\n",
                          static_cast<unsigned>(gCtx.device->GetDeviceRemovedReason()));
         }
         void* frames[48];
         USHORT nframes = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
-        std::fprintf(stderr, "[dx12] FATAL backtrace: %u frames\n", static_cast<unsigned>(nframes));
+        std::fprintf(stderr, "FATAL backtrace: %u frames\n", static_cast<unsigned>(nframes));
         for (USHORT i = 0; i < nframes; ++i) {
             HMODULE fm = nullptr;
             char fpath[MAX_PATH] = "<unknown>";
@@ -659,7 +737,14 @@ static LONG WINAPI dx12CrashFilter(EXCEPTION_POINTERS* ep) {
             for (const char* p = fpath; *p; ++p) {
                 if (*p == '\\' || *p == '/') fb = p + 1;
             }
-            std::fprintf(stderr, "  [%02u] %s+0x%llx\n", static_cast<unsigned>(i), fb, rva);
+            // P306c：本模块的帧连带 文件:行 一起打；别的模块维持 模块+偏移。
+            char sym[512] = {};
+            if (fm != nullptr && fm == gCrashOwnModule
+                && describeOwnFrame(frames[i], sym, sizeof(sym))) {
+                std::fprintf(stderr, "  [%02u] %s\n", static_cast<unsigned>(i), sym);
+            } else {
+                std::fprintf(stderr, "  [%02u] %s+0x%llx\n", static_cast<unsigned>(i), fb, rva);
+            }
         }
         std::fflush(stderr);
     }
@@ -670,6 +755,12 @@ static void installCrashHandlerOnce() {
     static bool installed = false;
     if (installed) return;
     installed = true;
+    // P306c：先把本模块的 PDB 预热进内存，过滤器里才能只查表不碰文件 I/O。
+    if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                                 | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCSTR>(&dx12CrashFilter), &gCrashOwnModule)) {
+        prepareCrashSymbols(gCrashOwnModule);
+    }
     SetUnhandledExceptionFilter(&dx12CrashFilter);
 }
 
@@ -796,7 +887,7 @@ mcdr::Result<ComPtr<IDXGIAdapter1>> selectDeviceAdapter() {
         const D3D_FEATURE_LEVEL best = probeHighestFeatureLevel(adapter.Get());
         report += "  " + name + " -> " + featureLevelName(best) + "\n";
         if (best >= kRequiredFeatureLevel) {
-            dbgLogInfo("P66 adapter select: %s (highest FL=%s)", name.c_str(), featureLevelName(best));
+            dbgLogInfo("adapter select: %s (highest FL=%s)", name.c_str(), featureLevelName(best));
             return adapter;
         }
     }
@@ -1765,7 +1856,7 @@ void notifyDlssDeviceReady() {
                         mcdr_dlss_register_vendor_dir(utf8, need + 1);
                     }
                 } else {
-                    dbgLogInfo("P108: this module's directory has no nvngx_dlss.dll; not registering it "
+                    dbgLogInfo("this module's directory has no nvngx_dlss.dll; not registering it "
                                "as the DLSS vendor directory (the JVM can pass the real one via "
                                "mcdr_dx12SetDlssVendorDir)");
                 }
@@ -1778,10 +1869,10 @@ void notifyDlssDeviceReady() {
         // 实机排查（第一版只在 applyDlssToTexture 里懒初始化，失败原因要到第一帧才可见）。
         const int32_t canRun = mcdr_dlss_can_run(reinterpret_cast<void*>(gCtx.device.Get()));
         char runtimePath[512] = {};
-        dbgLogInfo("P108: DLSS NGX init on device-ready: canRun=%d runtime=\"%s\"", canRun,
+        dbgLogInfo("DLSS NGX init on device-ready: canRun=%d runtime=\"%s\"", canRun,
                    mcdr_dlss_runtime_path());
         mcdr_dlss_query(note, sizeof(note), nullptr, 0, runtimePath, sizeof(runtimePath), nullptr);
-        dbgLogInfo("P108: DLSS status after init: %s", note);
+        dbgLogInfo("DLSS status after init: %s", note);
     }
     if (gCtx.adapter && gCtx.rtx.ngxRuntime && !gCtx.rtx.ngxRuntimePath.empty()) {
         mcdr_dlss_register_runtime_path(gCtx.rtx.ngxRuntimePath.c_str(),
@@ -1792,7 +1883,7 @@ void notifyDlssDeviceReady() {
     }
     gDlssAvailabilityLogged = true;
     const bool adapterOk = gCtx.rtx.dlssSuperResolution;
-    dbgLogInfo("P108: DLSS availability: ngxRuntime=%s%s%s%s dlssSupported=%s (why: %s) runtime=%s",
+    dbgLogInfo("DLSS availability: ngxRuntime=%s%s%s%s dlssSupported=%s (why: %s) runtime=%s",
                gCtx.rtx.ngxRuntime ? "yes" : "no",
                (gCtx.rtx.ngxRuntime && !gCtx.rtx.ngxRuntimePath.empty()) ? " \"" : "",
                (gCtx.rtx.ngxRuntime && !gCtx.rtx.ngxRuntimePath.empty()) ? gCtx.rtx.ngxRuntimePath.c_str()
@@ -1819,7 +1910,7 @@ void probeDxc(DeviceContext::Capabilities& caps) {
         caps.dxcNote = "dxcompiler.dll not found (MCDR_DXC_DIR / MCDR.dll dir / Windows SDK)";
         if (const wchar_t* off = _wgetenv(L"MCDR_DXC_DISABLE");
             off != nullptr && off[0] == L'1' && off[1] == L'\0') {
-            dbgLogInfo("P66: DXC discovery was short-circuited by MCDR_DXC_DISABLE=1 — this is the "
+            dbgLogInfo("DXC discovery was short-circuited by MCDR_DXC_DISABLE=1 — this is the "
                        "acceptance switch for the \"no DXC\" path (graphics pipelines now fail "
                        "instead of falling back to D3DCompile SM5.1), not a missing-SDK condition");
         }
@@ -1911,7 +2002,7 @@ mcdr::Result<void> compileHlslToDxil(const std::string& source, const std::strin
             // 在日志里长得一样，回退路径就无法取证。
             if (const wchar_t* off = _wgetenv(L"MCDR_DXC_DISABLE");
                 off != nullptr && off[0] == L'1' && off[1] == L'\0') {
-                dbgLogInfo("P66: DXC discovery was short-circuited by MCDR_DXC_DISABLE=1 (acceptance "
+                dbgLogInfo("DXC discovery was short-circuited by MCDR_DXC_DISABLE=1 (acceptance "
                            "switch for the no-DXC path; graphics pipelines now fail instead of "
                            "falling back to D3DCompile SM5.1)");
             }
@@ -2198,12 +2289,12 @@ void applyAgilitySdk() {
     gAgility.requested = true;
     const std::wstring dir = ownModuleDir();
     if (dir.empty()) {
-        dbgLogWarn("P110 agility: cannot resolve MCDR.dll directory - skipped");
+        dbgLogWarn("agility: cannot resolve MCDR.dll directory - skipped");
         return;
     }
     const std::wstring core = dir + L"D3D12Core.dll";
     if (GetFileAttributesW(core.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        dbgLogWarn("P110 agility: %s not found next to MCDR.dll - skipped",
+        dbgLogWarn("agility: %s not found next to MCDR.dll - skipped",
                    toUtf8(core).c_str());
         return;
     }
@@ -2211,27 +2302,27 @@ void applyAgilitySdk() {
     HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
     if (!d3d12) d3d12 = LoadLibraryW(L"d3d12.dll");
     if (!d3d12) {
-        dbgLogWarn("P110 agility: d3d12.dll unavailable (err=%lu) - skipped", GetLastError());
+        dbgLogWarn("agility: d3d12.dll unavailable (err=%lu) - skipped", GetLastError());
         return;
     }
     const auto getInterface =
         reinterpret_cast<PFN_D3D12_GET_INTERFACE>(GetProcAddress(d3d12, "D3D12GetInterface"));
     if (!getInterface) {
-        dbgLogWarn("P110 agility: D3D12GetInterface missing from d3d12.dll - skipped");
+        dbgLogWarn("agility: D3D12GetInterface missing from d3d12.dll - skipped");
         return;
     }
 
     Microsoft::WRL::ComPtr<ID3D12SDKConfiguration> config;
     HRESULT hr = getInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&config));
     if (FAILED(hr) || !config) {
-        dbgLogWarn("P110 agility: D3D12GetInterface(CLSID_D3D12SDKConfiguration) hr=0x%08lX - skipped",
+        dbgLogWarn("agility: D3D12GetInterface(CLSID_D3D12SDKConfiguration) hr=0x%08lX - skipped",
                    static_cast<unsigned long>(hr));
         return;
     }
     Microsoft::WRL::ComPtr<ID3D12SDKConfiguration1> config1;
     hr = config.As(&config1);
     if (FAILED(hr) || !config1) {
-        dbgLogWarn("P110 agility: QI ID3D12SDKConfiguration1 hr=0x%08lX - skipped",
+        dbgLogWarn("agility: QI ID3D12SDKConfiguration1 hr=0x%08lX - skipped",
                    static_cast<unsigned long>(hr));
         return;
     }
@@ -2239,20 +2330,20 @@ void applyAgilitySdk() {
     gAgility.factoryHr = config1->CreateDeviceFactory(kAgilitySdkVersion, utf8Dir.c_str(),
                                                       IID_PPV_ARGS(&factory));
     if (FAILED(gAgility.factoryHr) || !factory) {
-        dbgLogWarn("P110 agility: CreateDeviceFactory(sdk=%u, \"%s\") hr=0x%08lX - skipped",
+        dbgLogWarn("agility: CreateDeviceFactory(sdk=%u, \"%s\") hr=0x%08lX - skipped",
                    kAgilitySdkVersion, utf8Dir.c_str(),
                    static_cast<unsigned long>(gAgility.factoryHr));
         return;
     }
     gAgility.applyHr = factory->ApplyToGlobalState();
     if (FAILED(gAgility.applyHr)) {
-        dbgLogWarn("P110 agility: ApplyToGlobalState hr=0x%08lX - skipped",
+        dbgLogWarn("agility: ApplyToGlobalState hr=0x%08lX - skipped",
                    static_cast<unsigned long>(gAgility.applyHr));
         return;
     }
     gAgility.dir = dir;
     gAgility.applied = true;
-    dbgLogInfo("P110 agility: opt-in ok sdk=%u core=%s factory=ok apply=ok",
+    dbgLogInfo("agility: opt-in ok sdk=%u core=%s factory=ok apply=ok",
                kAgilitySdkVersion, utf8Dir.c_str());
 }
 
@@ -2269,7 +2360,7 @@ void logAgilityRuntime(ID3D12Device* device) {
     // 注意：这里不要用 GetModuleHandleW(L"D3D12Core.dll") 的路径当"生效 core"——d3d12.dll
     // 在返回 SDKConfiguration 之前就已经把 inbox 那份载入了，同名的 app-local 模块是
     // 第二个模块，按基名查只会拿到先加载的 System32 那份。真正判据是上面的 SDKVersion。
-    dbgLogInfo("P110 agility: agility=%s sdk=%u%s requested=%d requestedCoreDir=%s "
+    dbgLogInfo("agility: agility=%s sdk=%u%s requested=%d requestedCoreDir=%s "
                "factory=0x%08lX apply=0x%08lX",
                agility ? "on" : "off", sdkVersion, haveConfig ? "" : "(n/a)",
                gAgility.requested ? 1 : 0,
@@ -2328,7 +2419,7 @@ void streamlineInitEarly() {
     gSlModule = ::LoadLibraryW(dllPath.c_str());
     if (gSlModule == nullptr) {
         if (probe) { fwprintf(probe, L"load=fail err=%lu\n", ::GetLastError()); fclose(probe); }
-        dbgLogWarn("P111 streamline: %s not found (err=%lu) - skipped", toUtf8(dllPath).c_str(),
+        dbgLogWarn("streamline: %s not found (err=%lu) - skipped", toUtf8(dllPath).c_str(),
                    ::GetLastError());
         return;
     }
@@ -2338,7 +2429,7 @@ void streamlineInitEarly() {
     if (probe) fwprintf(probe, L"load=ok exports=%d\n", (pInit && gSlSetDevice && gSlIsLoaded) ? 1 : 0);
     if (pInit == nullptr || gSlSetDevice == nullptr || gSlIsLoaded == nullptr) {
         if (probe) fclose(probe);
-        dbgLogWarn("P111 streamline: %s is missing expected exports - skipped", toUtf8(dllPath).c_str());
+        dbgLogWarn("streamline: %s is missing expected exports - skipped", toUtf8(dllPath).c_str());
         return;
     }
     const wchar_t* paths[1] = { gSlDir.c_str() };
@@ -2375,7 +2466,7 @@ void streamlineInitEarly() {
                 sl::PreferenceFlags::eUseDXGIFactoryProxy;
     gSlInitResult = (*pInit)(pref, sl::kSDKVersion);
     if (probe) { fwprintf(probe, L"init=0x%X\n", static_cast<unsigned>(gSlInitResult)); fclose(probe); }
-    dbgLogWarn("P111 streamline: slInit=0x%X (early, before any DXGI/D3D12 call)", 
+    dbgLogWarn("streamline: slInit=0x%X (early, before any DXGI/D3D12 call)", 
                static_cast<unsigned>(gSlInitResult));
 }
 
@@ -2411,12 +2502,12 @@ void applyStreamline(ID3D12Device* device) {
     if (!loaded) {
         // P208：插件没加载 ⇒ 后面每帧 evaluate 都会被 native 跳过。历史上这条只打 P111 的
         // `dlssLoaded=no`，容易被当成噪音忽略；这里给一句能照着办的说明。
-        dbgLogError("[P208] Streamline is up but the DLSS plugin did NOT initialize. Look for "
+        dbgLogError("Streamline is up but the DLSS plugin did NOT initialize. Look for "
                     "'NGXInitValidateSnippets' in sl.log next to MCDR.dll: the installed NGX "
                     "runtime is older than the bundled nvngx_dlss.dll. DLSS stays off and "
                     "sub-pixel jitter is suppressed, so the image is stable instead of vibrating.");
     }
-    dbgLogWarn("P111 streamline: slIsFeatureSupported(DLSS)=%d setDevice=0x%X load=0x%X dlssLoaded=%s", slSupport,
+    dbgLogWarn("streamline: slIsFeatureSupported(DLSS)=%d setDevice=0x%X load=0x%X dlssLoaded=%s", slSupport,
                static_cast<unsigned>(deviceResult), static_cast<unsigned>(loadResult),
                loaded ? "yes" : "no");
     using PFn_GetFeatureFunction = sl::Result (*)(sl::Feature, const char*, void*&);
@@ -2447,7 +2538,7 @@ void applyStreamline(ID3D12Device* device) {
                  static_cast<unsigned>(optResult));
         fclose(probe);
     }
-    dbgLogWarn("P111 streamline: slDLSSSetOptions probe getFn=0x%X result=0x%X", getFnResult,
+    dbgLogWarn("streamline: slDLSSSetOptions probe getFn=0x%X result=0x%X", getFnResult,
                static_cast<unsigned>(optResult));
 
     }
@@ -2511,7 +2602,7 @@ mcdr::Result<void> ensureDevice() {
             // 1.619 的 D3D12SDKLayers.dll 不在 vcpkg 包里（只有 D3D12Core.dll）。拿 inbox 的
             // layers 配 agility 的 core 会让 D3D12CreateDevice 直接失败（层与 core 版本不匹配），
             // 所以在 agility 生效时宁可不启用调试层，也不冒这个风险。
-            dbgLogWarn("P110 agility: DX12_DEBUG_LAYER ignored - inbox D3D12SDKLayers would not "
+            dbgLogWarn("agility: DX12_DEBUG_LAYER ignored - inbox D3D12SDKLayers would not "
                        "match the 1.619 core");
         } else {
             ComPtr<ID3D12Debug> debug;
@@ -2548,7 +2639,7 @@ mcdr::Result<void> ensureDevice() {
                 std::snprintf(hrText, sizeof(hrText), "0x%08X", static_cast<unsigned>(hr));
                 selectError = "D3D12CreateDevice(12_2) failed on selected adapter '" + name +
                               "' (hr=" + hrText + ")";
-                dbgLogError("P66 %s", selectError.c_str());
+                dbgLogError("%s", selectError.c_str());
                 ok = false;
             }
         }
@@ -2570,7 +2661,7 @@ mcdr::Result<void> ensureDevice() {
             // P241 兜底：选中的适配器建不出设备时，退回 P66 之前的旧行为（系统默认适配器），
             // 免得一台本来能跑的机器因为枚举/选择环节出岔子而直接崩掉。
             if (SUCCEEDED(createD3D12Device(nullptr, kRequiredFeatureLevel, IID_PPV_ARGS(&device)))) {
-                dbgLogWarn("P241 using the system default adapter after: %s",
+                dbgLogWarn("using the system default adapter after: %s",
                            selectError.c_str());
                 ok = true;
             }
@@ -2688,7 +2779,7 @@ mcdr::Result<void> ensureDevice() {
 }
 
 void destroyDevice() {
-    dbgLogProgress("[P184] destroyDevice stage: enter");
+    dbgLogProgress("destroyDevice stage: enter");
     if (gCtx.queueFenceEvent) {
         CloseHandle(gCtx.queueFenceEvent);
         gCtx.queueFenceEvent = nullptr;
@@ -2705,17 +2796,17 @@ void destroyDevice() {
             }
         }
     }
-    dbgLogProgress("[P184] destroyDevice stage: queue fence wait done");
+    dbgLogProgress("destroyDevice stage: queue fence wait done");
     flushPendingDeletes(/*force=*/true);
-    dbgLogProgress("[P184] destroyDevice stage: pending deletes flushed");
+    dbgLogProgress("destroyDevice stage: pending deletes flushed");
     // P108：DLSS 的特征句柄与 scratch/中间纹理必须在**设备还活着**的时候释放，并且 NGX
     // 只能在设备销毁前 Shutdown。放在 gCtx 清零之前。
     mcdr_dlss_shutdown();
-    dbgLogProgress("[P184] destroyDevice stage: dlss shutdown done");
+    dbgLogProgress("destroyDevice stage: dlss shutdown done");
     gCtx = DeviceContext{};
     // P175：设备级描述符状态不跟着 gCtx 走（见 resetDescriptorAllocationState 的注释）。
     resetDescriptorAllocationState();
-    dbgLogProgress("[P184] destroyDevice stage: done");
+    dbgLogProgress("destroyDevice stage: done");
 }
 
 DeviceContext& deviceContext() { return gCtx; }
@@ -3798,7 +3889,7 @@ int setShadingRate(int rate) {
         return 1;
     }
     dbgLogInfo("VRS: shading rate %s set (tier=%d imageTileSize=%u additionalRates=%d) — it is the coarse "
-               "rate ceiling for the whitelisted draw batches (P231: no longer replayed per list)",
+               "rate ceiling for the whitelisted draw batches (no longer replayed per list)",
                shadingRateName(rate), static_cast<int>(gCtx.caps.shadingRateTier),
                gCtx.caps.shadingRateImageTileSize, gCtx.caps.additionalShadingRates ? 1 : 0);
     return 1;
@@ -4031,7 +4122,7 @@ static void logMemoryClass(uint64_t frame) {
         }
     }
     if (haveVid) {
-        dbgLogInfo("P199c frame=%llu private=%lluMB ws=%lluMB local=%lluMB/%lluMB nonLocal=%lluMB/%lluMB liveTex=%lld liveBuf=%lld bufTotal=%llu upMB=%lld defMB=%lld rbMB=%lld pd=%lld",
+        dbgLogInfo("frame=%llu private=%lluMB ws=%lluMB local=%lluMB/%lluMB nonLocal=%lluMB/%lluMB liveTex=%lld liveBuf=%lld bufTotal=%llu upMB=%lld defMB=%lld rbMB=%lld pd=%lld",
                    static_cast<unsigned long long>(frame), privMB, wsMB,
                    static_cast<unsigned long long>(localInfo.CurrentUsage >> 20),
                    static_cast<unsigned long long>(localInfo.Budget >> 20),
@@ -4044,7 +4135,7 @@ static void logMemoryClass(uint64_t frame) {
                    static_cast<long long>(gLiveReadbackBytes.load() >> 20),
                    static_cast<long long>(pendingDeletesCount()));
     } else {
-        dbgLogInfo("P199c frame=%llu private=%lluMB ws=%lluMB (video memory query unavailable)",
+        dbgLogInfo("frame=%llu private=%lluMB ws=%lluMB (video memory query unavailable)",
                    static_cast<unsigned long long>(frame), privMB, wsMB);
     }
 }
@@ -4057,8 +4148,9 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
     // （D3D12 中重复执行同一条 list 是合法的，但会重复写入同一批资源）。
     // 这里按“空帧”处理：不执行，但仍返回本 ctx 已经 Signal 过的 fence 值，让调用方继续。
     if (!ctx->listOpen) {
-        dbgLogInfo("submitCommandList: no open list — skip execute (empty frame) ctx=%p",
-               reinterpret_cast<void*>(ctx));
+        // 空帧很常见（加载屏、纯 UI 帧），不往控制台打，调试级留一行即可。
+        dbgLogDebug("submitCommandList: no open list — skip execute (empty frame) ctx=%p",
+                    reinterpret_cast<void*>(ctx));
         // BUG-03：返回本 ctx 已 Signal 的最新值，且**不递增**——没有内容要提交就没有新的
         // per-ctx 序号，之前 createFence() 生成的 token（= 该值 + 1）仍然挂着，要等这个
         // ctx 的下一次真正提交才完成（与官方「共享 encoder 的下一个 submit index」一致）。
@@ -4068,19 +4160,6 @@ mcdr::Result<UINT64> submitCommandList(CommandContext* ctx) {
         return mcdr::err("submitCommandList", errorMessage(e.error()));
     }
     UINT64 value = ctx->fenceValue + 1;
-    // P15 诊断：每 30 帧打印 submit 摘要（含 fence 值 + queueFence）
-    if ((value % 30ULL) == 1) {
-        dbgLogInfo("submitCommandList: frame=%llu ctx=%p queueFence=%llu | P199b pending=%lld "
-                   "srvSlot=%d samplerSlot=%d openLists=%d tex=%llu buf=%llu pso=%llu enc=%llu",
-                   static_cast<unsigned long long>(value), reinterpret_cast<void*>(ctx),
-                   static_cast<unsigned long long>(gCtx.queueFenceValue),
-                   static_cast<long long>(pendingDeletesCount()), static_cast<int>(gNextSrv),
-                   static_cast<int>(gNextSampler), static_cast<int>(gOpenListCount),
-                   static_cast<unsigned long long>(gStatTexCreate.load()),
-                   static_cast<unsigned long long>(gStatBufCreate.load()),
-                   static_cast<unsigned long long>(gStatPsoCreate.load()),
-                   static_cast<unsigned long long>(gStatEncoderCreate.load()));
-    }
     if ((value % 300ULL) == 1) {
         logMemoryClass(value);
     }
@@ -5809,7 +5888,7 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
                 default: return "UNKNOWN";
             }
         };
-        dbgLogDebug("P26 DIAG: ord=%d -> dxgi_fmt=%u (%s) semantic=%s", el.format,
+        dbgLogDebug("ord=%d -> dxgi_fmt=%u (%s) semantic=%s", el.format,
                      static_cast<unsigned>(ie.Format), dxgiFmtName(ie.Format), ie.SemanticName);
         ie.InputSlot = static_cast<UINT>(el.binding);
         ie.AlignedByteOffset = static_cast<UINT>(el.offset);
@@ -5936,7 +6015,7 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
             ie.SemanticIndex = semanticIndex;
             ie.Format = toDxgiVertexFormat(el.format);
             // P26 debug (second loop)
-            dbgLogDebug("P26 DIAG2: ord=%d -> dxgi_fmt=%u semantic=%s", el.format,
+            dbgLogDebug("ord=%d -> dxgi_fmt=%u semantic=%s", el.format,
                          static_cast<unsigned>(ie.Format), ie.SemanticName);
             ie.InputSlot = static_cast<UINT>(el.binding);
             ie.AlignedByteOffset = static_cast<UINT>(el.offset);
@@ -6091,7 +6170,7 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
         ++gStatPsoCreate;
         HRESULT h = gCtx.device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&out));
         if (FAILED(h)) {
-            dbgLogDebug("  === D3D12 validation messages ===");
+            dbgLogDebug("D3D12 validation messages:");
             if (gCtx.infoQueue) {
                 UINT64 count = gCtx.infoQueue->GetNumStoredMessages();
                 dbgLogDebug("  InfoQueue stored=%llu", static_cast<unsigned long long>(count));
@@ -6109,7 +6188,7 @@ mcdr::Result<void*> createGraphicsPipeline(const PipelineDesc& desc) {
                             case D3D12_MESSAGE_SEVERITY_WARNING: sev = "WARNING"; break;
                             default: break;
                         }
-                        dbgLogDebug("  InfoQueue[%s] %s", sev, msg->pDescription ? msg->pDescription : "");
+                        dbgLogDebug("  [%s] %s", sev, msg->pDescription ? msg->pDescription : "");
                     }
                 }
             }
@@ -6314,7 +6393,7 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
         static int p243ExhaustWarned = 0;
         if (p243ExhaustWarned < 8) {
             ++p243ExhaustWarned;
-            dbgLogWarn("P243 descriptor ring exhausted (next=%u need=%u cap=%u fence=%llu) - "
+            dbgLogWarn("descriptor ring exhausted (next=%u need=%u cap=%u fence=%llu) - "
                        "reusing previous SRV table",
                        static_cast<unsigned>(ctx->nextDrawSlot), static_cast<unsigned>(srvCount),
                        static_cast<unsigned>(syncRingCapacity()),
@@ -6450,7 +6529,7 @@ mcdr::Result<void> pushDescriptors(CommandContext* ctx, const std::vector<DrawBi
                             static int p109SelfSamples = 0;
                             if (p109SelfSamples < 5) {
                                 ++p109SelfSamples;
-                                dbgLogWarn("P109 SRV self-sample: pushDescriptors is about to move an ACTIVE "
+                                dbgLogWarn("SRV self-sample: pushDescriptors is about to move an ACTIVE "
                                            "pass attachment (res=%p) to SHADER_RESOURCE (ctx=%p inPass=%d) - "
                                            "this is the state divergence behind #538",
                                            reinterpret_cast<void*>(srvRes), reinterpret_cast<void*>(ctx),
@@ -8536,7 +8615,7 @@ mcdr::Result<void> smaaEnsureTargets(UINT64 w, UINT64 h) {
     gCtx.smaaWidth = w;
     gCtx.smaaHeight = h;
     gSmaaTargetsInSrvState = false;
-    dbgLogInfo("P104: SMAA intermediate targets %llux%llu (R8G8_UNORM) ready", static_cast<unsigned long long>(w),
+    dbgLogInfo("SMAA intermediate targets %llux%llu (R8G8_UNORM) ready", static_cast<unsigned long long>(w),
                static_cast<unsigned long long>(h));
     return {};
 }
@@ -8748,7 +8827,7 @@ mcdr::Result<void> smaaEnsureWorldResult(const D3D12_RESOURCE_DESC& srcDesc) {
     }
     gCtx.device->CreateRenderTargetView(gCtx.smaaWorldResult.Get(), nullptr, gCtx.smaaWorldResultRtv);
     gCtx.smaaWorldResultFormat = srcDesc.Format;
-    dbgLogInfo("P104: SMAA in-place result target %llux%llu (fmt=%d) ready",
+    dbgLogInfo("SMAA in-place result target %llux%llu (fmt=%d) ready",
                static_cast<unsigned long long>(srcDesc.Width),
                static_cast<unsigned long long>(srcDesc.Height), static_cast<int>(srcDesc.Format));
     return {};
@@ -8999,7 +9078,7 @@ mcdr::Result<void> smaaEnsurePipelines(DXGI_FORMAT rtFormat) {
     gCtx.smaaBlendPso = blendPso.value();
     gCtx.smaaBlendFormat = rtFormat;
     gCtx.smaaPipelinesReady = true;
-    dbgLogInfo("P104: SMAA pipelines ready (blend RTV fmt=%d, SM=%s)", static_cast<int>(rtFormat),
+    dbgLogInfo("SMAA pipelines ready (blend RTV fmt=%d, SM=%s)", static_cast<int>(rtFormat),
                smProfile.c_str());
     // 两条权重管线只有一条会被用到，但两条都建好 ⇒ 任何时候都不需要重建、不需要重试。
     // 「官方 LUT」那行日志**不能**放在这里：smaaEnsurePipelines 先于 smaaEnsureLuts 执行，
@@ -9065,7 +9144,7 @@ const char* antiAliasingName(int mode) {
 
 int setAntiAliasing(int mode) {
     if (mode < 0 || mode > 3) {
-        dbgLogError("P104: invalid anti-aliasing mode %d (valid: 0=OFF 1=SMAA 2=TAA 3=DLAA)", mode);
+        dbgLogError("invalid anti-aliasing mode %d (valid: 0=OFF 1=SMAA 2=TAA 3=DLAA)", mode);
         return -1;
     }
     // P77/P152：TAA（2）不再降级，且从 P152 起它的 resolve 也在 native 侧
@@ -9088,7 +9167,7 @@ int setAntiAliasing(int mode) {
         gCtx.taaHistoryValid = false;
     }
     if (mode != prev) {
-        dbgLogInfo("P77: anti-aliasing = %s (%s)", antiAliasingName(mode),
+        dbgLogInfo("anti-aliasing = %s (%s)", antiAliasingName(mode),
                    mode == 1 ? "SMAA, three passes in place after the world and before the GUI"
                    : mode == 2 ? "TAA, resolved natively after the world layer (RGBA16F history)"
                                : "no post-processing; plain blit");
@@ -9113,11 +9192,11 @@ int setDlssEnabled(int enabled) {
         return want ? 1 : 0;
     }
     gCtx.dlssEnabled = want;
-    dbgLogInfo("P108: DLSS %s (independent of anti-aliasing; aaMode=%d)",
+    dbgLogInfo("DLSS %s (independent of anti-aliasing; aaMode=%d)",
                want ? "enabled" : "disabled", gCtx.aaMode);
     if (want) {
         // 让下一次 applyDlssToTexture 有机会重来一次（例如上次是 NGX 还没就绪时失败的）。
-        dbgLogInfo("P108: DLSS gate is now open; the next world frame will try to create/evaluate");
+        dbgLogInfo("DLSS gate is now open; the next world frame will try to create/evaluate");
     }
     return want ? 1 : 0;
 }
@@ -9248,7 +9327,7 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
     resolved.pInDepth = reinterpret_cast<mcdr_object*>(unwrapResource(in.pInDepth));
     resolved.pInMotionVectors = reinterpret_cast<mcdr_object*>(unwrapResource(in.pInMotionVectors));
     resolved.pInOutput = reinterpret_cast<mcdr_object*>(unwrapResource(in.pInOutput));
-    dbgLogInfo("P108: DLSS resource unwrap: color=%p depth=%p mv=%p out=%p (from Dx12Object "
+    dbgLogInfo("DLSS resource unwrap: color=%p depth=%p mv=%p out=%p (from Dx12Object "
                "handles %p/%p/%p/%p)",
                resolved.pInColor, resolved.pInDepth, resolved.pInMotionVectors, resolved.pInOutput,
                static_cast<void*>(in.pInColor), static_cast<void*>(in.pInDepth),
@@ -9258,7 +9337,7 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
         static bool s_loggedMissing = false;
         if (!s_loggedMissing) {
             s_loggedMissing = true;
-            dbgLogWarn("P108: DLSS skipped — color/depth/output did not unwrap to a D3D12 resource "
+            dbgLogWarn("DLSS skipped — color/depth/output did not unwrap to a D3D12 resource "
                        "(color=%p depth=%p out=%p); the data plane handed over a handle that is not "
                        "a live texture",
                        resolved.pInColor, resolved.pInDepth, resolved.pInOutput);
@@ -9269,7 +9348,7 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
         static bool s_loggedNoMv = false;
         if (!s_loggedNoMv) {
             s_loggedNoMv = true;
-            dbgLogWarn("P108: DLSS skipped — no motion-vector texture this frame (the velocity pass "
+            dbgLogWarn("DLSS skipped — no motion-vector texture this frame (the velocity pass "
                        "is off or did not record); DLSS needs per-pixel motion vectors, so it stays "
                        "off until one exists. Enable it with -Pdxrmc.temporal.velocity=true.");
         }
@@ -9333,7 +9412,7 @@ bool applyDlssToTexture(CommandContext* ctx, const mcdr_dlss_input& in) {
     if (ctx->inRenderPass) {
         // Whoever left a pass open (the JVM hook sits after the world pass) has to be named in the
         // log, otherwise this stays invisible: the pass state and the call site disagree.
-        dbgLogWarn("P108x: a render pass was still open at the DLSS evaluate (inRenderPass=1); ending it "
+        dbgLogWarn("a render pass was still open at the DLSS evaluate (inRenderPass=1); ending it "
                 "so NGX's compute dispatch is legal. The caller is expected to begin its own pass "
                 "afterwards — nothing is restarted here.");
         (void)endRenderPass(ctx);
@@ -9362,19 +9441,19 @@ int setDlssOutput(mcdr_object* tex) {
     if (tex == nullptr) {
         gCtx.dlssOutputOverride = nullptr;
         mcdr_dlss_set_output_texture(nullptr);
-        dbgLogInfo("P108: DLSS output override cleared (back to the private fallback)");
+        dbgLogInfo("DLSS output override cleared (back to the private fallback)");
         return 0;
     }
     auto* obj = reinterpret_cast<Dx12Object*>(tex);
     if (obj->kind != Dx12Object::Kind::Texture || !obj->resource) {
-        dbgLogError("P108: mcdr_dx12SetDlssOutput got a handle that is not a live texture "
+        dbgLogError("mcdr_dx12SetDlssOutput got a handle that is not a live texture "
                     "(kind=%d); ignored",
                     static_cast<int>(obj->kind));
         return -1;
     }
     gCtx.dlssOutputOverride = tex;
     const int32_t r = mcdr_dlss_set_output_texture(reinterpret_cast<void*>(obj->resource.Get()));
-    dbgLogInfo("P108: DLSS output override accepted (raw resource %p); the evaluate will write "
+    dbgLogInfo("DLSS output override accepted (raw resource %p); the evaluate will write "
                "there instead of the private UAV texture",
                static_cast<void*>(obj->resource.Get()));
     return r == 1 ? 1 : 0;
@@ -9388,7 +9467,7 @@ int setDlssOutput(mcdr_object* tex) {
 // 越界返回 -1 且不改变现状；返回归一化后的档位。
 int setDlssQuality(int tier) {
     if (tier < 0 || tier > 4) {
-        dbgLogError("P108: invalid DLSS quality tier %d (valid: 0=Performance 1=Balanced "
+        dbgLogError("invalid DLSS quality tier %d (valid: 0=Performance 1=Balanced "
                     "2=Quality 3=DLAA)",
                     tier);
         return -1;
@@ -9398,7 +9477,7 @@ int setDlssQuality(int tier) {
     if (tier != prev) {
         // 让实现单元下一帧重建，并把"一次性失败"闸门复位（换档也能把之前失败的 DLSS 再试）。
         mcdr_dlss_request_quality(tier);
-        dbgLogInfo("P108: DLSS quality tier = %d (%s) — the feature will be recreated on the next "
+        dbgLogInfo("DLSS quality tier = %d (%s) — the feature will be recreated on the next "
                    "frame",
                    tier, tier == 0 ? "Performance"
                                    : (tier == 1 ? "Balanced" : (tier == 2 ? "Quality" : "DLAA")));
@@ -9415,7 +9494,7 @@ int setDlssQuality(int tier) {
 // 越界返回 -1 且不改变现状；返回实际记录的预设值。
 int setDlssRenderPreset(int preset) {
     if (preset < 0 || preset > 15) {
-        dbgLogError("P108: invalid DLSS render preset %d (valid: 0=Default 5=E 6=F 10=J 11=K "
+        dbgLogError("invalid DLSS render preset %d (valid: 0=Default 5=E 6=F 10=J 11=K "
                     "12=L 13=M)",
                     preset);
         return -1;
@@ -9424,7 +9503,7 @@ int setDlssRenderPreset(int preset) {
     gCtx.dlssPreset = preset;
     if (preset != prev) {
         mcdr_dlss_request_preset(preset);
-        dbgLogInfo("P108: DLSS render preset = %d — the feature will be recreated on the next "
+        dbgLogInfo("DLSS render preset = %d — the feature will be recreated on the next "
                    "frame",
                    preset);
     }
@@ -9502,7 +9581,7 @@ int queryDlss(char* out, int cap) {
                               : gCtx.rtx.dlssSuperResolutionWhy.c_str());
             return fail(why);
         }
-        return fail("NGX init failed (see the P108 WARN line)");
+        return fail("NGX init failed (see the DLSS WARN line)");
     }
     char note[256] = {};
     char optimal[256] = {};
@@ -9554,7 +9633,7 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
         // 非 2D / MSAA 目标既不能当 SRV 采样也不能 CopyResource：静默不适用（不是错误）。
         if (!gCtx.smaaUnavailableLogged) {
             gCtx.smaaUnavailableLogged = true;
-            dbgLogWarn("P104: target is not a single-sampled 2D texture; skipping the in-place SMAA path");
+            dbgLogWarn("target is not a single-sampled 2D texture; skipping the in-place SMAA path");
         }
         return false;
     }
@@ -9568,7 +9647,7 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     auto fail = [](const char* where, const std::string& what) {
         gCtx.smaaDisabled = true;
         gCtx.aaMode = 0;
-        dbgLogError("P104: SMAA failed in %s; SMAA disabled: %s", where, firstLine(what).c_str());
+        dbgLogError("SMAA failed in %s; SMAA disabled: %s", where, firstLine(what).c_str());
         return false;
     };
     if (auto r = smaaEnsurePipelines(srcFormat); !r) {
@@ -9583,7 +9662,7 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
         auto lut = smaaEnsureLuts();
         if (!lut && !gCtx.smaaLutFallbackWarned) {
             gCtx.smaaLutFallbackWarned = true;
-            dbgLogWarn("P104: SMAA falling back to the analytic blending-weight shader; official LUTs unavailable: %s",
+            dbgLogWarn("SMAA falling back to the analytic blending-weight shader; official LUTs unavailable: %s",
                        firstLine(lut.error().message).c_str());
         }
     }
@@ -9591,7 +9670,7 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
     if (!useLutWeights) {
         if (!gCtx.smaaLutFallbackWarned) {
             gCtx.smaaLutFallbackWarned = true;
-            dbgLogWarn("P104: SMAA falling back to the analytic blending-weight shader (official LUTs unavailable)");
+            dbgLogWarn("SMAA falling back to the analytic blending-weight shader (official LUTs unavailable)");
         }
     } else if (gCtx.smaaAppliedFrames == 0 && !gCtx.smaaLutReadyLogged) {
         // P104 fix：这一行原来挂在 smaaEnsurePipelines 里的 `if (gCtx.smaaLutsReady)` 分支上，
@@ -9600,7 +9679,7 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
         // 必须用一次性闸门：applySmaaToTexture **每帧**都会走到这里，没有闸门就会逐帧刷屏
         // （实测 18:09:53–18:10:08 刷了 15 秒）。smaaAppliedFrames==0 表示「首帧之前」。
         gCtx.smaaLutReadyLogged = true;
-        dbgLogInfo("P104: SMAA using the official AreaTex/SearchTex LUTs (160x560 RG8, 64x16 R8)");
+        dbgLogInfo("SMAA using the official AreaTex/SearchTex LUTs (160x560 RG8, 64x16 R8)");
     }
     if (auto r = smaaEnsureTargets(srcW64, srcH64); !r) {
         return fail("smaaEnsureTargets", r.error().message);
@@ -9689,7 +9768,7 @@ bool applySmaaToTexture(CommandContext* ctx, Dx12Object* tex) {
 
     ++gCtx.smaaAppliedFrames;
     if (gCtx.smaaAppliedFrames == 1) {
-        dbgLogInfo("P104: SMAA applied on the first frame: world layer %llux%llu anti-aliased in place (fmt=%d)",
+        dbgLogInfo("SMAA applied on the first frame: world layer %llux%llu anti-aliased in place (fmt=%d)",
                    static_cast<unsigned long long>(srcW64), static_cast<unsigned long long>(srcH64),
                    static_cast<int>(srcFormat));
     }
@@ -9997,7 +10076,7 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
         motionDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || motionDesc.SampleDesc.Count != 1) {
         if (!gCtx.taaUnavailableLogged) {
             gCtx.taaUnavailableLogged = true;
-            dbgLogWarn("P152: TAA needs single-sampled 2D scene and motion textures; skipping TAA");
+            dbgLogWarn("TAA needs single-sampled 2D scene and motion textures; skipping TAA");
         }
         return 0;
     }
@@ -10006,7 +10085,7 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
     if (w == 0 || h == 0 || motionDesc.Width != w || motionDesc.Height != h) {
         if (!gCtx.taaUnavailableLogged) {
             gCtx.taaUnavailableLogged = true;
-            dbgLogWarn("P152: TAA needs matching scene/motion sizes (%llux%llu vs %llux%llu); skipping TAA",
+            dbgLogWarn("TAA needs matching scene/motion sizes (%llux%llu vs %llux%llu); skipping TAA",
                        static_cast<unsigned long long>(w), static_cast<unsigned long long>(h),
                        static_cast<unsigned long long>(motionDesc.Width),
                        static_cast<unsigned long long>(motionDesc.Height));
@@ -10022,7 +10101,7 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
     if (sceneFormat != DXGI_FORMAT_R8G8B8A8_UNORM) {
         if (!gCtx.taaUnavailableLogged) {
             gCtx.taaUnavailableLogged = true;
-            dbgLogWarn("P152: TAA needs an RGBA8 scene target (fmt=%d); skipping TAA",
+            dbgLogWarn("TAA needs an RGBA8 scene target (fmt=%d); skipping TAA",
                        static_cast<int>(sceneFormat));
         }
         return 0;
@@ -10031,7 +10110,7 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
     // 任何一步失败都彻底关掉 TAA：避免每帧重试刷日志，也避免把历史留在与预期不符的状态上。
     auto fail = [](const char* where, const std::string& what) {
         gCtx.taaDisabled = true;
-        dbgLogError("P152: TAA failed in %s; TAA disabled: %s", where, firstLine(what).c_str());
+        dbgLogError("TAA failed in %s; TAA disabled: %s", where, firstLine(what).c_str());
         return -1;
     };
     if (auto r = taaEnsurePipelines(); !r) {
@@ -10120,7 +10199,7 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
             filled = true;
         } else if (!gCtx.taaSharpenFallbackWarned) {
             gCtx.taaSharpenFallbackWarned = true;
-            dbgLogWarn("P152: TAA sharpen pass failed; falling back to a plain blit: %s",
+            dbgLogWarn("TAA sharpen pass failed; falling back to a plain blit: %s",
                        firstLine(sr.error().message).c_str());
         }
     }
@@ -10143,7 +10222,7 @@ int applyTaaToTexture(CommandContext* ctx, Dx12Object* scene, Dx12Object* motion
     gCtx.taaHistoryValid = true;
     ++gCtx.taaAppliedFrames;
     if (gCtx.taaAppliedFrames == 1) {
-        dbgLogInfo("P152: TAA applied on the first frame: %llux%llu, history RGBA16F double buffered, blend=%.3f",
+        dbgLogInfo("TAA applied on the first frame: %llux%llu, history RGBA16F double buffered, blend=%.3f",
                    static_cast<unsigned long long>(w), static_cast<unsigned long long>(h),
                    static_cast<double>(blend));
     }
@@ -10437,7 +10516,7 @@ void waitForRenderThreadSubmit() {
     waitForPendingPresents();
     const double p98presentsMs = nowMs() - p98t1;
     if (p98submitDoneMs > 30.0 || p98presentsMs > 30.0) {
-        dbgLogInfo("P98 waitForRenderThreadSubmit: submitDone=%.1f ms (waitResult=%lu) pendingPresents=%.1f ms",
+        dbgLogInfo("waitForRenderThreadSubmit: submitDone=%.1f ms (waitResult=%lu) pendingPresents=%.1f ms",
                p98submitDoneMs, static_cast<unsigned long>(r), p98presentsMs);
     }
 }

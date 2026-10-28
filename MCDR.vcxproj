@@ -114,7 +114,7 @@
              <DelayLoadDLLs>NRC_D3D12.dll</DelayLoadDLLs>  (+ delayimp.lib)
            so the import becomes lazy and a missing DLL surfaces as a
            feature-unavailable error instead of MCDR.dll failing to load. -->
-      <AdditionalIncludeDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\xess\inc\xess;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include\dx12;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\upscalers\include;$(ProjectDir)external\fidelityfx\include;$(ProjectDir)external\streamline\include;$(ProjectDir)external\nrc\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include\directx-dxc;$(ProjectDir)include;$(ProjectDir)src\c_abi;$(ProjectDir)src\core;$(ProjectDir)src\advanced;$(ProjectDir)external\dlss\include;$(ProjectDir)external\nrd\Include;$(ProjectDir)external\xess\inc;$(ProjectDir)external\xess\inc\xess;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\api\include\dx12;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\framegeneration\include;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\framegeneration\include\dx12;$(ProjectDir)external\fidelityfx\Kits\FidelityFX\upscalers\include;$(ProjectDir)external\fidelityfx\include;$(ProjectDir)external\streamline\include;$(ProjectDir)external\nrc\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <!-- These sources have Chinese comments; without /utf-8 the compiler
            reads them under the active code page and mangles them. -->
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -274,6 +274,8 @@
     <ClCompile Include="src\advanced\d3d12_framegen.cpp" />
     <ClCompile Include="src\advanced\d3d12_fsr.cpp" />
     <ClCompile Include="src\advanced\d3d12_xess.cpp" />
+    <ClCompile Include="src\advanced\d3d12_xessfg.cpp" />
+    <ClCompile Include="src\advanced\d3d12_fsffg.cpp" />
     <!-- P267：SeamlessWindowHost（呈现子窗口 + GL 隔离），普通 TU -->
     <ClCompile Include="src\core\d3d12_window_host.cpp" />
     <!-- P197：HDR 状态单元。普通 TU（surface 是模块单元、DLSS 是普通 TU，

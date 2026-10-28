@@ -828,6 +828,11 @@ bool waitForPendingPresents(unsigned timeoutMs = 100);
 // 只剩 "presentSurface: FAILED DXGI_ERROR_DEVICE_REMOVED"，看不到真正原因
 // （实测漏掉的是上面那条 ERROR #907 / DXGI_ERROR_ACCESS_DENIED）。
 void logDeviceStatus(const char* tag);
+// 设备是否已被移除/重置（`GetDeviceRemovedReason() != S_OK`，或设备尚未创建）。
+// 帧循环在调用 D3D12 / Streamline / FidelityFX 之前用它跳过“已经失效”的活：
+// 设备一旦被移除，继续调用会在驱动或 SDK 里解引用失效对象 —— P306 的崩溃现场就是
+// Present 前的 FG 钩子（TDR 之后照常走了 FSR-FG 的 beforePresent）。
+bool deviceRemoved();
 // 非阻塞：请求渲染线程开始下一帧。返回 true 表示成功排队，false 表示正在处理上一帧。
 mcdr::Result<void> asyncRenderBeginFrame(CommandContext* ctx);
 // 阻塞：等到本帧提交完成（或超时 ms）。
@@ -1206,6 +1211,38 @@ enum class FgBackendId : int32_t {
     XessFg = MCDR_FG_BACKEND_XESSFG,
 };
 
+// P305ag：帧生成输入的**中性**快照（与 SR 后端解耦）。
+//
+// 存在理由：逐帧 tag 原来只有一个触发点 —— `srEvaluateFrame` 成功后（`d3d12_sr.cpp:413`）。
+// 但本仓的 DLSS 超分走 `mcdr_dlss_evaluate`（Streamline / NGX），根本不经过那条路径，于是
+// `sr.backend = DLSS` 的默认配置下 XeSS-FG 永远收不到颜色/深度/MV（实机取证：4561 帧 tagCalls=0）。
+// 把「这一帧交给 FG 的三个资源 + 尺寸 + 它们各自的**当前**状态」抽成这个小结构，DLSS 路径
+// 也能在 SR 成功后原样交一份，provider 不再依赖 `mcdr_sr_dispatch` 的字段名。
+//
+// 状态为什么必须由调用方给：tag 之前 SDK 会按 `incomingState` 记录屏障，写错状态会让资源
+// 的实际状态与我们自己的跟踪表错位（P273 之后整条渲染管线都按跟踪表工作）——DLSS 路径交完
+// SR 时深度/MV 已经是 NON_PIXEL_SHADER_RESOURCE，与 SR 通用路径的 DEPTH_READ 并不相同。
+struct FgFrameInputs {
+    ID3D12GraphicsCommandList* cmdList = nullptr;
+    void* pColorOutput = nullptr;  // 显示分辨率的世界层（无 HUD）
+    D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    void* pDepth = nullptr;
+    D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_DEPTH_READ;
+    void* pMotionVectors = nullptr;
+    D3D12_RESOURCE_STATES motionVectorState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    int32_t renderWidth = 0;
+    int32_t renderHeight = 0;
+    int32_t displayWidth = 0;
+    int32_t displayHeight = 0;
+    // 相机与时间：FSR-FG 的 PrepareV2 需要（AMD 官方 sample 逐帧填；DLSS-G 走 Streamline 常量，
+    // 自己不用这几个字段）。`0` = 上游没给，provider 用保守默认值。
+    float cameraNear = 0.0f;
+    float cameraFar = 0.0f;
+    float cameraVerticalFov = 0.0f;  // 弧度
+    float frameTimeDeltaMs = 0.0f;
+    float viewSpaceToMeters = 0.0f;
+};
+
 class IFrameGenProvider {
 public:
     IFrameGenProvider() = default;
@@ -1219,6 +1256,10 @@ public:
     // 设期望值。**只记录**：真正下发发生在下一次 beforePresent（渲染线程）。
     // 返回 true = 已接受（不代表已生效，生效看 presented()）。
     virtual bool setMode(const mcdr_fg_dispatch& desc) = 0;
+    // 帧首（`acquireSurface` 消费完挂起的链重建之后、本帧还没有开画）。给需要"帧起点"
+    // 语义的后端用：XeSS-FG 的 XeLL marker（RENDERSUBMIT_START）必须在这里发，且帧号要与
+    // 后面的 `SetPresentId` 一致（`xess_fg_developer_guide_english.md:240`）。默认空实现。
+    virtual void frameStart() {}
     // Present 之前 / 之后各一次，都在渲染线程。**不许在这里 Present**（D4）：
     // 链的所有权见 chainOwner()，provider 只做"Present 之前该做的准备"。
     virtual void beforePresent() = 0;
@@ -1229,6 +1270,55 @@ public:
     // 关。**必须先显式下发 eOff 再允许链回原生**（E10 / P213e），否则会留下
     // 「界面说关了、后端还在插帧」。实现不得改动链本身的所有权。
     virtual void shutdown() = 0;
+
+    // ---- 包装型后端（P304：FSR-FG / XeSS-FG）----
+    // DLSS-G 是「代理工厂 + SL 在 Present 内部插帧」，链仍是我们自己那条；而 FSR-FG 与
+    // XeSS-FG 都是**包装交换链**的：把应用链交给 SDK，之后所有 Present 必须走 SDK 换回来的
+    // 那条（`xefgSwapChainD3D12GetSwapChainPtr` / `ffxCreateContextDescFrameGenerationSwapChain
+    // WrapDX12` 的 swapchain 出参）。所以给接口加一个显式的包装点，而不是让 provider 自己
+    // 去改 `Dx12Surface` —— 链的字段归 surface 所有，provider 只回答"要换成哪条"。
+    //
+    // 默认实现 = 不包装（返回 0），DLSS-G 不用覆写。返回 1 时 `*outPresentChain` 必须是
+    // 已 AddRef 的接口，由 surface 接管引用；返回 0 表示"本后端不需要包装"。
+    // 参数都是本模块已有的类型（`Dx12Object` 的底层就是这些），不需要再做 void* 转换。
+    virtual int32_t wrapSwapChain(ID3D12Device* device, ID3D12CommandQueue* queue,
+                                  IDXGISwapChain* appChain, int32_t width, int32_t height,
+                                  DXGI_FORMAT format, IDXGISwapChain** outPresentChain) {
+        static_cast<void>(device);
+        static_cast<void>(queue);
+        static_cast<void>(appChain);
+        static_cast<void>(width);
+        static_cast<void>(height);
+        static_cast<void>(format);
+        static_cast<void>(outPresentChain);
+        return 0;
+    }
+    // 解包：链要重建/后端要换人时先调它（SDK 的 context 必须先于链释放）。
+    virtual void unwrapSwapChain() {}
+
+    // P305b：**这一帧**的输入 tag。Context 里带着本帧的命令列表，调用点在 `srEvaluateFrame`
+    // 的 `restoreDrawHeap` 之后 —— 那里 SR 已跑完、render pass 已结束、命令列表还开着，正是
+    // XeSS 的 `TagFrameResource(cmdList, …)` 与 FSR 的 `InterpolationCommandListDX12` 要的时机。
+    // 默认空实现：DLSS-G 在 `d3d12_dlss.cpp` 里自己交 tag（同一次 `slSetTagForFrame`）。
+    // P305c：UI 纹理（用户裁决 = GUI 合成目标）。传 nullptr 撤销。只在目标重建时调。
+    virtual void setUiTexture(void* object) { static_cast<void>(object); }
+    // P306ac：hudless 呈现开关。1 = 应用 Present 的**世界层不含 UI**，UI 单独作为一张
+    // UI-only 纹理交给后端合成（FSR-FG 的 `RegisterUiResource` 路径）；0 = 老路径，应用自己
+    // 把 UI 合成进 backbuffer，后端不得再注册 UI（否则同一份 HUD 会被画两遍）。
+    // 为什么由 JVM 决定：只有它知道"这一帧有没有 3D 世界层"（菜单/加载屏应当直通不插帧）。
+    // 默认空实现；包装型后端按需覆写。
+    virtual void setUiComposition(int32_t enabled) { static_cast<void>(enabled); }
+    // P306ac：后端是否真的会替我们把 UI 合成到 presented 帧上。只有它返回 true，应用才敢
+    // Present 一张不含 UI 的图。默认 false = "没人合成 UI"。
+    virtual bool uiCompositionReady() const { return false; }
+    // P305z：帧常量（View/Projection 等）由 FG 载荷带进来，provider 自己决定怎么喂给 SDK。
+    virtual void setFrameConstants(const mcdr_fg_constants& constants) { (void)constants; }
+
+    // P305b：**这一帧**的输入 tag。命令列表还开着、SR 已跑完 —— 正是 XeSS 的
+    // `TagFrameResource(cmdList, …)` 与 FSR 的 `InterpolationCommandListDX12` 要的时机。
+    // P305ag：载荷换成 `FgFrameInputs`（SR 通用路径与 DLSS 路径都能交，见上面的结构注释）。
+    // 默认空实现：DLSS-G 在 `d3d12_dlss.cpp` 里自己交 tag（同一次 `slSetTagForFrame`）。
+    virtual void tagFrameInputs(const FgFrameInputs& inputs) { static_cast<void>(inputs); }
 };
 
 // ---- 注册表（与 SR 注册表同风格：期望 → 生效两级）----
@@ -1241,6 +1331,8 @@ int32_t fgEnsureProvider(void);
 // 记下期望值并转给 provider（provider 未建时按需建）。返回 1=已接受 0=不可用 -1=参数非法。
 int32_t fgSetMode(const mcdr_fg_dispatch& desc);
 // 由 presentSurface 在 Present 前后调用（渲染线程）。没有生效后端时是空操作。
+// `fgFrameStart` 挂在 `acquireSurface` 帧首（XeSS-FG 的 XeLL marker 需要帧起点语义）。
+void fgFrameStart(void);
 void fgBeforePresent(void);
 void fgAfterPresent(void);
 // 上一次真正提交的帧数；没有生效后端时返回 1（= 没插帧），与老语义一致。
@@ -1262,6 +1354,35 @@ int32_t fgStatePacked(void);
 // `d3d12_surface.cpp` 在 DXGI 工厂被升级成 SL 代理工厂成功之后写一次；provider 改不动它。
 void fgNoteChainOwner(int32_t owner);
 int32_t fgChainOwner(void);
+// P304：链归属的**无锁镜像**，供 `fillCaps` 这类"可能已经持有注册表锁"的路径用。
+// 权威值仍是 `fgChainOwner()`；这一份只在两个写点上同步（都在锁内写），读侧不加锁是为了
+// 避免 `std::mutex` 不可重入造成的每帧死锁（详见 `d3d12_framegen.cpp` 的注释）。
+int32_t fgChainOwnerFast(void);
+
+// P305：包装型后端的链交接。`fgWrapPresentChain` 只在 picked 是包装型后端时动手（返回 1 =
+// `*outPresentChain` 已指向代理链，调用方负责持有）；`fgUnwrapPresentChain` 必须在销毁/重建
+// 链之前调用 —— provider 的 context 绑在那条链上。
+int32_t fgWrapPresentChain(void* device, void* queue, void* appChain, int32_t width, int32_t height, int32_t format,
+                           void** outPresentChain);
+void fgUnwrapPresentChain(void);
+
+// P305b：把本帧的输入 tag 交给包装型 provider。注册表侧持锁调用，provider 内部不得回头
+// 调注册表（`std::mutex` 不可重入）。
+// P305ag：两个入口 —— SR 通用路径把 `mcdr_sr_dispatch` 折成 `FgFrameInputs`（`fgMakeFrameInputs`）；
+// DLSS（Streamline / NGX）路径不走 `srEvaluateFrame`，自己填 `FgFrameInputs` 直接交。
+FgFrameInputs fgMakeFrameInputs(CommandContext* ctx, const mcdr_sr_dispatch& sr);
+void fgTagFrameInputs(const FgFrameInputs& inputs);
+
+// P305c：登记/撤销 UI 纹理句柄（`Dx12Object*`）。注册表侧持锁保存，provider 在 tag 时读取。
+void fgSetUiTexture(void* object);
+void fgSetFrameConstants(const mcdr_fg_constants* constants);
+
+// P306ac：hudless 呈现模式（present 的世界层不含 UI、UI 由 SDK 合成）。只记期望值并转给
+// 当前 provider；登记表在 provider 后建时回放（与 `uiTexture` 同一条纪律）。
+void fgSetUiComposition(int32_t enabled);
+// 1 = provider 在 && hudless 模式在 && 它确认"UI 会被合成"。调用方据此决定 present 用
+// 世界层还是合成层 —— 拿不准时必须返回 0，否则 UI 会整帧消失。
+int32_t fgUiCompositionReady(void);
 
 // ---- 链重建请求（P296 / D13）----
 // 官方检查表要求「每次开关 DLSS-G 都重建 swapchain」，否则关掉之后 SL 的呈现路径上
@@ -1275,6 +1396,16 @@ bool fgChainRebuildPending(void);
 // 覆盖当前归属）；ok == 0：重建失败，请求撤销但 `chainMode` 不动 —— 下次用户改开关时会再试一次。
 void fgNoteChainRebuildDone(int32_t ownerAfterRebuild, int32_t ok, const char* reason);
 
+// P306af：包装失败之后的收场。包装型后端的 `wrapSwapChain` 一旦失败，应用链已经被 SDK 拿走并
+// 销毁（`swapChain.Detach()` 之后回不来），此时如果照旧返回错误，surface 就停在"没有链"的状态：
+// 游戏逻辑还在跑、画面一帧都不再上屏。所以失败路径必须先调这里 —— 它关掉期望、把链归属记回
+// 原生、拆掉 provider，并记下 `lastReason`；随后调用方按"不需要包装"重建一条纯应用链。
+void fgAbortWrapAfterFailure(const char* reason);
+
+// P305ad：链重建属于**帧边界**职责，不能只挂在 `acquireSurface` 上 —— 那个函数由 JVM 在特定渲染路径才调，
+// 于是 `rebuildPending` 置真之后可能永远没人消费。这里把它暴露给其它实现单元（帧首消费点）。
+mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why);
+
 // ---- 后端工厂（P293 起：每家一个实现单元，注册表按需懒建）----
 // DLSS-G 的 provider 在 `src\core\d3d12_framegen.cpp` 里，是对既有
 // `mcdr_dlss_set_fg_mode` / `mcdr_dlss_fg_presented`（`include\mcdr_dlss_impl.h`）的薄包装：
@@ -1282,6 +1413,30 @@ void fgNoteChainRebuildDone(int32_t ownerAfterRebuild, int32_t ok, const char* r
 std::unique_ptr<IFrameGenProvider> makeDlssGProvider();
 // caps 的 DLSS-G 分支。**不建上下文**：只回答"能不能用、为什么不能"。
 void fillDlssGCaps(mcdr_fg_caps& out);
+
+// P304：包装型后端的工厂与能力表。每家一个实现单元，注册表按需懒建：
+//   `src\advanced\d3d12_xessfg.cpp` —— XeSS-FG（`libxess_fg.dll` + `libxell.dll`，
+//      走 `xefg_swapchain_d3d12` 的「包装应用链」路线）；
+//   `src\advanced\d3d12_fsffg.cpp`  —— FSR-FG（`amd_fidelityfx_framegeneration_dx12.dll`，
+//      走 `ffxCreateContextDescFrameGenerationSwapChainWrapDX12`）。
+// 与 DLSS-G 的关键差异：这两家要**接管 Present 的链**，所以只能在应用原生链上用
+// （`chainCompatible` 判据 = `chainOwner == MCDR_FG_CHAIN_APP_NATIVE`）——SL 代理工厂
+// 建的链不能交给它们，`eUseDXGIFactoryProxy` 与「包装别人的链」是两种互斥的集成方式。
+std::unique_ptr<IFrameGenProvider> makeXessFgProvider();
+std::unique_ptr<IFrameGenProvider> makeFsrFgProvider();
+void fillXessFgCaps(mcdr_fg_caps& out);
+void fillFsrFgCaps(mcdr_fg_caps& out);
+// 运行库是否已加载（只回答"DLL 在不在"，不代表可用）。用于诊断与 caps.runtimeLoaded。
+bool xessFgRuntimeAvailable();
+bool fsrFgRuntimeAvailable();
+
+// ---- 链策略（P304）----
+// 当前 pick 的后端（0=NONE）。改链前必须先问它：包装型后端要求应用原生链。
+int32_t fgPickedBackend(void);
+// 1 = 当前后端要求「应用原生链」（FSR-FG / XeSS-FG）。`createDxgiFactory` 据此决定要不要
+// 升级成 SL 代理工厂 —— 一旦包装型后端被选中，代理工厂必须让位，否则 SDK 拿到的是
+// SL 的链，包装会失败（`xefg_swapchain_d3d12` 只接受真正的应用链）。
+bool fgWantsAppNativeChain(void);
 
 // ---------------------------------------------------------------------------
 // Draw 命令录制（P6）：渲染 pass 内的 draw 全链路。
@@ -1531,4 +1686,3 @@ std::string enumerateAdaptersJson();
 // DXCore 不可用时这些字段回落为 ""/false，其余字段全部来自 DXGI。
 std::string adapterInfoJson();
 }  // namespace d3d12_mc
-

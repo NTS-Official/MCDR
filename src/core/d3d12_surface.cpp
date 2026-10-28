@@ -12,7 +12,6 @@ module;
 module mcdr.d3d12.device;
 
 import mcdr.error;
-
 // dx12-mc 原生 D3D12 层（C++）
 // P5 目标：DXGI swapchain（GpuSurfaceBackend 对应物）。
 // 设计参考：官方 com.mojang.blaze3d.vulkan.VulkanGpuSurface。
@@ -83,10 +82,22 @@ PFN_DCompositionCreateDevice resolveDCompCreateDevice() {
 // 且 sl.log 报 `Streamline presentCommon() was not observed`。
 
 // 统一工厂入口：原生创建 + 立刻升级成代理（SL 未启用时升级是空操作）。
+//
+// P304：包装型帧生成后端（FSR-FG / XeSS-FG）要求链是**应用原生**的 —— 它们要把应用链接管
+// 过去（`xefgSwapChainD3D12InitFromSwapChain` / `ffdxCreateContextDesc...WrapDX12`），而 SL
+// 代理工厂已经把链的呈现路径留给了 SL，两种集成方式不能叠加。所以这里先问注册表：
+// `fgWantsAppNativeChain()` 为真就**不升级**，并把归属登记成 app-native。
 template <typename T>
 HRESULT createDxgiFactory(ComPtr<T>& factory) {
     const HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
     if (FAILED(hr)) return hr;
+    if (fgWantsAppNativeChain()) {
+        // 不升级：这一条链要交给包装型 FG 后端。注意"不升级"不等于"SL 不可用" ——
+        // SR 侧若选了 DLSS+STREAMLINE，两者会在 caps 的互斥判据里各自报 unavailable，
+        // 而不是在链上互相顶掉（P304 的取舍：宁可让上层看到「不可用+原因」）。
+        fgNoteChainOwner(MCDR_FG_CHAIN_APP_NATIVE);
+        return hr;
+    }
     void* raw = factory.Get();
     if (mcdr_sl_upgrade_interface(&raw) != 0 && raw != nullptr) {
         // 成功时是 replace in place：原生那一个引用已经变成代理的引用，Attach 不 AddRef。
@@ -225,7 +236,7 @@ static void paintParentBlackBeforeDestroy(HWND child) {
 // (c) 窗口在被销毁前后被 resize 成别的尺寸导致捕获矩形整块落在客户区里。
 static void logWindowState(const char* tag, HWND hwnd) {
     if (hwnd == nullptr) {
-        dbgLogInfo("P96 %s: hwnd=null", tag);
+        dbgLogInfo("%s: hwnd=null", tag);
         return;
     }
     RECT rc{};
@@ -233,7 +244,7 @@ static void logWindowState(const char* tag, HWND hwnd) {
     wchar_t cls[128] = {};
     GetClassNameW(hwnd, cls, 128);
     auto brush = reinterpret_cast<void*>(GetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND));
-    dbgLogInfo("P96 %s: hwnd=%p cls=%ls rect=%ld,%ld %ldx%ld visible=%d iconic=%d classBrush=%p", tag,
+    dbgLogInfo("%s: hwnd=%p cls=%ls rect=%ld,%ld %ldx%ld visible=%d iconic=%d classBrush=%p", tag,
                reinterpret_cast<void*>(hwnd), cls, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
                static_cast<int>(IsWindowVisible(hwnd)), static_cast<int>(IsIconic(hwnd)), brush);
 }
@@ -370,7 +381,7 @@ static void logSwapChainPresentHook(IDXGISwapChain* sc) {
     const HMODULE rtssLoader = ::GetModuleHandleW(L"RTSSHooksLoader64.dll");
     DXGI_SWAP_CHAIN_DESC desc{};
     const bool haveDesc = SUCCEEDED(sc->GetDesc(&desc));
-    dbgLog("P250 overlay probe: RTSSHooks64=%p RTSSHooksLoader64=%p desc.ok=%d OutputWindow=%p "
+    dbgLog("overlay probe: RTSSHooks64=%p RTSSHooksLoader64=%p desc.ok=%d OutputWindow=%p "
            "Format=%d BufferCount=%u SwapEffect=%d Windowed=%d Refresh=%u/%u",
            reinterpret_cast<void*>(rtssHooks), reinterpret_cast<void*>(rtssLoader), haveDesc ? 1 : 0,
            haveDesc ? reinterpret_cast<void*>(desc.OutputWindow) : nullptr,
@@ -667,7 +678,7 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
     // 做 PQ 编码，也不会把 SDR 内容压进 10bit 的 PQ 曲线里。
     const DXGI_FORMAT chainFormat =
         wantHdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
-    dbgLogInfo("[P197] HDR probe: mode=%d found=%d hdrOn=%d colorSpace=%d sdrWhite=%.1f nits "
+    dbgLogInfo("HDR probe: mode=%d found=%d hdrOn=%d colorSpace=%d sdrWhite=%.1f nits "
                "max=%.1f nits -> wantHdr=%d chainFormat=%d",
                hdrMode, probe.found ? 1 : 0, probe.hdrOn ? 1 : 0, static_cast<int>(probe.colorSpace),
                probe.sdrWhiteNits, probe.maxLuminanceNits, wantHdr ? 1 : 0,
@@ -687,14 +698,14 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
         host = mcdr_host_create(win, static_cast<int32_t>(initW), static_cast<int32_t>(initH));
         if (host != nullptr) {
             presentChild = reinterpret_cast<HWND>(mcdr_host_child(host));
-            dbgLogInfo("[P267] seamless host child=%p (%ux%u) parent=%p",
+            dbgLogInfo("seamless host child=%p (%ux%u) parent=%p",
                        reinterpret_cast<void*>(presentChild), initW, initH,
                        reinterpret_cast<void*>(win));
             // 子窗口要等第一帧 Present 才显示，这段窗口期里 SDL 的客户区从未被绘制过
             // （默认白面）。先把父窗口刷黑，用户看到的就是"黑幕 -> 内容"，而不是白闪。
             paintWindowBlack(win);
         } else {
-            dbgLogWarn("[P267] seamless host creation failed (err=%lu); using top-level window",
+            dbgLogWarn("seamless host creation failed (err=%lu); using top-level window",
                        static_cast<unsigned long>(GetLastError()));
         }
     }
@@ -745,7 +756,7 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
         if (SUCCEEDED(setHr)) {
             hdrActive = true;
         } else {
-            dbgLogWarn("[P197] scRGB color space rejected (check=0x%08X support=0x%X set=0x%08X) — "
+            dbgLogWarn("scRGB color space rejected (check=0x%08X support=0x%X set=0x%08X) — "
                        "presenting SDR through the float chain",
                        static_cast<unsigned>(csHr), support, static_cast<unsigned>(setHr));
         }
@@ -771,12 +782,12 @@ mcdr::Result<void*> createSurface(uintptr_t hwnd) {
     s->hdrSdrWhiteScale = hdrActive ? std::clamp(probe.sdrWhiteNits / 80.0f, 1.0f, 10.0f) : 1.0f;
     mcdr_hdr_state_set_active(hdrActive ? 1 : 0);
     if (hdrActive) {
-        dbgLogInfo("[P197] HDR active: scRGB (R16G16B16A16_FLOAT + G10), SDR white %.1f nits "
+        dbgLogInfo("HDR active: scRGB (R16G16B16A16_FLOAT + G10), SDR white %.1f nits "
                    "(scale %.3f), max luminance %.1f nits, presentation window %s",
                    probe.sdrWhiteNits, s->hdrSdrWhiteScale, probe.maxLuminanceNits,
                    presentChild ? "present-child" : "game-window");
     } else {
-        dbgLogInfo("[P197] HDR inactive: SDR presentation (format=%d)",
+        dbgLogInfo("HDR inactive: SDR presentation (format=%d)",
                    static_cast<int>(chainFormat));
     }
     // 注意：不在此处 setActiveSurface！surface 必须在 configureSurface 完成后
@@ -811,7 +822,7 @@ mcdr::Result<void> setExclusiveFullscreen(Dx12Surface* s, bool on) {
     BOOL actual = FALSE;
     s->swapChain->GetFullscreenState(&actual, nullptr);
     if (FAILED(hr)) {
-        dbgLogWarn("P196 setExclusiveFullscreen(%d): SetFullscreenState hr=0x%08X "
+        dbgLogWarn("setExclusiveFullscreen(%d): SetFullscreenState hr=0x%08X "
                    "(fullscreenState=%d) — staying windowed",
                    on ? 1 : 0, static_cast<unsigned>(hr), actual ? 1 : 0);
         return mcdr::err("setExclusiveFullscreen", "SetFullscreenState failed: " + hrText(hr));
@@ -833,11 +844,11 @@ mcdr::Result<void> setExclusiveFullscreen(Dx12Surface* s, bool on) {
         auto resized = configureSurface(s, static_cast<int>(s->width), static_cast<int>(s->height),
                                         s->presentMode, /*force=*/true);
         if (!resized) {
-            dbgLogWarn("P196 setExclusiveFullscreen(%d): forced ResizeBuffers failed: %s", on ? 1 : 0,
+            dbgLogWarn("setExclusiveFullscreen(%d): forced ResizeBuffers failed: %s", on ? 1 : 0,
                        resized.error().message.c_str());
         }
     }
-    dbgLogInfo("P196 setExclusiveFullscreen(%d): ok, fullscreenState=%d presentWindow=%p",
+    dbgLogInfo("setExclusiveFullscreen(%d): ok, fullscreenState=%d presentWindow=%p",
                on ? 1 : 0, actual ? 1 : 0, reinterpret_cast<void*>(s->presentWindow));
     return {};
 }
@@ -847,6 +858,90 @@ std::vector<int> surfacePresentModes() {
     return {0, 2, 3};
 }
 
+
+// P305：链刚建好时问一次 provider 要不要包装（目前只有 XeSS-FG；FSR-FG 走 P306）。
+// 返回 1  = `s->swapChain` 已换成代理链，后续 Present / GetBuffer 都走它；
+// 返回 0  = 没包装（不是接管型后端，或 provider 还没准备好），应用链原样保留；
+// 返回 -1 = 链已被 SDK 接管但初始化失败，`s->swapChain` 已经为空，调用方必须放弃这台 surface。
+//
+// P305ae：调用点必须**先**把 `createSwapChainForWindow` 返回的临时 ComPtr 放掉再进来。
+// `bundle.swapChain.As(&s->swapChain)` 是 QueryInterface，同一对象计数 2；而 SDK 要求
+// "reference counter equal to 1"（`xess_fg_developer_guide_english.md:271-273`），
+// 计数 >1 时 SDK 重建 native 链失败，init 返回 HRESULT_FAILURE（-17）——这就是之前一直失败的原因。
+int32_t wrapChainForFrameGen(Dx12Surface* s, DeviceContext& ctx) {
+
+    if (s == nullptr || s->swapChain == nullptr || !ctx.device || !ctx.queue) {
+        return 0;
+    }
+    // 只有"接管交换链"的后端才会吃掉应用链。先问清楚再 Detach：P305 的 DLSS-G 开关回滚路径
+    // 就是在这里被无条件 Detach 走了链（`fgWrapPresentChain` 在 picked 不是接管型后端时
+    // 直接返回 0），之后 `acquireSurface` 的 GetCurrentBackBufferIndex() 撞空指针。
+    const int32_t picked = fgPickedBackend();
+    if (picked != MCDR_FG_BACKEND_XESSFG && picked != MCDR_FG_BACKEND_FSRFG) {
+        return 0;
+    }
+    // P305y（`xess_fg_developer_guide_english.md:271-274` 原话）：
+    //   "The application must provide a swap chain pointer with reference counter equal to 1."
+    //   "**The application-provided swap chain will be released!**"
+    //   "After successful call, the provided swap chain pointer will be invalid."
+    // 所以我们必须先 `Detach()` 把所有权交出去；继续用 `Get()` 就是在交出一条我们仍然持有的链——
+    // 引用计数不为 1 时 SDK 拒绝初始化（init 返回 HRESULT_FAILURE），而我们手里那个 ComPtr
+    // 也会在 SDK Release 之后变成悬空指针。
+    auto* appChain = s->swapChain.Detach();
+    void* wrapped = nullptr;
+    const int32_t ok = fgWrapPresentChain(
+        ctx.device.Get(), ctx.queue.Get(), appChain, static_cast<int32_t>(s->width),
+        static_cast<int32_t>(s->height), static_cast<int32_t>(s->swapChainFormat), &wrapped);
+    if (ok != 1 || wrapped == nullptr) {
+        // 文档：SDK 会释放应用链，失败之后这个指针同样不能再用。链没了，本帧不能再 Present，
+        // 交给上层按"surface 需要重建"处理，而不是拿悬空指针继续跑。
+        dbgLogWarn("frame generation did not take the app chain; the swap chain is gone and must be rebuilt");
+        s->backBuffers.clear();
+        s->currentImageIndex = -1;
+        s->lastBlitIndex = -1;
+        s->suboptimal = true;
+        return -1;
+    }
+    // 代理链是**另一个**对象：它的 back buffer 由 SDK 自己的 native 链产出，所以调用点
+    // 必须在我们返回之后才 GetBuffer/CreateRenderTargetView（guide:332-334：Init 之后
+    // 所有交换链交互都要走 proxy，包括 GetBuffer）。
+    //
+    // P305af：`xefgSwapChainD3D12GetSwapChainPtr` 是 COM 风格 getter —— 按 `riid` 交出一个
+    // **已加引用**的指针（guide 的用法是 `GetSwapChainPtr(ctx, IID_PPV_ARGS(&swapChain))`，
+    // 直接塞进 ComPtr）。所以这里**不能**再 QueryInterface 一次：多出来的那次引用会让
+    // `xefgSwapChainDestroy` 报 "Swap Chain reference counter is not 0"（CRITICAL），native 链
+    // 不释放，同一个 HWND 上重建链就 `DXGI_ERROR_INVALID_CALL (0x887A0001)`。
+    // 直接接管 GetSwapChainPtr 交出的那份引用（Attach 不 AddRef）。
+    auto* rawProxy = static_cast<IDXGISwapChain4*>(wrapped);
+    s->swapChain.Attach(rawProxy);
+    // 代理链是 SDK 重建出来的 native 链，tearing 能力未必与我们请求的一致。Present 的 flags
+    // 直接读 `s->allowTearing`：链上没有 ALLOW_TEARING 却传 DXGI_PRESENT_ALLOW_TEARING，
+    // DXGI 会判 INVALID_CALL（表现是掉帧 + 设备移除日志）。以代理链自己的描述符为准。
+    DXGI_SWAP_CHAIN_DESC1 proxyDesc{};
+    if (SUCCEEDED(rawProxy->GetDesc1(&proxyDesc))) {
+        const bool proxyTearing = (proxyDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+        if (proxyTearing != s->allowTearing) {
+            dbgLogInfo("proxy chain allowTearing=%d (app chain had %d), following the proxy",
+                       static_cast<int>(proxyTearing), static_cast<int>(s->allowTearing));
+        }
+        s->allowTearing = proxyTearing;
+        dbgLogInfo("proxy chain %ux%u buffers=%u format=%d effect=%d", proxyDesc.Width,
+                   proxyDesc.Height, proxyDesc.BufferCount, static_cast<int>(proxyDesc.Format),
+                   static_cast<int>(proxyDesc.SwapEffect));
+    }
+    dbgLogInfo("presenting through the wrapped chain (%ux%u)", s->width, s->height);
+    // P306o：包成功之后必须把链归属登记成对应的包装家族。`createDxgiFactory` 只会在建链时登记
+    // APP_NATIVE / SL_PROXY，如果这里不补记，`fgSetMode` 里的 `chainIsWrap` 永远为假 ⇒
+    // `needWrap` 永远为真 ⇒ 之后每一次推设置（切倍率、切 UI 合成、重开开关）都会再挂一次
+    // "重建链"，而重建又会在新链上再包一次 —— 正是 P305aq 里"第 3 次、第 4 次重建"的来源，
+    // 也是同一条 HWND 上反复易主最后撞 `DXGI_ERROR_INVALID_CALL` 的原因。
+    if (picked == MCDR_FG_BACKEND_FSRFG) {
+        fgNoteChainOwner(MCDR_FG_CHAIN_FSR_WRAP);
+    } else {
+        fgNoteChainOwner(MCDR_FG_CHAIN_XESS_WRAP);
+    }
+    return 1;
+}
 mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int presentMode, bool force) {
     DeviceContext& ctx = deviceContext();
     // P98 诊断（用户报告：加载屏幕弹出瞬间帧时间骤增、启动加载界面进度条冻结）：
@@ -894,7 +989,7 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
     // 之后把链交给 output，旧的 flip 序列作废；不重建的话 Present 返回 S_OK 却不再翻页，
     // 画面停在进全屏前那一帧（用户报的"独占全屏后画面冻结"）。此时由 force 绕过跳过。
     if (!force && static_cast<UINT>(width) == s->width && static_cast<UINT>(height) == s->height) {
-        dbgLogInfo("configureSurface: size unchanged %dx%d, skip ResizeBuffers (P98 total=%.1f ms)", width, height,
+        dbgLogInfo("configureSurface: size unchanged %dx%d, skip ResizeBuffers (total=%.1f ms)", width, height,
                nowMs() - p98t0);
         return {};
     }
@@ -980,7 +1075,7 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
     // + 窗口/全屏切换时常见竞态）。多次重试 + 递增等待，最多等 ~1s。
     // P96 诊断：把"要 resize 到多少"与此刻窗口/子窗口的真实几何一起记录 —— 用于判断
     // 退出时 2560x1334 的重配置是否同时改变了窗口尺寸（白幕是否只是"整块落在客户区里"）。
-    dbgLogInfo("P96 configureSurface: target=%ux%u presentWindow=%p", static_cast<unsigned>(width),
+    dbgLogInfo("configureSurface: target=%ux%u presentWindow=%p", static_cast<unsigned>(width),
                static_cast<unsigned>(height), reinterpret_cast<void*>(s->presentWindow));
     logWindowState("configureSurface child", s->presentWindow);
     logWindowState("configureSurface parent", s->presentWindow ? GetParent(s->presentWindow) : nullptr);
@@ -1025,8 +1120,16 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
             s->currentImageIndex = -1;
         }
         (void)deviceWaitIdle();
-        s->swapChain.Reset();
+        // P305 / P305ae：provider 的 context 绑在这条链上，销毁之前必须先解包（幂等）。
+        // 顺序很关键：**先放掉本进程对这条链的所有引用**（surface 的 ComPtr + back buffer 资源，
+        // flip model 下 back buffer 会反过来持有 swapchain），再让 provider 调
+        // `xefgSwapChainDestroy`。反过来的话 SDK 会报
+        // "Swap Chain reference counter is not 0 after xefgSwapChainDestroy call"（CRITICAL），
+        // native 链不释放、HWND 仍被占，下一次在同一个 HWND 上建链直接
+        // `DXGI_ERROR_INVALID_CALL (0x887A0001)` —— P305ae 之前 resize 后第二次 wrap 失败就是这个。
         s->backBuffers.clear();
+        s->swapChain.Reset();
+        fgUnwrapPresentChain();
         // P71：不清 rtvHandles —— 句柄在 rtvHeap 上是 bump 分配，保留复用即可；
         // 旧实现每次重建都重新分配 3 个槽，反复 resize 会把 kRtvHeapSize 用尽
         // （"RTV descriptor heap exhausted"），随后 configureSurface 直接失败。
@@ -1067,6 +1170,9 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
         if (FAILED(bundle.swapChain.As(&s->swapChain))) {
             return mcdr::err("configureSurface", "swapchain does not support IDXGISwapChain3");
         }
+        // P305ae：As() 只是 QueryInterface，bundle 与 s->swapChain 指着同一个对象（计数 2）。
+        // 立刻放掉临时句柄，保证交给帧生成时计数为 1（见 wrapChainForFrameGen 的注释）。
+        bundle.swapChain.Reset();
         s->compositionMode = bundle.composition;
         s->dcompDevice = bundle.dcompDevice;
         s->dcompTarget = bundle.dcompTarget;
@@ -1093,6 +1199,24 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
     s->height = static_cast<UINT>(height);
 
     // 重新取 back buffers + RTV
+    // P305ae：包装必须发生在取 back buffer **之前** —— 一旦 SDK 接管链，GetBuffer / Present
+    // 都必须走代理链（`xess_fg_developer_guide_english.md:332-334`：Init 之后所有交换链交互
+    // 都走 proxy）。返回 -1 表示链已被 SDK 释放、初始化失败，这台 surface 不能再用了。
+    if (wrapChainForFrameGen(s, ctx) < 0) {
+        // P306af：包装失败时应用链已经被 SDK 交出去并销毁了，这里**不能**直接返回错误 ——
+        // 那会把 surface 永久留在"没有链"的状态（画面冻结、游戏逻辑照跑）。关掉帧生成
+        // （`picked` 清成 NONE 之后不会再尝试包装），按纯应用链重建，保证画面能回来。
+        fgAbortWrapAfterFailure(
+            "frame generation could not take the swap chain and was turned off; "
+            "the swap chain was rebuilt without it");
+        auto plain = rebuildSwapChainForFg(s, "wrap-failed");
+        if (!plain) {
+            return mcdr::err("configureSurface",
+                             "recreating a plain swap chain after a failed frame generation wrap "
+                             "failed: " + plain.error().message);
+        }
+        return {};
+    }
     s->backBuffers.resize(kSurfaceBufferCount);
     s->surfaceFences.assign(kSurfaceBufferCount, 0);  // P18：per-backbuffer fence 初值
     // P71：RTV 句柄持久复用（见上文重建分支的说明）。只在本对象还没有句柄时分配。
@@ -1131,7 +1255,7 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
         const double p98other = p98total - (p98waitRenderMs < 0.0 ? 0.0 : p98waitRenderMs) -
                                 (p98waitPresentsMs < 0.0 ? 0.0 : p98waitPresentsMs) -
                                 (p98idleMs < 0.0 ? 0.0 : p98idleMs);
-        dbgLogInfo("P98 configureSurface: %dx%d total=%.1f ms (waitRender=%.1f waitPresents=%.1f idle=%.1f resize+rest=%.1f)",
+        dbgLogInfo("configureSurface: %dx%d total=%.1f ms (waitRender=%.1f waitPresents=%.1f idle=%.1f resize+rest=%.1f)",
                width, height, p98total, p98waitRenderMs, p98waitPresentsMs, p98idleMs, p98other);
     }
     return {};
@@ -1148,8 +1272,16 @@ mcdr::Result<void> configureSurface(Dx12Surface* s, int width, int height, int p
 // back buffer 刚画完，重建等于丢掉这一帧；帧首则是「上一帧已上屏、本帧还没开画」。
 // 独占全屏一律拒绝：P196 记录过「重建 + SetFullscreenState」会让画面冻结，FG 开关不
 // 值得押上这个风险 —— 拒绝后链保持原样，只是少了官方建议的那次重建。
+// P306 取证：FSR-FG 包装链在 acquireSurface 里 0xc0000005（崩在
+// amd_fidelityfx_framegeneration_dx12.dll 内，无符号）。为了定位到底是哪一次链调用
+// 触发的，前几次 acquire 逐步写一行到 `P306_breadcrumb.log`（native 日志级别被 JVM
+// 门控，只有这个通道稳定可见）。定位完即可删除。
+
 mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why) {
-    if (s == nullptr || s->swapChain == nullptr) {
+    // P306af：这里**允许** `swapChain == nullptr`。包装失败时 SDK 已经把应用链拿走并销毁
+    // （`wrapChainForFrameGen` 里 Detach 过），调用方正是要在这个状态下重建一条纯应用链；
+    // 把空链当成"surface 没建"直接挡掉，就会把 surface 永久留在没有链的状态（画面冻结）。
+    if (s == nullptr) {
         return mcdr::err("rebuildSwapChainForFg", "surface not created");
     }
     if (s->hwnd == 0) {
@@ -1157,20 +1289,24 @@ mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why) {
     }
     if (s->exclusive) {
         return mcdr::err("rebuildSwapChainForFg",
-                         "refused in exclusive fullscreen (P196: rebuild + fullscreen can freeze)");
+                         "refused in exclusive fullscreen (rebuild + fullscreen can freeze)");
     }
     DeviceContext& ctx = deviceContext();
     // 与 configureSurface 的重建分支同一收尾顺序：先把残留的 acquired back buffer 用
     // Present(0,0) 交还（只用 bufferHeld 判定，避免对已 present 的 buffer 再推一帧），
     // 再等 GPU 真空闲 —— 旧链的 back buffer 仍被上一帧命令引用时，DWM 会拒绝同一 HWND
     // 上的新链（E_ACCESSDENIED）。
-    if (s->bufferHeld.exchange(false)) {
+    const bool held = s->bufferHeld.exchange(false);
+    if (held && s->swapChain != nullptr) {
         s->swapChain->Present(0, 0);
     }
     s->currentImageIndex = -1;
     (void)deviceWaitIdle();
-    s->swapChain.Reset();
+    // P305 / P305ae：同 configureSurface —— 先放掉本进程的全部引用（surface + back buffer），
+    // 再让 provider 销毁 SDK 对象，否则 destroy 会看到引用计数 ≠ 0、native 链泄漏。
     s->backBuffers.clear();
+    s->swapChain.Reset();
+    fgUnwrapPresentChain();
     // P71：不清 rtvHandles —— 句柄在 rtvHeap 上是 bump 分配、可复用；清了反复重建会把
     // kRtvHeapSize 用尽（"RTV descriptor heap exhausted"）。
     s->lastBlitIndex = -1;
@@ -1180,47 +1316,74 @@ mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why) {
     if (FAILED(hr)) {
         return mcdr::err("rebuildSwapChainForFg", "CreateDXGIFactory1 failed " + hrText(hr));
     }
-    // composition 模式下 composition 对象属于 HWND，只能复用不能重建（对同一 HWND 重复
-    // CreateTargetForHwnd 会返回 WINDOW_ALREADY_COMPOSED）。
-    SwapChainBundle reuse;
-    if (s->compositionMode) {
-        reuse.composition = true;
-        reuse.dcompDevice = s->dcompDevice;
-        reuse.dcompTarget = s->dcompTarget;
-        reuse.dcompVisual = s->dcompVisual;
-    }
-    SwapChainBundle bundle;
     const UINT w = s->width == 0 ? 1u : s->width;
     const UINT h = s->height == 0 ? 1u : s->height;
-    auto made = createSwapChainForWindow(factory.Get(), ctx.queue.Get(),
-                                         reinterpret_cast<HWND>(s->hwnd), s->presentWindow, w, h,
-                                         s->compositionMode ? &reuse : nullptr, bundle,
-                                         s->swapChainFormat);
-    if (!made) {
-        return mcdr::err("rebuildSwapChainForFg", made.error().message);
-    }
-    if (bundle.composition && s->presentWindow != nullptr) {
-        // 重建时退化成 composition：呈现子窗口只会盖住合成画面，销毁它。
-        paintParentBlackBeforeDestroy(s->presentWindow);
-        DestroyWindow(s->presentWindow);
-        s->presentWindow = nullptr;
-    }
-    if (FAILED(bundle.swapChain.As(&s->swapChain))) {
-        return mcdr::err("rebuildSwapChainForFg", "swapchain does not support IDXGISwapChain3");
-    }
-    s->compositionMode = bundle.composition;
-    s->dcompDevice = bundle.dcompDevice;
-    s->dcompTarget = bundle.dcompTarget;
-    s->dcompVisual = bundle.dcompVisual;
-    s->allowTearing = bundle.allowTearing;
-    if (s->compositionMode) {
-        auto rebind = setCompositionContent(s->dcompVisual.Get(), s->dcompDevice.Get(), s->swapChain.Get());
-        if (!rebind) {
-            return mcdr::err("rebuildSwapChainForFg", "rebind composition content failed: " +
-                                                          rebind.error().message);
+    // P306af：包装失败**不能**把 surface 留在"没有链"的状态 —— 那正是用户看到的
+    // "游戏还在运行、画面一帧不动"（2026-10-28 19:51，FSR→XeSS 热切换）。
+    // 第一次按期望包装；失败就把帧生成关掉（`fgAbortWrapAfterFailure`），再用同一条 HWND
+    // 重建一条纯应用链。同一条 HWND 上旧链的销毁是异步的，所以重试之间稍等一会儿 ——
+    // XeSS 的 `InitFromSwapChain` 要在同一个 HWND 上建它自己的链，等不到就 0x887A0001。
+    for (int attempt = 0;; ++attempt) {
+        // composition 模式下 composition 对象属于 HWND，只能复用不能重建（对同一 HWND 重复
+        // CreateTargetForHwnd 会返回 WINDOW_ALREADY_COMPOSED）。每次尝试都要按当前状态重建
+        // 这份复用句柄：上一次尝试可能刚把模式从 flip 退化成 composition。
+        SwapChainBundle reuse;
+        if (s->compositionMode) {
+            reuse.composition = true;
+            reuse.dcompDevice = s->dcompDevice;
+            reuse.dcompTarget = s->dcompTarget;
+            reuse.dcompVisual = s->dcompVisual;
         }
+        SwapChainBundle bundle;
+        auto made = createSwapChainForWindow(factory.Get(), ctx.queue.Get(),
+                                             reinterpret_cast<HWND>(s->hwnd), s->presentWindow, w, h,
+                                             s->compositionMode ? &reuse : nullptr, bundle,
+                                             s->swapChainFormat);
+        if (!made) {
+            return mcdr::err("rebuildSwapChainForFg", made.error().message);
+        }
+        if (bundle.composition && s->presentWindow != nullptr) {
+            // 重建时退化成 composition：呈现子窗口只会盖住合成画面，销毁它。
+            paintParentBlackBeforeDestroy(s->presentWindow);
+            DestroyWindow(s->presentWindow);
+            s->presentWindow = nullptr;
+        }
+        if (FAILED(bundle.swapChain.As(&s->swapChain))) {
+            return mcdr::err("rebuildSwapChainForFg", "swapchain does not support IDXGISwapChain3");
+        }
+        // P305ae：同上 —— As() 之后临时句柄还持着同一对象，放掉它计数才是 1。
+        bundle.swapChain.Reset();
+        s->compositionMode = bundle.composition;
+        s->dcompDevice = bundle.dcompDevice;
+        s->dcompTarget = bundle.dcompTarget;
+        s->dcompVisual = bundle.dcompVisual;
+        s->allowTearing = bundle.allowTearing;
+        if (s->compositionMode) {
+            auto rebind =
+                setCompositionContent(s->dcompVisual.Get(), s->dcompDevice.Get(), s->swapChain.Get());
+            if (!rebind) {
+                return mcdr::err("rebuildSwapChainForFg", "rebind composition content failed: " +
+                                                              rebind.error().message);
+            }
+        }
+        // 重新取 back buffer + RTV（句柄持久复用，见上）。
+        // P305ae：包装在取 buffer 之前，理由同 configureSurface。
+        if (wrapChainForFrameGen(s, ctx) >= 0) {
+            break;
+        }
+        if (attempt >= 2) {
+            return mcdr::err("rebuildSwapChainForFg",
+                             "frame generation kept failing to take the swap chain");
+        }
+        fgAbortWrapAfterFailure(
+            "frame generation could not take the swap chain and was turned off; "
+            "the swap chain was rebuilt without it");
+        // 包装失败时 SDK 已经把我们的链销毁了（wrapChainForFrameGen 里 Detach 过）。
+        s->backBuffers.clear();
+        s->swapChain.Reset();
+        (void)deviceWaitIdle();
+        Sleep(static_cast<DWORD>(60 * (attempt + 1)));
     }
-    // 重新取 back buffer + RTV（句柄持久复用，见上）。
     s->backBuffers.resize(kSurfaceBufferCount);
     s->surfaceFences.assign(kSurfaceBufferCount, 0);
     if (s->rtvHandles.size() != kSurfaceBufferCount) {
@@ -1242,12 +1405,17 @@ mcdr::Result<void> rebuildSwapChainForFg(Dx12Surface* s, const char* why) {
     // P297：FG 开关引发的重建对 provider 来说也是一次 resize（它自己的历史资源尺寸跟着链走）。
     // 注意这是**同尺寸**的重建（尺寸没变，只是链换了），provider 必须能接受这种调用。
     fgOnResize(static_cast<int32_t>(w), static_cast<int32_t>(h));
-    dbgLogInfo("P296 rebuildSwapChainForFg: %ux%u done (why=%s composition=%d tearing=%d chainOwner=%d)",
+    dbgLogInfo("rebuildSwapChainForFg: %ux%u done (why=%s composition=%d tearing=%d chainOwner=%d)",
                static_cast<unsigned>(w), static_cast<unsigned>(h), why == nullptr ? "?" : why,
                static_cast<int>(s->compositionMode), static_cast<int>(s->allowTearing),
                static_cast<int>(fgChainOwner()));
     return {};
 }
+
+// P306 取证：FSR-FG 包装链在 acquireSurface 里 0xc0000005（崩在
+// amd_fidelityfx_framegeneration_dx12.dll 内，无符号）。为了定位到底是哪一次链调用
+// 触发的，前几次 acquire 逐步写一行到 `P306_breadcrumb.log`（native 日志级别被 JVM
+// 门控，只有这个通道稳定可见）。定位完即可删除。
 
 mcdr::Result<void> acquireSurface(Dx12Surface* s) {
     // P98 诊断：主线程帧间隔（>200 ms 视为停顿/掉帧），用于定位用户报告的
@@ -1258,7 +1426,7 @@ mcdr::Result<void> acquireSurface(Dx12Surface* s) {
         if (sP98LastAcquireMs > 0.0) {
             const double p98gap = p98now - sP98LastAcquireMs;
             if (p98gap > 200.0) {
-                dbgLogInfo("P98 main-thread frame hitch: %.1f ms since previous acquire", p98gap);
+                dbgLogInfo("main-thread frame hitch: %.1f ms since previous acquire", p98gap);
             }
         }
         sP98LastAcquireMs = p98now;
@@ -1285,6 +1453,10 @@ mcdr::Result<void> acquireSurface(Dx12Surface* s) {
         }
         fgNoteChainRebuildDone(fgChainOwner(), 1, nullptr);
     }
+    // P305ah：帧首钩子。必须在重建消费之后 —— 重建会换链，marker 的帧号要跟着新链的
+    // 第一次 Present 走；也必须在本帧开画之前 —— XeSS-FG 的 RENDERSUBMIT_START 语义就是
+    // "应用开始提交这一帧的渲染"。
+    fgFrameStart();
     // P48（多帧飞行）：Present 尚未完成时 GetCurrentBackBufferIndex 不会轮转，会返回
     // 上一帧已 Present 的同一个 back buffer（两帧写同一处 → 闪帧/撕裂）。真实 acquire
     // 已推迟到 blit 之前（Java Dx12GpuSurface.ensureAcquired），此时本帧录制已完成，
@@ -1423,7 +1595,7 @@ mcdr::Result<void> blitSurface(CommandContext* ctx, Dx12Surface* s, Dx12Object* 
         static int p109InPassBlits = 0;
         if (p109InPassBlits < 3) {
             ++p109InPassBlits;
-            dbgLogWarn("P109 blitSurface recorded INSIDE an open render pass (ctx=%p idx=%d): "
+            dbgLogWarn("blitSurface recorded INSIDE an open render pass (ctx=%p idx=%d): "
                        "the pass' attachments were rebound to the back buffer",
                        reinterpret_cast<void*>(ctx), s->currentImageIndex);
         }
@@ -1724,13 +1896,8 @@ void presentSurface(Dx12Surface* s) {
     // 这也避免对非当前 back buffer 做任何操作（P68 教训：写非当前 buffer 触发
     // D3D12 ERROR #907 → RemoveDevice(0x887A0005) 崩溃）。
     if (!s->blittedThisFrame || s->currentImageIndex < 0) {
-        static unsigned long long skippedNoBlit = 0;
-        ++skippedNoBlit;
-        // 前 5 次与之后每 60 次记一行：这是"本帧没有内容可显示"的唯一直接证据。
-        if (skippedNoBlit <= 5 || skippedNoBlit % 60 == 0) {
-            dbgLogInfo("presentSurface: skipped (nothing blitted this frame) count=%llu idx=%d suboptimal=%d",
-                       skippedNoBlit, s->currentImageIndex, static_cast<int>(s->suboptimal));
-        }
+        // 静默返回：这是"本帧没有内容可显示"的正常状态（启动、菜单、窗口被遮挡），
+        // 原先的计数+日志会在空闲时每 60 帧刷一行，对用户控制台只有噪音没有信息。
         return;
     }
     // IMMEDIATE=0 -> Present(0, ALLOW_TEARING)；FIFO_RELAXED=3 -> Present(1, 0)；
@@ -1750,45 +1917,6 @@ void presentSurface(Dx12Surface* s) {
     const UINT flags = (s->presentMode == 0 && s->allowTearing && !s->exclusive)
                            ? DXGI_PRESENT_ALLOW_TEARING
                            : 0;
-    // P95：打印门从 `(currentImageIndex + 1) % 30 == 0` 改为"真实 present 计数"。
-    // 旧门在 idx==-1 时恒真（每帧都打）、在健康的 3-buffer 链上恒假（从不打），语义正好
-    // 反了：它只记录"没有 back buffer"的异常帧，正常帧一次也不记录。
-    static unsigned long long presentLogCounter = 0;
-    const bool logThisPresent = (++presentLogCounter % 30) == 0;
-    // P15 诊断：每 30 帧打印 present 摘要（含 back buffer index + 结果）
-    // P3.2 诊断：每帧检查 Backbuffer 格式和尺寸是否与窗口匹配
-    if (!s->backBuffers.empty()) {
-        ID3D12Resource* bb =
-            s->backBuffers[static_cast<size_t>(s->currentImageIndex >= 0 ? s->currentImageIndex : 0)].Get();
-        if (bb) {
-            D3D12_RESOURCE_DESC bbDesc = bb->GetDesc();
-            if (logThisPresent) {
-                dbgLogInfo(
-                    "presentSurface: idx=%d sync=%u suboptimal=%d bbFmt=%d bbW=%llu bbH=%llu winW=%u winH=%u",
-                    s->currentImageIndex, syncInterval, static_cast<int>(s->suboptimal),
-                    static_cast<int>(bbDesc.Format), static_cast<unsigned long long>(bbDesc.Width),
-                    static_cast<unsigned long long>(bbDesc.Height), static_cast<unsigned>(s->width),
-                    static_cast<unsigned>(s->height));
-            }
-        }
-    }
-    if (logThisPresent) {
-        dbgLogInfo("presentSurface: idx=%d sync=%u flags=%u tearing=%d suboptimal=%d", s->currentImageIndex,
-                   syncInterval, flags, static_cast<int>(s->allowTearing), static_cast<int>(s->suboptimal));
-        // P196 诊断：独占全屏后画面冻结时，先看链是否真在 fullscreen、窗口尺寸/可见性是否正确。
-        if (s->hwnd != 0) {
-            BOOL fs = FALSE;
-            s->swapChain->GetFullscreenState(&fs, nullptr);
-            RECT wr{}, cr{};
-            GetWindowRect(reinterpret_cast<HWND>(s->hwnd), &wr);
-            GetClientRect(reinterpret_cast<HWND>(s->hwnd), &cr);
-            dbgLogInfo("presentSurface: state fs=%d win=(%ld,%ld %ldx%ld) client=%ldx%ld visible=%d",
-                       fs ? 1 : 0, static_cast<long>(wr.left), static_cast<long>(wr.top),
-                       static_cast<long>(wr.right - wr.left), static_cast<long>(wr.bottom - wr.top),
-                       static_cast<long>(cr.right - cr.left), static_cast<long>(cr.bottom - cr.top),
-                       IsWindowVisible(reinterpret_cast<HWND>(s->hwnd)) ? 1 : 0);
-        }
-    }
     // P113：Reflex 要求 Present 之前 sleep（文档 ProgrammingGuideReflex.md §5）。
     //
     // P296：帧生成的两侧钩子就套在 Reflex 这一点上 —— 顺序是 fgBeforePresent →
@@ -1799,7 +1927,18 @@ void presentSurface(Dx12Surface* s) {
     //   * `fgAfterPresent` 在呈递之后记账（本轮 R2 的 presented 统计），不碰资源。
     // 两家都是空操作以外的东西吗？v1 的 DLSS-G provider 里 afterPresent 仍是空的，见
     // `d3d12_framegen.cpp` 的注释：本项目的 FG 状态全在 present 之前决定。
-    fgBeforePresent();
+    // P306c：设备被移除/重置之后不要再进 FG 钩子 —— FSR-FG/DLSS-G 会对着已经失效的
+    // 设备解引用（P306 的崩溃就落在 Present 前的 FG 路径里）。Present 本身照常走，
+    // 让下面的失败分支把真正的原因（GetDeviceRemovedReason + InfoQueue）打进日志。
+    const bool fgDeviceAlive = !deviceRemoved();
+    if (fgDeviceAlive) {
+        fgBeforePresent();
+    } else {
+        static std::atomic<bool> fgDeviceLostLogged{false};
+        if (!fgDeviceLostLogged.exchange(true, std::memory_order_relaxed)) {
+            dbgLogWarn("presentSurface: device removed -> frame generation hooks skipped");
+        }
+    }
     mcdr_reflex_before_present();
     HRESULT hr = s->swapChain->Present(syncInterval, flags);
     // P267: only now that a real frame reached the screen do we show the child window that
@@ -1807,37 +1946,13 @@ void presentSurface(Dx12Surface* s) {
     if (s->host != nullptr && SUCCEEDED(hr) && !s->hostRevealed) {
         s->hostRevealed = true;
         mcdr_host_reveal(static_cast<MCDR_WindowHost*>(s->host));
-        dbgLogInfo("[P267] seamless host revealed (first successful present)");
-    }
-    // P252：建链时记过一次 Present 槽，但 RTSS 也可能是链建立之后才把 hook 挂上/替换掉。
-    // 在稳定出帧后（#1 / #120 / #600）再各记一次，dev 与用户环境可逐帧对比。
-    {
-        static std::atomic<int> p252PresentCounter{0};
-        const int seen = p252PresentCounter.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (seen == 1 || seen == 120 || seen == 600) {
-            void** p252vtbl = *reinterpret_cast<void***>(s->swapChain.Get());
-            if (p252vtbl != nullptr && p252vtbl[8] != nullptr) {
-                HMODULE p252owner = nullptr;
-                ::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                     reinterpret_cast<LPCWSTR>(p252vtbl[8]), &p252owner);
-                std::wstring p252path(MAX_PATH, L'\0');
-                const DWORD p252n =
-                    p252owner != nullptr ? ::GetModuleFileNameW(p252owner, p252path.data(), MAX_PATH) : 0;
-                p252path.resize(p252n);
-                std::wstring_view p252sv(p252path);
-                const size_t p252slash = p252sv.find_last_of(L"\\/");
-                if (p252slash != std::wstring_view::npos) p252sv.remove_prefix(p252slash + 1);
-                const auto* p252bytes = reinterpret_cast<const unsigned char*>(p252vtbl[8]);
-                dbgLogInfo("P252 present #%d slot=%p owner=%ls bytes=%02X %02X %02X %02X", seen, p252vtbl[8],
-                           p252sv.empty() ? L"(unknown)" : std::wstring(p252sv).c_str(), p252bytes[0],
-                           p252bytes[1], p252bytes[2], p252bytes[3]);
-            }
-        }
     }
     mcdr_reflex_after_present();  // P115：PCL 的 ePresentEnd 标记
     // P296：呈递之后的钩子（与上面 fgBeforePresent 成对，顺序见那里的注释）。
-    fgAfterPresent();
+    // P306c：Present 期间设备也可能刚被移除，这里再查一次；失效就只记账不走 provider。
+    if (fgDeviceAlive && !deviceRemoved()) {
+        fgAfterPresent();
+    }
     // present 后 backbuffer 所有权已释放（vanilla 每帧 acquire->blit->present，
     // 若此处不重置，configureSurface 的 ResizeBuffers 会误以为仍有 acquired
     // backbuffer 而返回 DXGI_ERROR_NOT_CURRENTLY_AVAILABLE -> 画面冻结）。
@@ -1873,7 +1988,7 @@ void presentSurface(Dx12Surface* s) {
 // 真正生效在下次建链/重建链时 —— 换格式必须重建交换链，不能原地改。
 void setHdrMode(int32_t mode) {
     mcdr_hdr_state_set_mode(mode);
-    dbgLogInfo("[P197] HDR mode set to %d (applies on next swapchain creation)", mode);
+    dbgLogInfo("HDR mode set to %d (applies on next swapchain creation)", mode);
 }
 
 int32_t hdrActiveFlag() { return mcdr_hdr_state_active(); }
@@ -1881,7 +1996,7 @@ int32_t hdrActiveFlag() { return mcdr_hdr_state_active(); }
 void destroySurface(Dx12Surface* s) {
     if (!s) return;
     dbgLogDebug("destroySurface: enter surface=%p", reinterpret_cast<void*>(s));
-    dbgLogProgress("[P184] destroySurface stage: enter");
+    dbgLogProgress("destroySurface stage: enter");
     // P196：独占全屏必须在释放链之前退出，否则显示模式会停在独占状态（桌面黑屏 / 分辨率不回退）。
     if (s->swapChain && s->exclusive) {
         const HRESULT fsHr = s->swapChain->SetFullscreenState(FALSE, nullptr);
@@ -1892,16 +2007,16 @@ void destroySurface(Dx12Surface* s) {
     // 先等待渲染线程完成当前帧（仅同步，不销毁线程），再等 GPU 空闲，
     // 避免 deviceWaitIdle → queue->Signal 与渲染线程的 Present 并发访问 swapchain 导致崩溃。
     waitForRenderThreadSubmit();
-    dbgLogProgress("[P184] destroySurface stage: waited render thread");
+    dbgLogProgress("destroySurface stage: waited render thread");
     (void)deviceWaitIdle();
-    dbgLogProgress("[P184] destroySurface stage: device idle");
+    dbgLogProgress("destroySurface stage: device idle");
     // P96/P183：先立刻把父窗口刷黑 —— 退出时窗口消失前会短暂露出父窗口客户区，
     // 早一步上色就少一帧灰/白幕；刷黑只动 GDI，不依赖下面的 fence 等待。
     HWND presentChild = s->presentWindow;
     MCDR_WindowHost* const surfaceHost = static_cast<MCDR_WindowHost*>(s->host);
     s->host = nullptr;
     if (surfaceHost == nullptr) paintParentBlackBeforeDestroy(presentChild);
-    dbgLogProgress("[P184] destroySurface stage: parent painted");
+    dbgLogProgress("destroySurface stage: parent painted");
     // P33 fix：等待 per-surface present fence，确保 Display Controller 已完成
     // flip 并释放 backbuffer 引用。IMMEDIATE 模式 + FLIP_DISCARD 下，deviceWaitIdle
     // 不等待 display controller，backbuffer 仍可能被 DWM 异步读取。
@@ -1928,17 +2043,17 @@ void destroySurface(Dx12Surface* s) {
     // P33 fix：present fence 等 GPU 完成所有命令（含 present），此时再 flush
     // 延迟删除对象，确保不在 GPU 仍引用资源时释放它们（消除 PreSwapInfoQueue
     // CORRUPTION 警告的根本原因）。
-    dbgLogProgress("[P184] destroySurface stage: fence wait done");
+    dbgLogProgress("destroySurface stage: fence wait done");
     flushPendingDeletes();
-    dbgLogProgress("[P184] destroySurface stage: pending deletes flushed");
+    dbgLogProgress("destroySurface stage: pending deletes flushed");
     if (getActiveSurface() == s) setActiveSurface(nullptr);
     // 先释放 swapchain（delete s），再销毁它的呈现宿主窗口，顺序不能反：
     // 窗口还活着时 DWM 仍持有该窗口的呈现资源引用。
     // presentChild 已在 fence 等待之前取出（P183），这里只清字段。
     s->presentWindow = nullptr;
-    dbgLogProgress("[P184] destroySurface stage: deleting surface");
+    dbgLogProgress("destroySurface stage: deleting surface");
     delete s;
-    dbgLogProgress("[P184] destroySurface stage: surface deleted");
+    dbgLogProgress("destroySurface stage: surface deleted");
     // P96：父窗口早在上面的 fence 等待之前就刷黑了（P183），这里只补日志与销毁子窗口。
     logWindowState("destroySurface child(before)", presentChild);
     logWindowState("destroySurface parent(before)", presentChild ? GetParent(presentChild) : nullptr);
@@ -1959,9 +2074,9 @@ void destroySurfaceNoWaitIdle(Dx12Surface* s) {
     s->presentWindow = nullptr;
     MCDR_WindowHost* const surfaceHost = static_cast<MCDR_WindowHost*>(s->host);
     s->host = nullptr;
-    dbgLogProgress("[P184] destroySurface stage: deleting surface");
+    dbgLogProgress("destroySurface stage: deleting surface");
     delete s;
-    dbgLogProgress("[P184] destroySurface stage: surface deleted");
+    dbgLogProgress("destroySurface stage: surface deleted");
     // P96：同 destroySurface —— 先刷黑父窗口再销毁子窗口（见该处说明）。
     if (surfaceHost != nullptr) {
         mcdr_host_release(surfaceHost);

@@ -373,7 +373,7 @@ static int32_t readbackTexturePixelsCore(mcdr_object* texture, int32_t* out, int
     }
     // Grid index of the centre sample is (yi=1, xi=1) -> element offset (1*3+1)*4 = 16.
     constexpr int kCenter = (1 * 3 + 1) * 4;
-    dbgLogInfo("[dx12-java] rbTex %ux%u center=(%d,%d) RGBA=(%d,%d,%d,%d) black=%d", w, h,
+    dbgLogInfo("rbTex %ux%u center=(%d,%d) RGBA=(%d,%d,%d,%d) black=%d", w, h,
                static_cast<int>(w) / 2, static_cast<int>(h) / 2, out[kCenter + 0], out[kCenter + 1],
                out[kCenter + 2], out[kCenter + 3],
                (out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0) ? 1 : 0);
@@ -415,14 +415,14 @@ void MCDR_CALL mcdr_dx12SetHdrMode(int32_t mode) { setHdrMode(mode); }
 // P117: 光追可见性分层总开关。此刻只做状态存储与日志，G-Buffer/采样的创建在 device 侧。
 void MCDR_CALL mcdr_dx12SetRaytracingMode(int32_t mode) {
     mcdr_rt_state_set_mode(mode);
-    dbgLog("[P117] raytracing mode=%d (0=off 1=ao 2=ao_shadows 3=full)", static_cast<int>(mode));
+    dbgLog("raytracing mode=%d (0=off 1=ao 2=ao_shadows 3=full)", static_cast<int>(mode));
 }
 
 // P251: 交换链建链选项（allowTearing / presentChild）。只写进程状态，下次建链生效。
 void MCDR_CALL mcdr_dx12SetSwapchainOptions(int32_t allowTearing, int32_t forcePresentChild) {
     mcdr_surface_opts_set_allow_tearing(allowTearing);
     mcdr_surface_opts_set_force_present_child(forcePresentChild);
-    dbgLogInfo("[P251] swapchain options: allowTearing=%d presentChild=%d (applies on next swapchain creation)",
+    dbgLogInfo("swapchain options: allowTearing=%d presentChild=%d (applies on next swapchain creation)",
                static_cast<int>(allowTearing), static_cast<int>(forcePresentChild));
 }
 
@@ -472,7 +472,7 @@ int32_t MCDR_CALL mcdr_dx12ReadbackSurfacePixels(mcdr_surface* surface, int32_t*
                            D3D12_RESOURCE_STATE_PRESENT, out, err)) {
         return mcdr::abi::failWith("mcdr_dx12ReadbackSurfacePixels", err);
     }
-    dbgLogInfo("[dx12-java] readback %ux%u center=(%d,%d)=(%d,%d,%d,%d) corners=%d black=%d", w,
+    dbgLogInfo("readback %ux%u center=(%d,%d)=(%d,%d,%d,%d) corners=%d black=%d", w,
                h, static_cast<int>(w) / 2, static_cast<int>(h) / 2, out[(4 * 3 + 4) + 0],
                out[(4 * 3 + 4) + 1], out[(4 * 3 + 4) + 2], out[(4 * 3 + 4) + 3],
                (out[0] != 0 || out[1] != 0 || out[2] != 0) ? 1 : 0,

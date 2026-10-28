@@ -426,7 +426,7 @@ namespace
     // the default-dirs mode to take effect, so both are issued and each result is logged.
     void widenSearchPath(const std::wstring& dir) {
         if (dir.empty()) {
-            logWarn("P108: DLSS vendor directory is empty; the DLL search path is left untouched");
+            logWarn("DLSS vendor directory is empty; the DLL search path is left untouched");
             return;
         }
         const BOOL setDefault = ::SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
@@ -437,7 +437,7 @@ namespace
         const DLL_DIRECTORY_COOKIE cookie = ::AddDllDirectory(dir.c_str());
         const DWORD addErr = (cookie != nullptr) ? 0u : ::GetLastError();
         s.searchPathSet = true;
-        logInfo("P108: DLSS search path widened for \"%s\": SetDefaultDllDirectories=%s(err=%lu) "
+        logInfo("DLSS search path widened for \"%s\": SetDefaultDllDirectories=%s(err=%lu) "
                 "SetDllDirectoryW=%s(err=%lu) AddDllDirectory=%s(err=%lu)",
                 narrow(dir).c_str(), setDefault ? "ok" : "failed", setDefaultErr,
                 setDir ? "ok" : "failed", setDirErr, (cookie != nullptr) ? "ok" : "failed", addErr);
@@ -449,7 +449,7 @@ namespace
             return;
         }
         s.envLogged = true;
-        logInfo("P108: DLSS load environment: moduleDir=\"%s\" cwd=\"%s\" exeDir=\"%s\" vendorDir=\"%s\" "
+        logInfo("DLSS load environment: moduleDir=\"%s\" cwd=\"%s\" exeDir=\"%s\" vendorDir=\"%s\" "
                 "searchPathSet=%d",
                 narrow(moduleDirectoryW()).c_str(), narrow(currentDirectoryW()).c_str(),
                 narrow(executableDirectoryW()).c_str(), narrow(s.vendorDir).c_str(),
@@ -519,11 +519,11 @@ namespace
                     const DWORD n = ::GetModuleFileNameW(mod, p, static_cast<DWORD>(std::size(p)));
                     s.runtimePath = narrow(std::wstring(p, n));
                 }
-                logInfo("P108: nvngx runtime loaded via %s (attempt %llu) -> \"%s\"", c.what,
+                logInfo("nvngx runtime loaded via %s (attempt %llu) -> \"%s\"", c.what,
                         static_cast<unsigned long long>(i + 1), s.runtimePath.c_str());
                 break;
             }
-            logWarn("P108: nvngx runtime attempt %llu/%llu (%s) failed: \"%s\" -> err=%lu (%s)",
+            logWarn("nvngx runtime attempt %llu/%llu (%s) failed: \"%s\" -> err=%lu (%s)",
                     static_cast<unsigned long long>(i + 1),
                     static_cast<unsigned long long>(candidates.size()), c.what,
                     narrow(c.useEx ? c.path : std::wstring(name)).c_str(), err,
@@ -532,7 +532,7 @@ namespace
                                                                               : "see winerror.h"));
         }
         if (found == nullptr) {
-            logWarn("P108: nvngx_dlss.dll could not be loaded from any candidate; DLSS will report "
+            logWarn("nvngx_dlss.dll could not be loaded from any candidate; DLSS will report "
                     "itself unavailable. Note: nvngx_dlss.dll imports only system DLLs, so "
                     "ERROR_MOD_NOT_FOUND here points at the path, not at a missing dependency.");
         }
@@ -736,7 +736,7 @@ namespace
             static bool s_warned = false;
             if (!s_warned) {
                 s_warned = true;
-                logWarn("P108: the device module injected no texture-create entry — private DLSS "
+                logWarn("the device module injected no texture-create entry — private DLSS "
                         "textures are unavailable (older DLL/JVM pairing); only JVM-supplied "
                         "resources are used");
             }
@@ -798,7 +798,7 @@ namespace
             IID_PPV_ARGS(&s.depthStencil));
         if (FAILED(hr)) {
             s.depthStencil = nullptr;
-            logWarn("P108: DLSS scratch buffer creation failed (%llu bytes, hr=0x%08X); DLSS disabled",
+            logWarn("DLSS scratch buffer creation failed (%llu bytes, hr=0x%08X); DLSS disabled",
                     static_cast<unsigned long long>(bytes), static_cast<unsigned>(hr));
             return false;
         }
@@ -846,7 +846,7 @@ namespace
         if (!createTrackedTexture(s.transitionCtx, width, height, format, 1, 1, 1,
                                   static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), &obj,
                                   &res)) {
-            logWarn("P108: DLSS private UAV output creation failed (%ux%u fmt=%d) — the device "
+            logWarn("DLSS private UAV output creation failed (%ux%u fmt=%d) — the device "
                     "module refused or failed to create it; the existing path stays in effect",
                     width, height, static_cast<int>(format));
             return nullptr;
@@ -856,7 +856,7 @@ namespace
         s.dlssOutputWidth = width;
         s.dlssOutputHeight = height;
         s.dlssOutputFormat = format;
-        logInfo("P108: DLSS private UAV output created by the device module: %ux%u fmt=%d "
+        logInfo("DLSS private UAV output created by the device module: %ux%u fmt=%d "
                 "(ALLOW_UNORDERED_ACCESS, tracked) — DLSS writes here, then the result is copied "
                 "into the JVM's target",
                 width, height, static_cast<int>(format));
@@ -870,7 +870,7 @@ namespace
                                        NVSDK_NGX_Feature sourceComponent) {
         (void)loggingLevel;
         if (message != nullptr) {
-            logInfo("P108: NGX[%d] %s", static_cast<int>(sourceComponent), message);
+            logInfo("NGX[%d] %s", static_cast<int>(sourceComponent), message);
         }
     }
 
@@ -900,12 +900,12 @@ namespace
         if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
             if (::CreateDirectoryW(fallback.c_str(), nullptr) == FALSE &&
                 ::GetLastError() != ERROR_ALREADY_EXISTS) {
-                logWarn("P108: could not create the NGX application-data directory \"%s\" (err=%lu); "
+                logWarn("could not create the NGX application-data directory \"%s\" (err=%lu); "
                         "falling back to the process working directory",
                         narrow(fallback).c_str(), ::GetLastError());
                 return L".";
             }
-            logInfo("P108: created the NGX application-data directory \"%s\"",
+            logInfo("created the NGX application-data directory \"%s\"",
                     narrow(fallback).c_str());
         }
         return fallback;
@@ -1058,7 +1058,7 @@ namespace
         const sl::ViewportHandle viewport(0);
         const sl::Result r = fn(viewport, opt);
         if (r != sl::Result::eOk) {
-            logWarn("P112: DLSS impl=streamline — slDLSSSetOptions result=0x%X (mode=%d, out=%ux%u, "
+            logWarn("DLSS impl=streamline — slDLSSSetOptions result=0x%X (mode=%d, out=%ux%u, "
                 "render=%dx%d)",
                 static_cast<unsigned>(r), static_cast<int>(opt.mode), opt.outputWidth,
                 opt.outputHeight, static_cast<unsigned>(in.renderWidth),
@@ -1071,7 +1071,7 @@ namespace
         s.slOptOutH = opt.outputHeight;
         s.slOptPreExposure = opt.preExposure;
         s.slOptExposureScale = opt.exposureScale;
-        logInfo("P199: slDLSSSetOptions applied (mode=%d, out=%ux%u, preExposure=%.3f, "
+        logInfo("slDLSSSetOptions applied (mode=%d, out=%ux%u, preExposure=%.3f, "
                 "exposureScale=%.3f; later frames reuse it until one of these changes)",
                 modeAsInt, opt.outputWidth, opt.outputHeight, opt.preExposure, opt.exposureScale);
         return 0;
@@ -1087,7 +1087,7 @@ namespace
         if (dlssImplStreamline()) {
             // P112：SL 拥有 NGX。这里绝不能调用 NVSDK_NGX_D3D12_Init_*（同进程双 NGX 冲突，
             // P111 实测 sl.log 里 getNGXFeatureRequirements 报 0xbad00005）。
-            logInfo("P112: DLSS impl=streamline — native NGX init skipped "
+            logInfo("DLSS impl=streamline — native NGX init skipped "
                     "(Streamline owns the runtime; evaluate lands in phase 2)");
             s.failure = "streamline mode: native NGX init skipped by design";
             return false;
@@ -1100,7 +1100,7 @@ namespace
         // 0x16+ 报 out of date 正是"声明比核心新"；而 0x15 下的 FAIL_InvalidParameter
         // (0xBAD00005) 是**参数**问题，靠下面的能力诊断把原因具名化，而不是靠猜版本。
         const std::wstring appDataPath = buildAppDataPath();
-        logInfo("P108: NGX Init (sdkVersion=NVSDK_NGX_Version_API=0x%X, projectId=\"%s\", "
+        logInfo("NGX Init (sdkVersion=NVSDK_NGX_Version_API=0x%X, projectId=\"%s\", "
                 "engineType=%d, engineVersion=\"%s\", appDataPath=\"%s\", featureInfo=%s)",
                 static_cast<unsigned>(NVSDK_NGX_Version_API), MCDR_NGX_PROJECT_ID,
                 static_cast<int>(NVSDK_NGX_ENGINE_TYPE_CUSTOM), MCDR_NGX_ENGINE_VERSION,
@@ -1109,7 +1109,7 @@ namespace
         const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init_with_ProjectID(MCDR_NGX_PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, MCDR_NGX_ENGINE_VERSION, appDataPath.c_str(), device, commonInfoForNgx(), NVSDK_NGX_Version_API);
         if (NVSDK_NGX_FAILED(r)) {
             s.failure = "NVSDK_NGX_D3D12_Init_with_ProjectID";
-            logWarn("P108: DLSS unavailable — NVSDK_NGX_D3D12_Init_with_ProjectID failed: %s "
+            logWarn("DLSS unavailable — NVSDK_NGX_D3D12_Init_with_ProjectID failed: %s "
                     "(appDataPath=\"%s\", featureInfo=%s)",
                     ngxResultString(r).c_str(), narrow(appDataPath).c_str(),
                     commonInfoForNgx() != nullptr ? "pathlist" : "null");
@@ -1121,7 +1121,7 @@ namespace
         const NVSDK_NGX_Result pr = NVSDK_NGX_D3D12_GetCapabilityParameters(&params);
         if (NVSDK_NGX_FAILED(pr) || params == nullptr) {
             s.failure = "NVSDK_NGX_D3D12_GetCapabilityParameters";
-            logWarn("P108: DLSS unavailable — GetCapabilityParameters failed: %s",
+            logWarn("DLSS unavailable — GetCapabilityParameters failed: %s",
                     ngxResultString(pr).c_str());
             return false;
         }
@@ -1144,14 +1144,14 @@ namespace
                 params, NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &minMinor);
             const NVSDK_NGX_Result ri = NVSDK_NGX_Parameter_GetI(
                 params, NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &initResult);
-            logInfo("P108: NGX capabilities: available=%d(%s) needsUpdatedDriver=%d(%s) "
+            logInfo("NGX capabilities: available=%d(%s) needsUpdatedDriver=%d(%s) "
                     "minDriverVersion=%u.%u(%s/%s) featureInitResult=0x%08X(%s)",
                     available, ngxResultString(ra).c_str(), needsDriver, ngxResultString(rn).c_str(),
                     minMajor, minMinor, ngxResultString(rmj).c_str(), ngxResultString(rmn).c_str(),
                     static_cast<unsigned>(initResult), ngxResultString(ri).c_str());
             // 这一条单独再报一次：它是"能不能用"的总答案，读到它就不用猜了。
             if (available == 0 || needsDriver == 1) {
-                logWarn("P108: NGX says DLSS-SR is NOT usable on this system "
+                logWarn("NGX says DLSS-SR is NOT usable on this system "
                         "(available=%d needsUpdatedDriver=%d minDriverVersion=%u.%u "
                         "featureInitResult=0x%08X)",
                         available, needsDriver, minMajor, minMinor, static_cast<unsigned>(initResult));
@@ -1159,7 +1159,7 @@ namespace
         }
 
 
-        logInfo("P108: DLSS/NGX initialised (project id \"%s\", engine version \"%s\", appdata "
+        logInfo("DLSS/NGX initialised (project id \"%s\", engine version \"%s\", appdata "
                 "\".\\ngx\", SDK API version 0x%08X)",
                 MCDR_NGX_PROJECT_ID, MCDR_NGX_ENGINE_VERSION,
                 static_cast<unsigned>(NVSDK_NGX_Version_API));
@@ -1173,11 +1173,11 @@ namespace
                 params, 1280, 720, NVSDK_NGX_PerfQuality_Value_MaxQuality, &ow, &oh, &mw, &mh, &nw,
                 &nh, &sharp);
             if (!NVSDK_NGX_FAILED(orr)) {
-                logInfo("P108: DLSS optimal settings: MaxQuality 1280x720 -> optimal %ux%u "
+                logInfo("DLSS optimal settings: MaxQuality 1280x720 -> optimal %ux%u "
                         "(range %ux%u .. %ux%u), sharpness %.3f",
                         ow, oh, nw, nh, mw, mh, static_cast<double>(sharp));
             } else {
-                logWarn("P108: DLSS optimal-settings query failed: %s", ngxResultString(orr).c_str());
+                logWarn("DLSS optimal-settings query failed: %s", ngxResultString(orr).c_str());
             }
         }
         return true;
@@ -1246,12 +1246,12 @@ namespace
             }
         }
         if (!table.empty()) {
-            logInfo("P108: DLSS optimal render sizes at %ux%u: %s", targetW, targetH, table.c_str());
+            logInfo("DLSS optimal render sizes at %ux%u: %s", targetW, targetH, table.c_str());
         }
         if (forced) {
             // P108 (user m11147): say plainly that this tier came from the user, not from the
             // ratio — the log must never leave the two indistinguishable.
-            logInfo("P108: DLSS quality tier is EXPLICIT (user button): %s -> sdk optimal %ux%u, "
+            logInfo("DLSS quality tier is EXPLICIT (user button): %s -> sdk optimal %ux%u, "
                     "sharpness %.3f (render %ux%u target %ux%u, ratio would have picked "
                     "\"nearest\")",
                     kNames[forcedIdx], bestW, bestH, static_cast<double>(bestSharp), renderW,
@@ -1318,7 +1318,7 @@ namespace
                 if (adopted != resolvedTier) {
                     if (!s.tooSmallWarned) {
                         s.tooSmallWarned = true;
-                        logError("P291n: tier %d (%.2fx nominal) cannot describe render %dx%d -> target %dx%d (%.2fx); asking for tier %d instead",
+                        logError("tier %d (%.2fx nominal) cannot describe render %dx%d -> target %dx%d (%.2fx); asking for tier %d instead",
                                  resolvedTier, nominal, in.renderWidth, in.renderHeight,
                                  in.targetWidth, in.targetHeight, factor, adopted);
                     }
@@ -1335,7 +1335,7 @@ namespace
                 tooSmall(static_cast<uint32_t>(in.renderHeight), needH)) {
                 if (!s.tooSmallWarned) {
                     s.tooSmallWarned = true;
-                    logError("P291f: render %ux%u is smaller than tier %d nominal input (%ux%u at %.2fx) — NGX answers with a dynamic scaling error and an empty texture, i.e. a black world with a working GUI; raise the render scale",
+                    logError("render %ux%u is smaller than tier %d nominal input (%ux%u at %.2fx) — NGX answers with a dynamic scaling error and an empty texture, i.e. a black world with a working GUI; raise the render scale",
                              in.renderWidth, in.renderHeight, resolvedTier, needW, needH,
                              kTierNominalFactor[resolvedTier]);
                 }
@@ -1355,7 +1355,7 @@ namespace
         if (s.feature != nullptr) {
             const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_ReleaseFeature(s.feature);
             if (NVSDK_NGX_FAILED(r)) {
-                logWarn("P108: NVSDK_NGX_D3D12_ReleaseFeature failed: %s",
+                logWarn("NVSDK_NGX_D3D12_ReleaseFeature failed: %s",
                         ngxResultString(r).c_str());
             }
             s.feature = nullptr;
@@ -1405,12 +1405,12 @@ namespace
                 // for it while the render scale is, say, 80% would make NGX upscale under a DLAA
                 // label. State-change only — a per-frame ERROR is how the 480-creates bug was
                 // diagnosed, so it must not survive as log spam.
-                logError("P108: DLAA (tier 3) requested but render %dx%d != target %dx%d — falling "
+                logError("DLAA (tier 3) requested but render %dx%d != target %dx%d — falling "
                          "back to the Quality tier for this round (accepted as the baseline). Set "
                          "the render scale to 100%% to use DLAA.",
                          in.renderWidth, in.renderHeight, in.targetWidth, in.targetHeight);
             } else if (s.requestedQuality == 3) {
-                logInfo("P108: DLAA (tier 3) accepted: render %dx%d == target %dx%d",
+                logInfo("DLAA (tier 3) accepted: render %dx%d == target %dx%d",
                         in.renderWidth, in.renderHeight, in.targetWidth, in.targetHeight);
             }
         }
@@ -1431,7 +1431,7 @@ namespace
                     }
                 }
                 if (adopted != resolvedTier) {
-                    logWarn("P291f: tier %d (%.2fx nominal) cannot describe render %dx%d -> target %dx%d "
+                    logWarn("tier %d (%.2fx nominal) cannot describe render %dx%d -> target %dx%d "
                             "(%.2fx); asking NGX for tier %d instead",
                             resolvedTier, nominal, in.renderWidth, in.renderHeight, in.targetWidth,
                             in.targetHeight, factor, adopted);
@@ -1455,7 +1455,7 @@ namespace
                 tooSmall(static_cast<uint32_t>(in.renderHeight), needH)) {
                 if (!s.tooSmallWarned) {
                     s.tooSmallWarned = true;
-                    logError("P291f: render %ux%u is smaller than tier %d nominal input (%ux%u at %.2fx) — "
+                    logError("render %ux%u is smaller than tier %d nominal input (%ux%u at %.2fx) — "
                              "NGX answers with a dynamic scaling error and an empty texture, i.e. a black "
                              "world with a working GUI; raise the render scale",
                              in.renderWidth, in.renderHeight, resolvedTier, needW, needH, nominal);
@@ -1563,12 +1563,12 @@ static const uint32_t kTierToNgx[5] = {
         std::size_t scratch = 0;
         const NVSDK_NGX_Result sr =
             NVSDK_NGX_D3D12_GetScratchBufferSize(NVSDK_NGX_Feature_SuperSampling, s.params, &scratch);
-        logInfo("P108: DLSS scratch buffer query: result=%s size=%llu bytes",
+        logInfo("DLSS scratch buffer query: result=%s size=%llu bytes",
                 ngxResultString(sr).c_str(), static_cast<unsigned long long>(scratch));
         if (NVSDK_NGX_FAILED(sr)) {
             s.createdWarned = true;
             s.failure = "NVSDK_NGX_D3D12_GetScratchBufferSize";
-            logWarn("P108: DLSS unavailable — GetScratchBufferSize failed: %s",
+            logWarn("DLSS unavailable — GetScratchBufferSize failed: %s",
                     ngxResultString(sr).c_str());
             return false;
         }
@@ -1576,7 +1576,7 @@ static const uint32_t kTierToNgx[5] = {
         // scratch data in internal allocations. Allocate a conservative floor anyway so a build
         // that does use the buffer cannot read past it, and say so in the log.
         if (scratch == 0) {
-            logInfo("P108: NGX reports a scratch buffer size of 0 (modern DLSS allocates "
+            logInfo("NGX reports a scratch buffer size of 0 (modern DLSS allocates "
                     "internally); allocating a 64 MiB floor regardless");
             scratch = 64ull * 1024ull * 1024ull;
         }
@@ -1609,7 +1609,7 @@ static const uint32_t kTierToNgx[5] = {
         if (NVSDK_NGX_FAILED(cr) || handle == nullptr) {
             s.createdWarned = true;
             s.failure = "NGX_D3D12_CREATE_DLSS_EXT";
-            logWarn("P108: DLSS unavailable — CreateFeature failed: %s (render %dx%d, target %dx%d, "
+            logWarn("DLSS unavailable — CreateFeature failed: %s (render %dx%d, target %dx%d, "
                     "flags=0x%X, quality=%u)",
                     ngxResultString(cr).c_str(), in.renderWidth, in.renderHeight, in.targetWidth,
                     in.targetHeight, static_cast<unsigned>(s.featureFlags), s.qualityValue);
@@ -1636,7 +1636,7 @@ static const uint32_t kTierToNgx[5] = {
             case static_cast<uint32_t>(NVSDK_NGX_PerfQuality_Value_DLAA): qualityName = "DLAA"; break;
             default: break;
         }
-        logInfo("P108: DLSS feature created: render %dx%d -> target %dx%d, quality=%u (%s, %s%s), "
+        logInfo("DLSS feature created: render %dx%d -> target %dx%d, quality=%u (%s, %s%s), "
                 "flags=0x%X (AutoExposure=%d DepthInverted=%d MVLowRes=%d MVJittered=%d HDR=%d), "
                 "scratch=%llu bytes",
                 in.renderWidth, in.renderHeight, in.targetWidth, in.targetHeight, s.qualityValue,
@@ -1658,7 +1658,7 @@ static const uint32_t kTierToNgx[5] = {
         // line answers when the picture does not change.
         {
             const char* key = presetHintKey(s.qualityValue);
-            logInfo("P108: DLSS render preset = %d (%s) on %s", s.effectivePreset,
+            logInfo("DLSS render preset = %d (%s) on %s", s.effectivePreset,
                     presetName(s.effectivePreset).c_str(), key != nullptr ? key : "(unmapped tier)");
         }
         return true;
@@ -1690,7 +1690,7 @@ static const uint32_t kTierToNgx[5] = {
         s.lastNear = in.nearZ;
         s.lastFar = in.farZ;
         s.lastFlags = static_cast<uint32_t>(s.featureFlags);
-        logInfo("P108: DLSS input: render %dx%d -> target %dx%d, depthInverted=%u near=%.3f far=%.3f "
+        logInfo("DLSS input: render %dx%d -> target %dx%d, depthInverted=%u near=%.3f far=%.3f "
                 "depthFmt=%d, mvScale=%.2f/%.2f, exposure=%s, jitter(single-sourced from the JVM "
                 "Halton by design)=%.3f/%.3f, reset=%u, flags=0x%X, quality=%u",
                 in.renderWidth, in.renderHeight, in.targetWidth, in.targetHeight, in.depthInverted,
@@ -1753,7 +1753,7 @@ int32_t mcdr_dlss_install_texture_ops(void* createFn, void* destroyFn) {
     gCreateTexture = reinterpret_cast<CreateTextureFn>(createFn);
     gDestroyTexture = reinterpret_cast<DestroyTextureFn>(destroyFn);
     if (gCreateTexture == nullptr || gDestroyTexture == nullptr) {
-        logWarn("P108: the device module injected no texture create/destroy entry (create=%p "
+        logWarn("the device module injected no texture create/destroy entry (create=%p "
                 "destroy=%p) — DLSS keeps using only JVM-supplied resources",
                 createFn, destroyFn);
         return 0;
@@ -1786,11 +1786,11 @@ int32_t mcdr_dlss_register_vendor_dir(const char* utf8Dir, int32_t cap) {
     if (dir.empty()) {
         return 0;
     }
-    logInfo("P108: DLSS vendor directory from the mod: \"%s\"", dir.c_str());
+    logInfo("DLSS vendor directory from the mod: \"%s\"", dir.c_str());
     const int need = ::MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), static_cast<int>(dir.size()),
                                           nullptr, 0);
     if (need <= 0) {
-        logWarn("P108: DLSS vendor directory is not valid UTF-8; ignoring it");
+        logWarn("DLSS vendor directory is not valid UTF-8; ignoring it");
         return 0;
     }
     std::wstring wide(static_cast<std::size_t>(need), L'\0');
@@ -1803,7 +1803,7 @@ int32_t mcdr_dlss_register_vendor_dir(const char* utf8Dir, int32_t cap) {
     // P108 blocker-B root cause: tell NGX where to look for its feature DLLs. This is what
     // turns Init/GetFeatureRequirements from FAIL_InvalidParameter into Success.
     rebuildCommonInfo(wide);
-    logInfo("P108: NGX feature path list set to \"%s\" (nvngx feature DLLs are looked up there "
+    logInfo("NGX feature path list set to \"%s\" (nvngx feature DLLs are looked up there "
             "instead of the application folder, which is the JVM's bin\\ in a dev run)",
             narrow(wide).c_str());
     logEnvOnce();
@@ -2031,7 +2031,7 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
             s.depthSnapshot = nullptr;
             if (!s.depthSnapshotWarned) {
                 s.depthSnapshotWarned = true;
-                logWarn("P108: depth snapshot texture creation failed (%ux%u fmt=%d) — the device "
+                logWarn("depth snapshot texture creation failed (%ux%u fmt=%d) — the device "
                         "module refused or failed to create it; DLSS falls back to the "
                         "JVM-supplied depth (which is already cleared by then, so the upscale "
                         "loses its depth term)",
@@ -2047,7 +2047,7 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
         s.depthSnapshotMips = (dd.MipLevels > 1) ? dd.MipLevels : 1;
         s.depthSnapshotArray = (dd.DepthOrArraySize > 1) ? dd.DepthOrArraySize : 1;
         s.depthSnapshotSamples = dd.SampleDesc.Count;
-        logInfo("P108: DLSS depth snapshot texture created by the device module: %ux%u fmt=%d "
+        logInfo("DLSS depth snapshot texture created by the device module: %ux%u fmt=%d "
                 "(private, tracked, COPY_DEST/COPY_SOURCE)",
                 w, h, static_cast<int>(dd.Format));
     }
@@ -2093,7 +2093,7 @@ int32_t mcdr_dlss_snapshot_depth(void* commandList, void* depthResource, DlssTra
     tl(tlCtx, depthResource, before);  // hand the depth back exactly as it was found
     ++s.depthSnapshotFrame;
     if (s.depthSnapshotFrame == 1) {
-        logInfo("P108: DLSS depth snapshot captured (first): %ux%u fmt=%d from resource %p; it "
+        logInfo("DLSS depth snapshot captured (first): %ux%u fmt=%d from resource %p; it "
                 "replaces the JVM's depth at evaluate time",
                 w, h, static_cast<int>(dd.Format), depthResource);
     }
@@ -2218,7 +2218,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 gReflex.optionsApplied = false;
                 if (gReflex.setOptsFailures < 3) {
                     ++gReflex.setOptsFailures;
-                    logWarn("P247 reflex: slReflexSetOptions(mode=%d limit=%uus) failed=0x%X; "
+                    logWarn("reflex: slReflexSetOptions(mode=%d limit=%uus) failed=0x%X; "
                             "holding slReflexSleep until it succeeds",
                             effective, gReflex.frameLimitUs, static_cast<unsigned>(r));
                 }
@@ -2238,7 +2238,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             const sl::Result r = gReflex.marker(marker, *gLastFrameToken);
             if (r != sl::Result::eOk && gReflex.markerFailures < 3) {
                 ++gReflex.markerFailures;
-                logWarn("P113 pcl: marker %d result=0x%X", static_cast<int>(marker),
+                logWarn("pcl: marker %d result=0x%X", static_cast<int>(marker),
                         static_cast<unsigned>(r));
             }
         }
@@ -2313,11 +2313,11 @@ sl::FrameToken* gLastFrameToken = nullptr;
             const sl::Result r = gReflex.sleep(*gLastFrameToken);
             if (r != sl::Result::eOk && gReflex.sleepFailures < 3) {
                 ++gReflex.sleepFailures;
-                logWarn("P247 reflex: slReflexSleep failed=0x%X (options were applied OK)",
+                logWarn("reflex: slReflexSleep failed=0x%X (options were applied OK)",
                         static_cast<unsigned>(r));
             } else if (r == sl::Result::eOk && !gReflex.sleepOkLogged) {
                 gReflex.sleepOkLogged = true;
-                logInfo("P247 reflex: slReflexSleep ok (mode=%d) — Reflex/PCL markers active",
+                logInfo("reflex: slReflexSleep ok (mode=%d) — Reflex/PCL markers active",
                         gReflex.appliedMode);
             }
         }
@@ -2491,6 +2491,28 @@ sl::FrameToken* gLastFrameToken = nullptr;
 
     }
 
+    // P305ag：把本帧的 SR 产物交给 FG provider（XeSS-FG / FSR-FG 这类包装型后端）。
+    //
+    // 为什么在这里：逐帧 tag 原本只有一个触发点 —— `srEvaluateFrame` 成功后（`d3d12_sr.cpp:413`）。
+    // 而 DLSS 超分走的是本文件的 `mcdr_dlss_evaluate`（普通翻译单元，不 import 设备模块），
+    // `sr.backend = DLSS` 时那条路径根本不执行，XeSS-FG 因此一帧输入都收不到（实机取证：
+    // 4561 帧 tagCalls=0，setEnabled 从未下发）。走 `mcdr_fgTagDlssInputs` 这个只过 POD 的
+    // C ABI 桥，避免模块私有名的修饰名在链接期对不上（见 `d3d12_mesh_base.cpp` 的教训）。
+    //
+    // 状态为什么这么给：`out` 刚从 SR 输出恢复成 RENDER_TARGET（P273 契约），深度/MV 在 SR
+    // 结束时是只读 SRV（SL 自己的 tag 也要求 NON_PIXEL_SHADER_RESOURCE）。给错只是让 SDK
+    // 记错屏障的 Before 值，`TagFrameResource` 会返回错误码并落 breadcrumb（`P305af tag FAILED`）。
+    void tagFrameGenInputsFromDlss(ID3D12GraphicsCommandList* cmd, const mcdr_dlss_input& in) {
+        if (cmd == nullptr) {
+            return;
+        }
+        mcdr_fgTagDlssInputs(cmd, in.pInOutput, static_cast<int32_t>(D3D12_RESOURCE_STATE_RENDER_TARGET),
+                             in.pInDepth,
+                             static_cast<int32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                             in.pInMotionVectors,
+                             static_cast<int32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+    }
+
     int32_t streamlineEvaluate(void* commandList, const mcdr_dlss_input& in, DlssTransitionFn tl,
                                void* tlCtx) {
         auto* cmd = static_cast<ID3D12GraphicsCommandList*>(commandList);
@@ -2509,7 +2531,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             static bool warned = false;
             if (!warned) {
                 warned = true;
-                logWarn("P112: streamline evaluate unavailable — interposer exports or "
+                logWarn("streamline evaluate unavailable — interposer exports or "
                         "slDLSSSetOptions missing");
             }
             return 0;
@@ -2689,7 +2711,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
             static bool warnedTag = false;
             if (!warnedTag) {
                 warnedTag = true;
-                logWarn("P210: slSetTagForFrame failed=0x%X (frame=%u, color=%p depth=%p mv=%p out=%p)",
+                logWarn("slSetTagForFrame failed=0x%X (frame=%u, color=%p depth=%p mv=%p out=%p)",
                         static_cast<unsigned>(tagResult), s.submitCount,
                         static_cast<void*>(color), static_cast<void*>(depth),
                         static_cast<void*>(mv), static_cast<void*>(outResource));
@@ -2766,6 +2788,8 @@ sl::FrameToken* gLastFrameToken = nullptr;
         // 5) 宿主负责恢复（:242-253 + eDisableCLStateTracking）：只恢复输出到 RT。
         // 输入侧我们不再改状态，所以也没有要恢复的 barrier。
         transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        // P305ag：SR 已跑完、输出已在 RENDER_TARGET —— 此刻把本帧输入交给 FG provider。
+        tagFrameGenInputsFromDlss(cmd, in);
 
         // 5.5) P213：帧生成（DLSS-G）。
         // - HUD-less 必须“UI 之前、与 backbuffer 同尺寸”的画面（ProgrammingGuideDLSS_G.md §5.0）。
@@ -2827,7 +2851,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 lastFgQpc = nowUs;
                 wantFrames = dynFrames;
                 if (++dynTick % 120 == 0) {
-                    logWarn("[P225] fg dynamic: frames=%d max=%d target=%uus",
+                    logWarn("fg dynamic: frames=%d max=%d target=%uus",
                             wantFrames, maxFrames, gReflex.frameLimitUs);
                 }
             }
@@ -2853,7 +2877,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     // P296：只在本函数真的下发过选项时打一行（上面的 if 已经按"值变了才下发"过滤），
                     // 验收时用它证明"开关确实到过 SL"，不需要去 sl.log 里猜 —— 那份日志只记
                     // "slDLSSGSetOptions() is called on the thread N"，不记 mode/numFrames。
-                    logInfo("P296 fg options -> %s frames=%u (%ux%u)",
+                    logInfo("fg options -> %s frames=%u (%ux%u)",
                             fgDynamic ? "dynamic" : "on",
                             static_cast<unsigned>(fg.numFramesToGenerate),
                             static_cast<unsigned>(in.targetWidth),
@@ -2862,7 +2886,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     static bool warnedFgOpt = false;
                     if (!warnedFgOpt) {
                         warnedFgOpt = true;
-                        logWarn("P213: slDLSSGSetOptions failed=0x%X (mode=%d frames=%d)",
+                        logWarn("slDLSSGSetOptions failed=0x%X (mode=%d frames=%d)",
                                 static_cast<unsigned>(fgOptResult), fgMode, wantFrames);
                     }
                 }
@@ -2877,7 +2901,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     // 用 numFramesActuallyPresented > 1 证明插帧真的发生（而不是我们只是下发过选项）。
                     static uint64_t fgLogTick = 0;
                     if (++fgLogTick % 600 == 0) {
-                        logInfo("P248 fg state: status=%d presented=%u maxGen=%u tick=%llu",
+                        logInfo("fg state: status=%d presented=%u maxGen=%u tick=%llu",
                                 static_cast<int>(stFrame.status),
                                 static_cast<unsigned>(stFrame.numFramesActuallyPresented),
                                 static_cast<unsigned>(stFrame.numFramesToGenerateMax),
@@ -2887,7 +2911,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     static bool warnedFgState = false;
                     if (!warnedFgState) {
                         warnedFgState = true;
-                        logWarn("P248 slDLSSGGetState failed=0x%X", static_cast<unsigned>(stRes));
+                        logWarn("slDLSSGGetState failed=0x%X", static_cast<unsigned>(stRes));
                     }
                 }
             }
@@ -2905,14 +2929,14 @@ sl::FrameToken* gLastFrameToken = nullptr;
                     // P296（验收 A6）：关掉时到底有没有真的下发 eOff，只能由我们自己证明 ——
                     // sl.log 不记 mode/numFrames。这行打在"刚关掉"的那一帧，之后 fgMode 一直是 0
                     // 且 appliedFgMode 也是 0，不会再进这个分支。
-                    logInfo("P213e fg options -> off (applied)");
+                    logInfo("fg options -> off (applied)");
                 } else {
                     // 失败时 appliedFgMode 保持非 0，下一帧还会再试；这里只警告一次，
                     // 免得"SL 不认 eOff"变成每秒几十行的垃圾日志。
                     static bool warnedFgOff = false;
                     if (!warnedFgOff) {
                         warnedFgOff = true;
-                        logWarn("P213e slDLSSGSetOptions(eOff) failed=0x%X",
+                        logWarn("slDLSSGSetOptions(eOff) failed=0x%X",
                                 static_cast<unsigned>(offResult));
                     }
                 }
@@ -2932,7 +2956,7 @@ sl::FrameToken* gLastFrameToken = nullptr;
                 : 0);
 
         if (evalResult != sl::Result::eOk) {
-            logWarn("P112: streamline evaluate tags=0x%X options=0x%X evaluate=0x%X "
+            logWarn("streamline evaluate tags=0x%X options=0x%X evaluate=0x%X "
                     "(mode=%d, out=%ux%u)",
                     static_cast<unsigned>(tagResult), static_cast<unsigned>(optResult),
                     static_cast<unsigned>(evalResult), static_cast<int>(opt.mode),
@@ -2992,7 +3016,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         if (!s.evalFailWarned) {
             s.evalFailWarned = true;
             s.failure = "invalid texture handle";
-            logError("P108: DLSS skipped — a texture handle in mcdr_dlss_input is not a readable "
+            logError("DLSS skipped — a texture handle in mcdr_dlss_input is not a readable "
                      "pointer (color=%p depth=%p mv=%p out=%p). That is a data-plane bug (the JVM "
                      "handed over a stale/invalid handle), not a DLSS failure; DLSS stays enabled "
                      "so the next frame can retry with a valid set.",
@@ -3021,7 +3045,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
             if (!createTrackedTexture(s.transitionCtx, static_cast<UINT>(md.Width), md.Height,
                                       md.Format, md.MipLevels, md.DepthOrArraySize,
                                       md.SampleDesc.Count, 0, &mvObj, &mvRes)) {
-                logError("P108: motion-vector intermediate creation failed (fmt=%d); DLSS disabled",
+                logError("motion-vector intermediate creation failed (fmt=%d); DLSS disabled",
                          static_cast<int>(md.Format));
                 s.disabled = true;
                 return -1;
@@ -3091,7 +3115,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         } else {
             // Never silent: a mismatch means the copy back would be nonsense, so say so and fall
             // back to the private texture (the old, still-broken-on-this-machine path).
-            logError("P108: the JVM-supplied DLSS output texture does not fit the target — "
+            logError("the JVM-supplied DLSS output texture does not fit the target — "
                      "got %llux%u fmt=%d, need %dx%d fmt=%d; falling back to the private UAV "
                      "texture (which this machine cannot write, so DLSS output will be empty)",
                      static_cast<unsigned long long>(ed.Width), ed.Height,
@@ -3117,7 +3141,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // crashed the game). If neither the hand-over texture nor a private one is usable, skip
     // the frame instead of removing the device.
     if (ngxTarget == out) {
-        logError("P291b: no usable DLSS output texture this frame (the hand-over texture was "
+        logError("no usable DLSS output texture this frame (the hand-over texture was "
                  "rejected and the private one could not be created); skipping the evaluate "
                  "instead of transitioning a non-UAV target to UNORDERED_ACCESS");
         return 0;
@@ -3150,7 +3174,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         if (!s.evalFailWarned) {
             s.evalFailWarned = true;
             s.failure = "NGX_D3D12_EVALUATE_DLSS_EXT";
-            logError("P108: DLSS Evaluate failed: %s; DLSS disabled for this process "
+            logError("DLSS Evaluate failed: %s; DLSS disabled for this process "
                      "(the existing linear-blit path stays in effect). Resources that had UAV "
                      "this attempt: %s. Inputs: color=%p depth=%p mv=%p out=%p",
                      ngxResultString(er).c_str(),
@@ -3173,12 +3197,14 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     } else {
         transition(out, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
+    // P305ag：NGX 路径同样在 SR 成功后把本帧输入交给 FG provider（深度/MV 已在上面转成只读）。
+    tagFrameGenInputsFromDlss(cmd, *in);
     s.resetPending = false;
 
     ++s.submitCount;
     if (!s.evalOk) {
         s.evalOk = true;
-        logInfo("P108: DLSS Evaluate succeeded on the first frame: render %dx%d -> target %dx%d "
+        logInfo("DLSS Evaluate succeeded on the first frame: render %dx%d -> target %dx%d "
                 "(mv=%s)",
                 in->renderWidth, in->renderHeight, in->targetWidth, in->targetHeight,
                 mvIsRg16 ? "RG16 straight through" : "copied into an RG16 intermediate");
@@ -3203,7 +3229,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
         s.createdWarned = false;
         if (!s.qualityRequestLogged) {
             s.qualityRequestLogged = true;
-            logInfo("P108: DLSS quality tier request: %d (%s) — the feature will be rebuilt",
+            logInfo("DLSS quality tier request: %d (%s) — the feature will be rebuilt",
                     normalised,
                     normalised < 0 ? "unset -> closest to the render:target ratio"
                                    : (normalised == 1 ? "Performance"
@@ -3226,7 +3252,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
     // rebuild the feature on the next frame, because the preset is a CreateFeature input.
     int32_t mcdr_dlss_request_preset(int32_t preset) {
         if (preset < 0 || preset > NVSDK_NGX_DLSS_Hint_Render_Preset_O) {
-            logWarn("P108: DLSS render preset %d is out of range (valid: 0=Default, 5=E, 6=F, "
+            logWarn("DLSS render preset %d is out of range (valid: 0=Default, 5=E, 6=F, "
                     "10=J, 11=K, 12=L, 13=M) — ignored",
                     preset);
             return -1;
@@ -3238,7 +3264,7 @@ int32_t mcdr_dlss_evaluate(void* commandList, const mcdr_dlss_input* in, DlssTra
             s.createdWarned = false;
             if (!s.presetRequestLogged) {
                 s.presetRequestLogged = true;
-                logInfo("P108: DLSS render preset request: %d (%s) — the feature will be rebuilt",
+                logInfo("DLSS render preset request: %d (%s) — the feature will be rebuilt",
                         preset, presetName(preset).c_str());
             }
         }
@@ -3262,12 +3288,12 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
     s.externalOutput = res;
     if (res != nullptr) {
         const D3D12_RESOURCE_DESC d = res->GetDesc();
-        logInfo("P108: DLSS output texture supplied by the JVM: %llux%u fmt=%d flags=0x%X — NGX "
+        logInfo("DLSS output texture supplied by the JVM: %llux%u fmt=%d flags=0x%X — NGX "
                 "will write here instead of this unit's private UAV texture",
                 static_cast<unsigned long long>(d.Width), d.Height, static_cast<int>(d.Format),
                 static_cast<unsigned>(d.Flags));
     } else {
-        logInfo("P108: DLSS output texture override cleared; back to the private UAV texture");
+        logInfo("DLSS output texture override cleared; back to the private UAV texture");
     }
     return res != nullptr ? 1 : 0;
 }
@@ -3282,7 +3308,7 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
     const bool changed = (want != s.enabled);
     s.enabled = want;
     if (changed) {
-        logInfo("P108: DLSS switch %s (independent of anti-aliasing; NGX state is kept: "
+        logInfo("DLSS switch %s (independent of anti-aliasing; NGX state is kept: "
                 "initOk=%d featureOk=%d)",
                 want ? "ON" : "OFF", s.initOk ? 1 : 0, s.featureOk ? 1 : 0);
     }
@@ -3309,7 +3335,7 @@ int32_t mcdr_dlss_set_output_texture(void* resource) {
         // NGX_ENABLE_DEPRECATED_SHUTDOWN 时才声明，本项目没有定义它（编译期就报 C3861）。
         const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Shutdown1(s.device);
         if (NVSDK_NGX_FAILED(r)) {
-            logWarn("P108: NVSDK_NGX_D3D12_Shutdown1 failed: %s", ngxResultString(r).c_str());
+            logWarn("NVSDK_NGX_D3D12_Shutdown1 failed: %s", ngxResultString(r).c_str());
         }
         s = State{};
     }
@@ -3333,7 +3359,7 @@ int32_t mcdr_sl_upgrade_interface(void** baseInterface) {
     const int32_t fgModeForLog = gDlssgMode.load();
     const int32_t upgraded = streamlineUpgradeInterface(baseInterface);
     if (upgraded != 0) {
-        logInfo("P249: DXGI factory upgraded to the Streamline proxy factory "
+        logInfo("DXGI factory upgraded to the Streamline proxy factory "
                 "(eUseDXGIFactoryProxy) - swapchain creation now goes through SL (fg=%d)",
                 fgModeForLog);
     }

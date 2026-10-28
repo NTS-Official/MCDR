@@ -242,7 +242,7 @@ bool ensureProvider(CommandContext* ctx, int32_t backendId, const mcdr_sr_dispat
     if (gSrProvider != nullptr) {
         const int32_t previous = gSrActive;
         releaseProviderWithWait(ctx);
-        dbgLogInfo("P280: SR provider switch %s -> %s", nameOf(previous), nameOf(backendId));
+        dbgLogInfo("SR provider switch %s -> %s", nameOf(previous), nameOf(backendId));
     }
     std::unique_ptr<IUpscaleProvider> provider = makeProvider(toId(backendId));
     if (provider == nullptr) {
@@ -254,7 +254,7 @@ bool ensureProvider(CommandContext* ctx, int32_t backendId, const mcdr_sr_dispat
     }
     gSrActive = backendId;
     gSrProvider = std::move(provider);
-    dbgLogInfo("P272: SR provider ready: %s (render %dx%d display %dx%d)", nameOf(backendId),
+    dbgLogInfo("SR provider ready: %s (render %dx%d display %dx%d)", nameOf(backendId),
                seed.renderWidth, seed.renderHeight, seed.displayWidth, seed.displayHeight);
     return true;
 }
@@ -406,6 +406,11 @@ int32_t srEvaluateFrame(CommandContext* ctx, const mcdr_sr_dispatch& desc) {
         return 0;
     }
     gSrActive = backendId;
+    // P305b：包装型帧后端的输入 tag 必须落在**这一帧的命令列表**上（XeSS 的
+    // `TagFrameResource(cmdList, presentId, …)`、FSR 的 `InterpolationCommandListDX12` 都是
+    // 这个时机），而不是 Present 前后。DLSS-G 不覆写这个钩子 —— 它在 `d3d12_dlss.cpp` 里
+    // 自己用同一次 `slSetTagForFrame` 交 tag，所以这里对它是一次空调用。
+    fgTagFrameInputs(fgMakeFrameInputs(ctx, desc));
     return 1;
 }
 
@@ -450,7 +455,7 @@ void srReleaseProvider(void) {
         if (queueValue > 0) {
             const auto waited = waitForQueueFenceValue(queueValue, 5'000'000'000ULL);
             if (!waited.has_value()) {
-                dbgLogWarn("P280: the queue did not retire in time, releasing the SR provider anyway");
+                dbgLogWarn("the queue did not retire in time, releasing the SR provider anyway");
             }
         }
         gSrProvider->shutdown();
@@ -475,7 +480,7 @@ void releaseProviderWithWait(CommandContext* ctx) {
     if (ctx != nullptr && ctx->fenceValue > 0) {
         const auto waited = waitForFenceValue(ctx, ctx->fenceValue, 5'000'000'000ULL);
         if (!waited.has_value()) {
-            dbgLogWarn("P280: the previous frame did not retire in time, releasing the SR provider anyway");
+            dbgLogWarn("the previous frame did not retire in time, releasing the SR provider anyway");
         }
     }
     gSrProvider->shutdown();
