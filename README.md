@@ -1,5 +1,8 @@
 # MCDR
-[English] | [[简体中文](README_ZH.MD)]
+[English] | [[简体中文](docs/README_ZH.MD)]
+
+> [!Note]
+> Shaders compiling chain is undergoing a rewrite. Hybrid RT/PT solution is still in very early development.
 
 <div align="center">
 
@@ -18,6 +21,9 @@ The native library portion of DirectXMod has been modernized, along with a set o
 - The latest Agility SDK is used, upgrading SM5.1 to SM6.8.
 - Various small utility packages were added, such as nlohmann-json for conveniently assembling JSON.
 - …
+
+## Documentation
+Design docs live in `docs/`, starting at [`docs/overview.md`](docs/overview.md). They cover the C ABI contract, the device / surface / async layers, DLSS, frame generation, super resolution, mesh shaders and the ray tracing capability probe, plus the build and module rules. Source comments only carry constraints that break the build or the picture when violated; data flow, invariants and known defects live in the docs.
 
 # Acknowledgments
 This is the acknowledgements part of the project DXRMC.

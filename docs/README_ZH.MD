@@ -1,5 +1,9 @@
 # MCDR
-[[English](README.md)] | [简体中文]
+[[English](../README.md)] | [简体中文]
+
+> [!Note]
+> 着色器编译链正在经历重写，混合光追方案仍在非常不成熟的早期当中。
+
 
 <div align="center">
 
@@ -18,6 +22,8 @@
 - 添加了各种小的工具性的包，例如 nlohmann-json 用来方便地拼 JSON。
 - ……
 
+## 设计文档
+设计文档在 `docs/`，从 [`docs/overview.md`](docs/overview.md) 开始读：C ABI 契约、设备 / 交换链 / 异步三层、DLSS、帧生成、超分、mesh 与光追能力探测，以及构建与模块规则。源码注释只写“违反就会出错”的约束，数据流、不变式与已知缺陷都在文档里。
 
 # 鸣谢
 这是鸣谢部分：
