@@ -19,3 +19,9 @@
 [submodule "external/sharc"]
 	path = external/sharc
 	url = https://github.com/NVIDIA-RTX/SHARC.git
+[submodule "external/gl2sl-zig"]
+	path = external/gl2sl-zig
+	url = https://github.com/NTS-Official/gl-hl-processor.git
+[submodule "external/gl2hl"]
+	path = external/gl2hl
+	url = https://github.com/NTS-Official/Illusion-shaders-processor.git
